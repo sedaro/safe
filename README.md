@@ -10,3 +10,23 @@ When paired with Sedaro EDS's, SAFE delivers trusted satellite autonomy over lon
 2. A Router sets the active autonomy mode based on telemetry so that developers and mission planners can design an array of modes that incorporate various autonomy approaches for each mission phase, potential state of the vehicle, and potential state of its operating
 environment. 
 3. Batteries-included developer libraries for multi-simulation, multi-parameter optimization and risk analysis, in addition to turnkey support for the integration of EDS’s, enables streamlined development of SAFE autonomy modes.
+
+#### Getting Started
+
+```bash
+cd examples
+cargo run
+```
+
+
+#### Project Layout
+
+- [`safe`](./safe/): SAFE implementation
+  - [`sedaro`](./safe/sedaro/): Utilities and drivers for integrating [Sedaro](https://sedaro.com) Edge Deployable Simulators (EDS)
+- [`safectl`](./safectl/): A CLI for interacting with a running SAFE process
+- [`examples`](./examples/): Example autonomy implementations and reference designs
+
+
+#### License
+
+This project is licensed under the [Apache-2.0 License](./LICENSE).
