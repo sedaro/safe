@@ -205,48 +205,74 @@ impl ObservabilitySubsystem {
 }
 
 // ============================================================================
-// Autonomy Mode Trait
+// Autonomy Mode
 // ============================================================================
 
-#[async_trait]
-trait AutonomyMode: Send + Sync {
-    fn name(&self) -> &str;
-    fn register_router(&mut self, tx_to_router: mpsc::Sender<Command>, rx_from_router: broadcast::Receiver<Telemetry>);
-    async fn run(&mut self) -> Result<()>;
-}
-
-struct CollisionAvoidanceMode {
+#[derive(Debug)]
+struct AutonomyMode {
   name: String,
-  rx_telem: Option<broadcast::Receiver<Telemetry>>,
-  tx_command: Option<mpsc::Sender<Command>>,
+  rx_telem: broadcast::Receiver<Telemetry>,
+  tx_command: mpsc::Sender<Command>,
+  active: bool,
+  priority: u8,
+  activation: Option<Activation>,
 }
-impl CollisionAvoidanceMode {
-  fn new(name: String) -> Self {
-      Self {
-          name,
-          rx_telem: None,
-          tx_command: None,
+impl AutonomyMode {
+  async fn run(&mut self) -> Result<()> {
+      loop {
+          if let Ok(telemetry) = self.rx_telem.recv().await {
+            info!("{} received telemetry: {:?}", self.name, telemetry);
+            self.tx_command.send(Command { cmd_id: 1, payload: vec![0, 1, 2] }).await?;
+          }
       }
   }
 }
 
-#[async_trait]
-impl AutonomyMode for CollisionAvoidanceMode {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn register_router(&mut self, tx_to_router: mpsc::Sender<Command>, rx_from_router: broadcast::Receiver<Telemetry>) {
-      self.tx_command = Some(tx_to_router);
-      self.rx_telem = Some(rx_from_router);
-    }
-    async fn run(&mut self) -> Result<()> {
-        loop {
-            if let Ok(telemetry) = self.rx_telem.as_mut().unwrap().recv().await {
-              info!("{} received telemetry: {:?}", self.name(), telemetry);
-              self.tx_command.as_mut().unwrap().send(Command { cmd_id: 1, payload: vec![0, 1, 2] }).await?;
-            }
-        }
-    }
+// TODO: Get feedback from Team on all of this Ontology!
+// TODO: SedaroTS here instead?
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AutonomyModeDefinition {
+  pub name: String,
+  pub priority: u8,
+  pub activation: Option<Activation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VariableDefinition<T> {
+  pub name: String,
+  pub initial_value: Option<T>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum GenericVariable<T> {
+  Literal(T),
+  VariableRef(String),
+  TelemetryRef(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Variable {
+  String(GenericVariable<String>),
+  Float64(GenericVariable<f64>),
+  Bool(GenericVariable<bool>),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Expr {
+  Variable,
+  And(Vec<Expr>),
+  Or(Vec<Expr>),
+  Not(Box<Expr>),
+  GreaterThan(Box<Variable>, Box<Variable>),
+  LessThan(Box<Variable>, Box<Variable>),
+  Equal(Box<Variable>, Box<Variable>),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Activation {
+  Immediate(Expr),
+  Hysteretic { enter: Expr, exit: Expr },
 }
 
 // ============================================================================
@@ -261,7 +287,7 @@ struct Router {
     tx_command: mpsc::Sender<Command>,
     observability: Arc<ObservabilitySubsystem>,
     selected_mode: Option<String>,
-    autonomy_modes: HashMap<String, mpsc::Receiver<Command>>,
+    autonomy_modes: HashMap<String, (Arc<tokio::sync::Mutex<AutonomyMode>>, mpsc::Receiver<Command>)>,
 }
 
 impl Router {
@@ -273,7 +299,6 @@ impl Router {
     ) -> Self {
         debug!("Initializing Router with config: {:?}", config.router);
         let (tx_telem_to_modes, rx_telem_in_modes) = broadcast::channel(config.router.max_autonomy_modes);
-        
         Self {
             engagement_mode: EngagementMode::Off,
             rx_telem,
@@ -285,11 +310,27 @@ impl Router {
             autonomy_modes: HashMap::new(),
         }
     }
-    fn register_autonomy_mode(&mut self, mode: &mut impl AutonomyMode, config: &Config) {
+
+    fn register_autonomy_mode(&mut self, mode_def: &AutonomyModeDefinition, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) = mpsc::channel::<Command>(config.router.command_channel_buffer_size);
-        self.autonomy_modes.insert(mode.name().to_string(), rx_command_from_modes);
-        self.selected_mode = Some(mode.name().to_string());
-        mode.register_router(tx_command_to_router, self.rx_telem_in_modes.resubscribe());
+        let mode = AutonomyMode {
+          name: mode_def.name.clone(),
+          rx_telem: self.rx_telem_in_modes.resubscribe(),
+          tx_command: tx_command_to_router.clone(),
+          active: false,
+          priority: mode_def.priority,
+          activation: mode_def.activation.clone(),
+        };
+        let mode = Arc::new(tokio::sync::Mutex::new(mode));
+        let mode_for_task = mode.clone();
+        tokio::spawn(async move { // TODO: Make thread
+          let mut mode = mode_for_task.lock().await;
+          if let Err(e) = mode.run().await {
+            warn!("Autonomy Mode error: {}", e);
+          }
+        });
+        self.autonomy_modes.insert(mode_def.name.to_string(), (mode, rx_command_from_modes));
+        self.selected_mode = Some(mode_def.name.to_string()); // TODO: Remove and based on router activations
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -297,43 +338,33 @@ impl Router {
         loop {
             tokio::select! {
                 Some(telemetry) = self.rx_telem.recv() => {
-                    self.handle_telemetry(telemetry).await?;
+                    self.observability.write(
+                        tracing::Level::INFO,
+                        LogEntry::TelemetryReceived(telemetry.clone()),
+                    );
+                    if let Err(_) = self.tx_telem_to_modes.send(telemetry) {
+                        warn!("No active subscribers for telemetry");
+                    }
                 }
                 // TODO: There is an issue here where modes can send a bunch of commands when inactive and then when the become active we'll forward them along
                 // Need to flush the channels when switching modes
-                Some(command) = self.autonomy_modes.get_mut(self.selected_mode.as_ref().unwrap()).unwrap().recv() => {
-                    self.handle_mode_command(command).await?;
+                Some(command) = self.autonomy_modes.get_mut(self.selected_mode.as_ref().unwrap()).unwrap().1.recv() => {
+                    self.observability.write(
+                        tracing::Level::INFO,
+                        LogEntry::CommandIssued { // TODO: Have this include which mode issued it
+                            commands: vec![command.clone()],
+                            reason: None,
+                        },
+                    );
+                    if let Err(_) = self.tx_command.send(command).await {
+                        warn!("No active subscribers for commands");
+                    }
                 }
                 // Some(config) = self.config_rx.recv() => {
                 //     self.handle_config(config).await?;
                 // }
             }
         }
-    }
-
-    async fn handle_telemetry(&self, telemetry: Telemetry) -> Result<()> {
-        self.observability.write(
-            tracing::Level::INFO,
-            LogEntry::TelemetryReceived(telemetry.clone()),
-        );
-        if let Err(_) = self.tx_telem_to_modes.send(telemetry.clone()) {
-            warn!("No active subscribers for telemetry");
-        }
-        Ok(())
-    }
-
-    async fn handle_mode_command(&self, cmd: Command) -> Result<()> {
-        self.observability.write(
-            tracing::Level::INFO,
-            LogEntry::CommandIssued { // TODO: Have this include which mode issued it
-                commands: vec![cmd.clone()],
-                reason: None,
-            },
-        );
-        if let Err(_) = self.tx_command.send(cmd).await {
-            warn!("No active subscribers for commands");
-        }
-        Ok(())
     }
 }
 
@@ -366,7 +397,6 @@ async fn c2_interface_task(
                     }
                 }
             }
-            
             Some(cmd) = command_rx.recv() => {
                 transport.send_command(cmd).await?;
             }
@@ -494,6 +524,33 @@ async fn main() -> Result<()> {
         .json()
         .init();
     
+    let thing = AutonomyModeDefinition {
+      name: "CollisionAvoidance".to_string(),
+      priority: 1,
+      activation: Some(Activation::Hysteretic {
+        enter: Expr::GreaterThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+        ),
+        exit: Expr::LessThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+        ),
+      }),
+    };
+    let var = VariableDefinition::<f64> {
+      name: "proximity_m".to_string(),
+      initial_value: Some(0.0),
+    };
+    let v = serde_json::to_string_pretty(&thing)?;
+    println!("{}", v);
+    let v = serde_json::from_str::<AutonomyModeDefinition>(&v)?;
+    println!("{:?}", v);
+    let v = serde_json::to_string_pretty(&var)?;
+    println!("{}", v);
+    let v = serde_json::from_str::<VariableDefinition<f64>>(&v)?;
+    println!("{:?}", v);
+
     info!("SAFE is in start up.");
     
     let observability = Arc::new(ObservabilitySubsystem::new(None));
@@ -515,15 +572,38 @@ async fn main() -> Result<()> {
         &config,
     );
 
-    let mut ca_mode = CollisionAvoidanceMode::new("CollisionAvoidance".to_string());
-    router.register_autonomy_mode(&mut ca_mode, &config);
-    
-    tokio::spawn(async move { // TODO: Make thread
-      if let Err(e) = ca_mode.run().await {
-        warn!("Autonomy Mode error: {}", e);
-      }
-    });
+    let mode_def = AutonomyModeDefinition {
+      name: "CollisionAvoidance".to_string(),
+      priority: 1,
+      activation: Some(Activation::Hysteretic {
+        enter: Expr::GreaterThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+        ),
+        exit: Expr::LessThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+        ),
+      }),
+    };
+    router.register_autonomy_mode(&mode_def, &config);
 
+    let mode_def = AutonomyModeDefinition {
+      name: "Other".to_string(),
+      priority: 1,
+      activation: Some(Activation::Hysteretic {
+        enter: Expr::GreaterThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+        ),
+        exit: Expr::LessThan(
+          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
+          Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+        ),
+      }),
+    };
+    router.register_autonomy_mode(&mode_def, &config);
+    
     tokio::spawn(async move {
         if let Err(e) = router.run().await {
             warn!("Router error: {}", e);
@@ -562,6 +642,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/*
+AutonomyMode should be converted back to a trait so we can actually do stuff in rust natively?  We want to run it as its 
+own thread though so what's the suggestion for managing Routing state while also having independence.
+ */
 
 /*
 Define ontology
