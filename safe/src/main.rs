@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use c2::{Command, Telemetry};
 use config::Config;
 use definitions::{
-    Activation, AutonomyModeDefinition, Expr, GenericVariable, Variable, VariableDefinition,
+    Activation, AutonomyModeDefinition, Expr, Value, Variable, VariableDefinition,
 };
 use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
@@ -133,16 +133,16 @@ async fn main() -> Result<()> {
         priority: 1,
         activation: Some(Activation::Hysteretic {
             enter: Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
             ),
             exit: Expr::LessThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
             ),
         }),
     };
@@ -189,16 +189,16 @@ async fn main() -> Result<()> {
         priority: 1,
         activation: Some(Activation::Hysteretic {
             enter: Expr::Not(Box::new(Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
             ))),
             exit: Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
             ),
         }),
     };
@@ -207,8 +207,8 @@ async fn main() -> Result<()> {
     let mode = NominalOperationsAutonomyMode {
         name: "NominalOps".to_string(),
         priority: 0,
-        activation: Some(Activation::Immediate(Expr::Var(Variable::Bool(
-            GenericVariable::Literal(true),
+        activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
+            Value::Literal(true),
         )))),
     };
     router.register_autonomy_mode(mode, &config);
@@ -284,7 +284,6 @@ async fn main() -> Result<()> {
 }
 
 /*
-- CI/CD
 - Implement Routing (review with Alex)
 -- later --
 - Have a rust-native autonomy mode or two
