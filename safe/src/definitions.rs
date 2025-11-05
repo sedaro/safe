@@ -7,7 +7,7 @@ pub enum Error {
     UndefinedTelemetry(String),
     TypeMismatch,
     NotComparable,
-    NotBoolean,
+    UnresolvedVariable,
 }
 
 // TODO: Get feedback from Team on all of this Ontology!
@@ -26,34 +26,18 @@ pub struct VariableDefinition<T> {
     pub initial_value: Option<T>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Variable {
-    String(Value<String>),
-    Float64(Value<f64>),
-    Bool(Value<bool>),
-}
-impl Variable {
-    fn resolve(&self, ctx: &impl Resolvable) -> Result<ResolvedValue, Error> {
-        match self {
-            Variable::String(v) => v.resolve_string(ctx).map(ResolvedValue::String), // FIXME: Make same?
-            Variable::Float64(v) => v.resolve_f64(ctx).map(ResolvedValue::Float),
-            Variable::Bool(v) => v.resolve_bool(ctx).map(ResolvedValue::Bool),
-        }
-    }
-}
-
 pub trait Resolvable {
     fn get_variable(&self, name: &str) -> Option<Variable>;
     fn get_telemetry(&self, name: &str) -> Option<Variable>;
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub enum Value<V> {
     Literal(V),
     VariableRef(String),
     TelemetryRef(String),
 }
-impl Value<String> { // FIXME: Consolidate?
+impl Value<String> {
     fn resolve_string(&self, ctx: &impl Resolvable) -> Result<String, Error> {
         match self {
             Value::Literal(s) => Ok(s.clone()),
@@ -105,26 +89,38 @@ impl Value<bool> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum ResolvedValue {
-    String(String),
-    Float(f64),
-    Bool(bool),
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Variable {
+    String(Value<String>),
+    Float64(Value<f64>),
+    Bool(Value<bool>),
 }
-
-impl ResolvedValue {
+impl Variable {
     fn as_bool(&self) -> Result<bool, Error> {
         match self {
-            ResolvedValue::Bool(b) => Ok(*b),
-            _ => Err(Error::NotBoolean),
+            Variable::Bool(Value::Literal(v)) => Ok(*v),
+            Variable::Bool(_) => Err(Error::UnresolvedVariable),
+            Variable::Float64(Value::Literal(v)) => Ok(*v != 0.0),
+            Variable::Float64(_) => Err(Error::UnresolvedVariable),
+            Variable::String(Value::Literal(s)) => Ok(!s.is_empty()), // TODO: Revisit truthiness of strings if we want to change how they are interpreted   
+            Variable::String(_) => Err(Error::UnresolvedVariable),
         }
     }
     fn try_cmp(&self, other: &Self) -> Result<Option<Ordering>, Error> {
         match (self, other) {
-            (ResolvedValue::Float(a), ResolvedValue::Float(b)) => Ok(a.partial_cmp(b)),
-            (ResolvedValue::String(a), ResolvedValue::String(b)) => Ok(Some(a.cmp(b))),
-            (ResolvedValue::Bool(a), ResolvedValue::Bool(b)) => Ok(Some(a.cmp(b))),
+            (Variable::String(a), Variable::String(b)) => Ok(Some(a.cmp(b))),
+            (Variable::Float64(a), Variable::Float64(b)) => Ok(a.partial_cmp(b)),
+            (Variable::Bool(a), Variable::Bool(b)) => Ok(Some(a.cmp(b))),
+            (Variable::Float64(Value::Literal(a)), Variable::Bool(Value::Literal(b))) => Ok((*a != 0.0).partial_cmp(b)),           
+            (Variable::Bool(Value::Literal(a)), Variable::Float64(Value::Literal(b))) => Ok(a.partial_cmp(&(*b != 0.0))),
             _ => Err(Error::TypeMismatch),
+        }
+    }
+    fn resolve(&self, ctx: &impl Resolvable) -> Result<Variable, Error> {
+        match self {
+            Variable::String(v) => v.resolve_string(ctx).map(|v| Variable::String(Value::Literal(v))),
+            Variable::Float64(v) => v.resolve_f64(ctx).map(|v| Variable::Float64(Value::Literal(v))),
+            Variable::Bool(v) => v.resolve_bool(ctx).map(|v| Variable::Bool(Value::Literal(v))),
         }
     }
 }
@@ -171,14 +167,15 @@ impl Expr {
                 lv.try_cmp(&rv)?.ok_or(Error::NotComparable).map(|o| o.is_lt())
             }
             Expr::Equal(l, r) => {
-                Ok(Self::eval_value(l, ctx)? == Self::eval_value(r, ctx)?)
+                let (lv, rv) = (Self::eval_value(l, ctx)?, Self::eval_value(r, ctx)?);
+                lv.try_cmp(&rv)?.ok_or(Error::NotComparable).map(|o| o.is_eq())
             }
         }
     }
-    fn eval_value(expr: &Expr, ctx: &impl Resolvable) -> Result<ResolvedValue, Error> {
+    fn eval_value(expr: &Expr, ctx: &impl Resolvable) -> Result<Variable, Error> {
         match expr {
             Expr::Term(var) => var.resolve(ctx),
-            other => other.eval(ctx).map(ResolvedValue::Bool),
+            other => other.eval(ctx).map(|b| Variable::Bool(Value::Literal(b))),
         }
     }
 }
