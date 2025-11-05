@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use core::panic;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{self, Instant};
+use tokio::time;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn, debug};
 use futures::{SinkExt, StreamExt};
@@ -142,41 +142,41 @@ impl ConfigTransport for TcpConfigTransport {
 // ============================================================================
 
 struct ObservabilitySubsystem {
+    sig: String, // Signature for differentiating concurrent log streams
     seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-enum LogEntry {
-    Generic(String),
-    Metrics { uptime: u64, memory: f64, disk_read: f64, disk_write: f64, cpu: f32 },
+enum Event {
+    MetricsCollected { uptime: u64, memory: f64, disk_read: f64, disk_write: f64, cpu: f32 },
     CommandIssued { commands: Vec<Command>, reason: Option<String> },
     TelemetryReceived(Telemetry),
     // ConfigChanged { before: , after },
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+enum Location {
+    Main,
+    Router,
+    AutonomyMode(String),
+    Config,
+    C2,
 }
 
 impl ObservabilitySubsystem {
     fn new(seq: Option<u64>) -> Self {
         Self {
+            sig: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string(),
             seq: Arc::new(std::sync::atomic::AtomicU64::new(seq.unwrap_or(0))),
         }
     }
 
-    // TODO: Rework this
-    // We want to only capture replayable events in this log and name it accordingly.  The file should only have events in it
-    // There should be a different log for generic message
-    fn write(&self, level: tracing::Level, entry: LogEntry) {
+    fn log_event(&self, location: Location, event: Event) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        match level {
-            tracing::Level::ERROR => tracing::error!(seq = seq, timestamp = timestamp, entry = ?entry),
-            tracing::Level::WARN => tracing::warn!(seq = seq, timestamp = timestamp, entry = ?entry),
-            tracing::Level::INFO => tracing::info!(seq = seq, timestamp = timestamp, entry = ?entry),
-            tracing::Level::DEBUG => tracing::debug!(seq = seq, timestamp = timestamp, entry = ?entry),
-            tracing::Level::TRACE => tracing::trace!(seq = seq, timestamp = timestamp, entry = ?entry),
-        }
+        tracing::info!(sig = self.sig, seq = seq, loc = ?location, event = ?event);
     }
 
     async fn run(&self, config: &Config) -> Result<()> {
@@ -190,9 +190,9 @@ impl ObservabilitySubsystem {
             warn!("Failed to get process info for metrics");
             continue;
           };
-          self.write( // TODO: Validate and include entries for each autonomy mode (and all other parallel processes).  This will also not account for anything running outside of the process that is connected in via IPC.  Modes will need their own way or reporting possibly.
-            tracing::Level::INFO,
-            LogEntry::Metrics { 
+          self.log_event( // TODO: Validate and include entries for each autonomy mode (and all other parallel processes).  This will also not account for anything running outside of the process that is connected in via IPC.  Modes will need their own way or reporting possibly.
+            Location::Main,
+            Event::MetricsCollected { 
               uptime: process.run_time(), // seconds
               memory: process.memory().to_f64().unwrap()/1024.0/1024.0, // MB
               disk_read: process.disk_usage().read_bytes.to_f64().unwrap()/1024.0/1024.0, // MB
@@ -353,7 +353,7 @@ impl Router {
             rx_telem_in_modes,
             tx_command,
             observability,
-            selected_mode: None, // TODO: Be able to specify the initial mode via name
+            selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
             autonomy_modes: HashMap::new(),
             telem_buffer: VecDeque::with_capacity(config.router.historic_telem_buffer_size),
         }
@@ -380,20 +380,18 @@ impl Router {
           handle,
         };
         self.autonomy_modes.insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
-        self.selected_mode = Some(mode_name); // TODO: Remove and based on router activations
       }
 
     async fn run(&mut self, config: &Config) -> Result<()> {
         info!("Router is starting");
         let mut routing_interval = time::interval(std::time::Duration::from_secs(config.router.period_seconds));
-        routing_interval.tick().await;
         loop {
             tokio::select! {
                 // Receive telemetry from C2 and forward to modes
                 Some(telemetry) = self.rx_telem.recv() => {
-                    self.observability.write(
-                        tracing::Level::INFO,
-                        LogEntry::TelemetryReceived(telemetry.clone()),
+                    self.observability.log_event(
+                        Location::Router,
+                        Event::TelemetryReceived(telemetry.clone()),
                     );
                     self.telem_buffer.push_front(telemetry.clone());
                     if self.telem_buffer.len() > config.router.historic_telem_buffer_size {
@@ -407,10 +405,16 @@ impl Router {
                 // Forward commands from active mode to C2
                 // TODO: There is an issue here where modes can send a bunch of commands when inactive and then when the become active we'll forward them along
                 // Need to flush the channels when switching modes
-                Some(command) = self.autonomy_modes.get_mut(self.selected_mode.as_ref().unwrap()).unwrap().1.recv() => {
-                    self.observability.write(
-                        tracing::Level::INFO,
-                        LogEntry::CommandIssued { // TODO: Have this include which mode issued it
+                Some(command) = async {
+                  if let Some(mode_name) = &self.selected_mode {
+                    self.autonomy_modes.get_mut(mode_name).unwrap().1.recv().await
+                  } else {
+                    futures::future::pending().await
+                  }
+                } => {
+                    self.observability.log_event(
+                        Location::AutonomyMode(self.selected_mode.clone().unwrap()),
+                        Event::CommandIssued { // TODO: Have this include which mode issued it
                             commands: vec![command.clone()],
                             reason: None,
                         },
@@ -426,7 +430,7 @@ impl Router {
                   let mut candidate_modes: Vec<(u8, String)> = vec![];
                   // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
                   if let Some(current_mode_name) = &self.selected_mode {
-                    let (current_mode, _) = self.autonomy_modes.get(current_mode_name).unwrap();
+                    let (current_mode, _) = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
                     if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
                       // Evaluate exit criteria
                       if !self.eval_activation_expr(exit, &latest_telem) {
@@ -451,7 +455,18 @@ impl Router {
                     let highest_priority_mode = &candidate_modes[0].1;
                     if Some(highest_priority_mode.clone()) != self.selected_mode {
                       info!("Switching to mode: {}", highest_priority_mode);
+                      { // Atomically set active flags
+                        if let Some(current_mode_name) = &self.selected_mode {
+                          let (mode, _) = self.autonomy_modes.get_mut(current_mode_name).unwrap();
+                          let mut active = mode.active.lock().await;
+                          *active = false;
+                        }
+                        let (mode, _) = self.autonomy_modes.get_mut(highest_priority_mode).unwrap();
+                        let mut active = mode.active.lock().await;
+                        *active = true;
+                      }
                       self.selected_mode = Some(highest_priority_mode.clone());
+                      
                     } else {
                       debug!("Staying in mode: {}", highest_priority_mode);
                     }
@@ -545,9 +560,9 @@ async fn c2_interface_task(
             result = transport.recv_telemetry() => {
                 match result {
                     Ok(telemetry) => {
-                        observability.write(
-                            tracing::Level::INFO,
-                            LogEntry::TelemetryReceived(telemetry.clone()),
+                        observability.log_event(
+                            Location::C2,
+                            Event::TelemetryReceived(telemetry.clone()),
                         );
                         telem_tx.send(telemetry).await?;
                     }
@@ -681,7 +696,7 @@ impl AutonomyMode for CollisionAvoidanceAutonomyMode {
       loop {
           if let Ok(telemetry) = rx_telem.recv().await {
             let active = active.lock().await;
-            info!("{}: {} received telemetry: {:?}", active, self.name(), telemetry);
+            info!("{} [{}] received telemetry: {:?}", self.name(), active, telemetry);
             tx_command.send(Command { cmd_id: 1, payload: vec![0, 1, 2] }).await?;
           }
       }
@@ -731,7 +746,7 @@ async fn main() -> Result<()> {
         .with_level(true)
         .json()
         .init();
-    
+
     let thing = AutonomyModeDefinition {
       name: "CollisionAvoidance".to_string(),
       priority: 1,
@@ -851,19 +866,17 @@ async fn main() -> Result<()> {
 }
 
 /*
-- Implement Routing (review with Alex)
 - Refactor file and format
-- Clean up obs. for better DX and replayability guarantees.  "Reasoning" too.
 - CI/CD
+- Implement Routing (review with Alex)
 -- later --
 - Have a rust-native autonomy mode or two
-- AutonomyMode should be converted back to a trait so we can actually do stuff in rust natively?  We want to run it as its 
-own thread though so what's the suggestion for managing Routing state while also having independence.
 - Mode transition command purging
 - Try to compile it for Raspberry PI and STM MCU
 - Focus on the EDS integration piece
 - CLI to issue commands over unix socket to Config and C2 interfaces
 - Integrate redb
+- Is it important to guarantee that Modes can't issue commands when Router logic would deactivate them?  Do we need to work out the races here or is this acceptable?
  */
 
 /* 
