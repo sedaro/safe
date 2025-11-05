@@ -4,6 +4,7 @@ mod definitions;
 mod observability;
 mod router;
 mod transports;
+mod kits;
 
 use anyhow::Result;
 use async_trait::async_trait;
