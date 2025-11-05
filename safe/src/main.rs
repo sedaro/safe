@@ -1,22 +1,22 @@
 // main.rs
 use anyhow::Result;
 use async_trait::async_trait;
-use figment::Figment;
+use core::panic;
 use figment::providers::{Env, Format, Serialized, Yaml};
+use figment::Figment;
+use futures::{SinkExt, StreamExt};
 use rand_distr::num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use core::panic;
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::process;
 use std::sync::Arc;
+use sysinfo::{Pid, System};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{info, warn, debug};
-use futures::{SinkExt, StreamExt};
-use sysinfo::{System, Pid};
-use std::process;
-use std::collections::VecDeque;
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // Message Types
@@ -51,7 +51,7 @@ enum EngagementMode {
 }
 
 enum AutonomyModeSignal {
-  // TODO: Warn of getting unscheduled
+    // TODO: Warn of getting unscheduled
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -88,7 +88,10 @@ impl TcpC2Transport {
 #[async_trait]
 impl C2Transport for TcpC2Transport {
     async fn recv_telemetry(&mut self) -> Result<Telemetry> {
-        let bytes = self.framed.next().await
+        let bytes = self
+            .framed
+            .next()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
         Ok(bincode::deserialize(&bytes)?)
     }
@@ -125,7 +128,10 @@ impl TcpConfigTransport {
 #[async_trait]
 impl ConfigTransport for TcpConfigTransport {
     async fn recv_config(&mut self) -> Result<ConfigMessage> {
-        let bytes = self.framed.next().await
+        let bytes = self
+            .framed
+            .next()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
         Ok(bincode::deserialize(&bytes)?)
     }
@@ -148,8 +154,17 @@ struct ObservabilitySubsystem {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum Event {
-    MetricsCollected { uptime: u64, memory: f64, disk_read: f64, disk_write: f64, cpu: f32 },
-    CommandIssued { commands: Vec<Command>, reason: Option<String> },
+    MetricsCollected {
+        uptime: u64,
+        memory: f64,
+        disk_read: f64,
+        disk_write: f64,
+        cpu: f32,
+    },
+    CommandIssued {
+        commands: Vec<Command>,
+        reason: Option<String>,
+    },
     TelemetryReceived(Telemetry),
     // ConfigChanged { before: , after },
 }
@@ -182,25 +197,30 @@ impl ObservabilitySubsystem {
     async fn run(&self, config: &Config) -> Result<()> {
         let mut sys = System::new_all();
         let pid = Pid::from(process::id() as usize);
-        let mut interval = time::interval(std::time::Duration::from_secs(config.observability.metrics.period_seconds));
-        interval.tick().await; 
+        let mut interval = time::interval(std::time::Duration::from_secs(
+            config.observability.metrics.period_seconds,
+        ));
+        interval.tick().await;
         loop {
-          sys.refresh_process(pid);
-          let Some(process) = sys.process(pid) else {
-            warn!("Failed to get process info for metrics");
-            continue;
-          };
-          self.log_event( // TODO: Validate and include entries for each autonomy mode (and all other parallel processes).  This will also not account for anything running outside of the process that is connected in via IPC.  Modes will need their own way or reporting possibly.
-            Location::Main,
-            Event::MetricsCollected { 
-              uptime: process.run_time(), // seconds
-              memory: process.memory().to_f64().unwrap()/1024.0/1024.0, // MB
-              disk_read: process.disk_usage().read_bytes.to_f64().unwrap()/1024.0/1024.0, // MB
-              disk_write: process.disk_usage().written_bytes.to_f64().unwrap()/1024.0/1024.0, // MB
-              cpu: process.cpu_usage(), // percentage
-            },
-          );
-          interval.tick().await;
+            sys.refresh_process(pid);
+            let Some(process) = sys.process(pid) else {
+                warn!("Failed to get process info for metrics");
+                continue;
+            };
+            self.log_event(
+                // TODO: Validate and include entries for each autonomy mode (and all other parallel processes).  This will also not account for anything running outside of the process that is connected in via IPC.  Modes will need their own way or reporting possibly.
+                Location::Main,
+                Event::MetricsCollected {
+                    uptime: process.run_time(),                                   // seconds
+                    memory: process.memory().to_f64().unwrap() / 1024.0 / 1024.0, // MB
+                    disk_read: process.disk_usage().read_bytes.to_f64().unwrap() / 1024.0 / 1024.0, // MB
+                    disk_write: process.disk_usage().written_bytes.to_f64().unwrap()
+                        / 1024.0
+                        / 1024.0, // MB
+                    cpu: process.cpu_usage(), // percentage
+                },
+            );
+            interval.tick().await;
         }
     }
 }
@@ -214,7 +234,12 @@ trait AutonomyMode: Send + Sync {
     fn name(&self) -> String;
     fn activation(&self) -> Option<Activation>;
     fn priority(&self) -> u8;
-    async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()>;
+    async fn run(
+        &mut self,
+        mut rx_telem: broadcast::Receiver<Telemetry>,
+        tx_command: mpsc::Sender<Command>,
+        active: Arc<tokio::sync::Mutex<bool>>,
+    ) -> Result<()>;
 }
 
 struct ManagedAutonomyMode {
@@ -234,22 +259,22 @@ struct ManagedAutonomyMode {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AutonomyModeDefinition {
-  pub name: String,
-  pub priority: u8,
-  pub activation: Option<Activation>,
+    pub name: String,
+    pub priority: u8,
+    pub activation: Option<Activation>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct VariableDefinition<T> {
-  pub name: String,
-  pub initial_value: Option<T>,
+    pub name: String,
+    pub initial_value: Option<T>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum GenericVariable<T> {
-  Literal(T),
-  VariableRef(String),
-  TelemetryRef(String),
+    Literal(T),
+    VariableRef(String),
+    TelemetryRef(String),
 }
 // impl<T: PartialEq> PartialEq for GenericVariable<T> {
 //     fn eq(&self, other: &Self) -> bool {
@@ -270,9 +295,9 @@ enum GenericVariable<T> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Variable {
-  String(GenericVariable<String>),
-  Float64(GenericVariable<f64>),
-  Bool(GenericVariable<bool>),
+    String(GenericVariable<String>),
+    Float64(GenericVariable<f64>),
+    Bool(GenericVariable<bool>),
 }
 // impl PartialEq for Variable {
 //     fn eq(&self, other: &Self) -> bool {
@@ -303,22 +328,22 @@ enum Variable {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Expr {
-  Var(Variable), // TODO: Ask Alex how'd you'd do this traditionally and what'd you'd call it
-  And(Vec<Expr>),
-  Or(Vec<Expr>),
-  Not(Box<Expr>),
-  GreaterThan(Box<Variable>, Box<Variable>),
-  LessThan(Box<Variable>, Box<Variable>),
-  Equal(Box<Variable>, Box<Variable>),
+    Var(Variable), // TODO: Ask Alex how'd you'd do this traditionally and what'd you'd call it
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+    Not(Box<Expr>),
+    GreaterThan(Box<Variable>, Box<Variable>),
+    LessThan(Box<Variable>, Box<Variable>),
+    Equal(Box<Variable>, Box<Variable>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Activation {
-  Immediate(Expr),
-  Hysteretic { enter: Expr, exit: Expr },
-  // TODO: Implement some form of interrupt that can break out of any other mode, even if hysteretic and exit criteria not met
-  // Requirement: Don't let Modes filibuster
-  // TODO: Add hysteresis based on time, possible via a built in Variable of elapsed_time_active_s
+    Immediate(Expr),
+    Hysteretic { enter: Expr, exit: Expr },
+    // TODO: Implement some form of interrupt that can break out of any other mode, even if hysteretic and exit criteria not met
+    // Requirement: Don't let Modes filibuster
+    // TODO: Add hysteresis based on time, possible via a built in Variable of elapsed_time_active_s
 }
 
 // ============================================================================
@@ -345,7 +370,8 @@ impl Router {
         config: &Config,
     ) -> Self {
         debug!("Initializing Router with config: {:?}", config.router);
-        let (tx_telem_to_modes, rx_telem_in_modes) = broadcast::channel(config.router.max_autonomy_modes);
+        let (tx_telem_to_modes, rx_telem_in_modes) =
+            broadcast::channel(config.router.max_autonomy_modes);
         Self {
             engagement_mode: EngagementMode::Off,
             rx_telem,
@@ -360,31 +386,38 @@ impl Router {
     }
 
     fn register_autonomy_mode<M: AutonomyMode + 'static>(&mut self, mut mode: M, config: &Config) {
-        let (tx_command_to_router, rx_command_from_modes) = mpsc::channel::<Command>(config.router.command_channel_buffer_size);
+        let (tx_command_to_router, rx_command_from_modes) =
+            mpsc::channel::<Command>(config.router.command_channel_buffer_size);
         let mode_name = mode.name().clone();
         let priority = mode.priority().clone();
         let activation = mode.activation().clone();
         let active = Arc::new(tokio::sync::Mutex::new(false));
         let active_clone = active.clone();
         let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
-        let handle = tokio::spawn(async move { // TODO: Make thread/process
-          if let Err(e) = mode.run(rx_telem_in_mode, tx_command_to_router.clone(), active_clone).await {
-            warn!("Autonomy Mode error: {}", e);
-          }
+        let handle = tokio::spawn(async move {
+            // TODO: Make thread/process
+            if let Err(e) = mode
+                .run(rx_telem_in_mode, tx_command_to_router.clone(), active_clone)
+                .await
+            {
+                warn!("Autonomy Mode error: {}", e);
+            }
         });
         let managed_mode = ManagedAutonomyMode {
-          name: mode_name.clone(),
-          priority,
-          activation,
-          active,
-          handle,
+            name: mode_name.clone(),
+            priority,
+            activation,
+            active,
+            handle,
         };
-        self.autonomy_modes.insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
-      }
+        self.autonomy_modes
+            .insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
+    }
 
     async fn run(&mut self, config: &Config) -> Result<()> {
         info!("Router is starting");
-        let mut routing_interval = time::interval(std::time::Duration::from_secs(config.router.period_seconds));
+        let mut routing_interval =
+            time::interval(std::time::Duration::from_secs(config.router.period_seconds));
         loop {
             tokio::select! {
                 // Receive telemetry from C2 and forward to modes
@@ -466,7 +499,7 @@ impl Router {
                         *active = true;
                       }
                       self.selected_mode = Some(highest_priority_mode.clone());
-                      
+
                     } else {
                       debug!("Staying in mode: {}", highest_priority_mode);
                     }
@@ -479,67 +512,65 @@ impl Router {
     // TODO: Write comprehensive unit tests
     // TODO: Make this not panic
     fn eval_activation_expr(&self, expr: &Expr, latest_telem: &Option<Telemetry>) -> bool {
-      match expr {
-        Expr::Var(v) => {
-          true // TODO: Fixme
-        }
-        Expr::And(clauses) => {
-          for clause in clauses {
-            if !self.eval_activation_expr(clause, latest_telem) {
-              return false;
+        match expr {
+            Expr::Var(v) => {
+                true // TODO: Fixme
             }
-          }
-          true
-        }
-        Expr::Or(clauses) => {
-          for clause in clauses {
-            if self.eval_activation_expr(clause, latest_telem) {
-              return true;
+            Expr::And(clauses) => {
+                for clause in clauses {
+                    if !self.eval_activation_expr(clause, latest_telem) {
+                        return false;
+                    }
+                }
+                true
             }
-          }
-          false
-        }
-        Expr::Not(clause) => {
-          !self.eval_activation_expr(clause, latest_telem)
-        }
-        Expr::GreaterThan(var1, var2) => {
-            return match (&**var1, &**var2) {
-              (Variable::Float64(var1), Variable::Float64(var2)) => {
-                let a = match var1 {
-                  GenericVariable::Literal(v) => *v,
-                  GenericVariable::TelemetryRef(name) => {
-                    if let Some(telem) = &latest_telem {
-                      match name.as_str() {
-                        "proximity_m" => telem.proximity_m as f64,
-                        _ => return false, // Unknown telemetry field
-                      }
-                    } else {
-                      return false; // No telemetry available
+            Expr::Or(clauses) => {
+                for clause in clauses {
+                    if self.eval_activation_expr(clause, latest_telem) {
+                        return true;
                     }
-                  }
-                  _ => return false, // TODO: Implement rest
-                };
-                let b = match var2 {
-                  GenericVariable::Literal(v) => *v,
-                  GenericVariable::TelemetryRef(name) => {
-                    if let Some(telem) = &latest_telem {
-                      match name.as_str() {
-                        "proximity_m" => telem.proximity_m as f64,
-                        _ => return false, // Unknown telemetry field 
-                      }
-                    } else {
-                      return false; // No telemetry available
+                }
+                false
+            }
+            Expr::Not(clause) => !self.eval_activation_expr(clause, latest_telem),
+            Expr::GreaterThan(var1, var2) => {
+                return match (&**var1, &**var2) {
+                    (Variable::Float64(var1), Variable::Float64(var2)) => {
+                        let a = match var1 {
+                            GenericVariable::Literal(v) => *v,
+                            GenericVariable::TelemetryRef(name) => {
+                                if let Some(telem) = &latest_telem {
+                                    match name.as_str() {
+                                        "proximity_m" => telem.proximity_m as f64,
+                                        _ => return false, // Unknown telemetry field
+                                    }
+                                } else {
+                                    return false; // No telemetry available
+                                }
+                            }
+                            _ => return false, // TODO: Implement rest
+                        };
+                        let b = match var2 {
+                            GenericVariable::Literal(v) => *v,
+                            GenericVariable::TelemetryRef(name) => {
+                                if let Some(telem) = &latest_telem {
+                                    match name.as_str() {
+                                        "proximity_m" => telem.proximity_m as f64,
+                                        _ => return false, // Unknown telemetry field
+                                    }
+                                } else {
+                                    return false; // No telemetry available
+                                }
+                            }
+                            _ => return false, // TODO: Implement rest
+                        };
+                        a > b
                     }
-                  }
-                  _ => return false, // TODO: Implement rest
+                    _ => false, // TODO: Implement rest
                 };
-                a > b
-              }
-              _ => false, // TODO: Implement rest
-          }
+            }
+            _ => false, // TODO: Implement rest
         }
-        _ => false, // TODO: Implement rest
-      }
     }
 }
 
@@ -554,7 +585,7 @@ async fn c2_interface_task(
     observability: Arc<ObservabilitySubsystem>,
 ) -> Result<()> {
     info!("C2 interface started");
-    
+
     loop {
         tokio::select! {
             result = transport.recv_telemetry() => {
@@ -577,7 +608,7 @@ async fn c2_interface_task(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -590,7 +621,7 @@ async fn config_interface_task(
     config_tx: mpsc::Sender<ConfigMessage>,
 ) -> Result<()> {
     info!("Config interface started");
-    
+
     loop {
         match transport.recv_config().await {
             Ok(config) => {
@@ -603,7 +634,7 @@ async fn config_interface_task(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -619,7 +650,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct C2Config {
-    pub transport: String,  // "tcp", "udp", "serial", "mock"
+    pub transport: String, // "tcp", "udp", "serial", "mock"
     pub address: String,
     pub port: u16,
     pub timeout_ms: u64,
@@ -664,7 +695,7 @@ impl Default for Config {
                 metrics: MetricsConfig {
                     enabled: true,
                     period_seconds: 10,
-                }
+                },
             },
             router: RouterConfig {
                 max_autonomy_modes: 64,
@@ -683,46 +714,88 @@ impl Default for Config {
 
 #[derive(Debug)]
 struct CollisionAvoidanceAutonomyMode {
-  name: String,
-  priority: u8,
-  activation: Option<Activation>,
+    name: String,
+    priority: u8,
+    activation: Option<Activation>,
 }
 #[async_trait]
 impl AutonomyMode for CollisionAvoidanceAutonomyMode {
-  fn name(&self) -> String { self.name.clone() }
-  fn priority(&self) -> u8 { self.priority }
-  fn activation(&self) -> Option<Activation> { self.activation.clone() }
-  async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()> {
-      loop {
-          if let Ok(telemetry) = rx_telem.recv().await {
-            let active = active.lock().await;
-            info!("{} [{}] received telemetry: {:?}", self.name(), active, telemetry);
-            tx_command.send(Command { cmd_id: 1, payload: vec![0, 1, 2] }).await?;
-          }
-      }
-  }
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+    fn activation(&self) -> Option<Activation> {
+        self.activation.clone()
+    }
+    async fn run(
+        &mut self,
+        mut rx_telem: broadcast::Receiver<Telemetry>,
+        tx_command: mpsc::Sender<Command>,
+        active: Arc<tokio::sync::Mutex<bool>>,
+    ) -> Result<()> {
+        loop {
+            if let Ok(telemetry) = rx_telem.recv().await {
+                let active = active.lock().await;
+                info!(
+                    "{} [{}] received telemetry: {:?}",
+                    self.name(),
+                    active,
+                    telemetry
+                );
+                tx_command
+                    .send(Command {
+                        cmd_id: 1,
+                        payload: vec![0, 1, 2],
+                    })
+                    .await?;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct NominalOperationsAutonomyMode {
-  name: String,
-  priority: u8,
-  activation: Option<Activation>,
+    name: String,
+    priority: u8,
+    activation: Option<Activation>,
 }
 #[async_trait]
 impl AutonomyMode for NominalOperationsAutonomyMode {
-  fn name(&self) -> String { self.name.clone() }
-  fn priority(&self) -> u8 { self.priority }
-  fn activation(&self) -> Option<Activation> { self.activation.clone() }
-  async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()> {
-      loop {
-          if let Ok(telemetry) = rx_telem.recv().await {
-            let active = active.lock().await;
-            info!("{} [{}] received telemetry: {:?}", self.name(), active, telemetry);
-            tx_command.send(Command { cmd_id: 1, payload: vec![3, 4, 5] }).await?;
-          }
-      }
-  }
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+    fn activation(&self) -> Option<Activation> {
+        self.activation.clone()
+    }
+    async fn run(
+        &mut self,
+        mut rx_telem: broadcast::Receiver<Telemetry>,
+        tx_command: mpsc::Sender<Command>,
+        active: Arc<tokio::sync::Mutex<bool>>,
+    ) -> Result<()> {
+        loop {
+            if let Ok(telemetry) = rx_telem.recv().await {
+                let active = active.lock().await;
+                info!(
+                    "{} [{}] received telemetry: {:?}",
+                    self.name(),
+                    active,
+                    telemetry
+                );
+                tx_command
+                    .send(Command {
+                        cmd_id: 1,
+                        payload: vec![3, 4, 5],
+                    })
+                    .await?;
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -736,10 +809,9 @@ async fn main() -> Result<()> {
         // Format: SAFE__ROUTER__MAX_AUTONOMY_MODES=128
         .merge(Env::prefixed("SAFE__").split("__"))
         .extract()?;
-    
-    let (non_blocking, _guard) = tracing_appender::non_blocking(
-        tracing_appender::rolling::daily("./logs", "safe.log")
-    );
+
+    let (non_blocking, _guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "safe.log"));
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_target(false)
@@ -748,22 +820,26 @@ async fn main() -> Result<()> {
         .init();
 
     let thing = AutonomyModeDefinition {
-      name: "CollisionAvoidance".to_string(),
-      priority: 1,
-      activation: Some(Activation::Hysteretic {
-        enter: Expr::GreaterThan(
-          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
-          Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-        ),
-        exit: Expr::LessThan(
-          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
-          Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
-        ),
-      }),
+        name: "CollisionAvoidance".to_string(),
+        priority: 1,
+        activation: Some(Activation::Hysteretic {
+            enter: Expr::GreaterThan(
+                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                    "proximity_m".to_string(),
+                ))),
+                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+            ),
+            exit: Expr::LessThan(
+                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                    "proximity_m".to_string(),
+                ))),
+                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+            ),
+        }),
     };
     let var = VariableDefinition::<f64> {
-      name: "proximity_m".to_string(),
-      initial_value: Some(0.0),
+        name: "proximity_m".to_string(),
+        initial_value: Some(0.0),
     };
     let v = serde_json::to_string_pretty(&thing)?;
     println!("{}", v);
@@ -775,7 +851,7 @@ async fn main() -> Result<()> {
     println!("{:?}", v);
 
     info!("SAFE is in start up.");
-    
+
     let observability = Arc::new(ObservabilitySubsystem::new(None));
     let observability_clone = observability.clone();
     let config_clone = config.clone();
@@ -785,9 +861,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (tx_telemetry_to_router, rx_telemetry_in_router) = mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
-    let (tx_command_to_c2, rx_command_in_c2) = mpsc::channel::<Command>(config.router.command_channel_buffer_size);
-    
+    let (tx_telemetry_to_router, rx_telemetry_in_router) =
+        mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
+    let (tx_command_to_c2, rx_command_in_c2) =
+        mpsc::channel::<Command>(config.router.command_channel_buffer_size);
+
     let mut router = Router::new(
         rx_telemetry_in_router,
         tx_command_to_c2,
@@ -796,37 +874,41 @@ async fn main() -> Result<()> {
     );
 
     let mode = CollisionAvoidanceAutonomyMode {
-      name: "CollisionAvoidance".to_string(),
-      priority: 1,
-      activation: Some(Activation::Hysteretic {
-        enter: Expr::Not(
-          Box::new(Expr::GreaterThan(
-            Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
-            Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-          ))
-        ),
-        exit: Expr::GreaterThan(
-          Box::new(Variable::Float64(GenericVariable::TelemetryRef("proximity_m".to_string()))),
-          Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
-        ),
-      }),
+        name: "CollisionAvoidance".to_string(),
+        priority: 1,
+        activation: Some(Activation::Hysteretic {
+            enter: Expr::Not(Box::new(Expr::GreaterThan(
+                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                    "proximity_m".to_string(),
+                ))),
+                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+            ))),
+            exit: Expr::GreaterThan(
+                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                    "proximity_m".to_string(),
+                ))),
+                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+            ),
+        }),
     };
     router.register_autonomy_mode(mode, &config);
 
     let mode = NominalOperationsAutonomyMode {
-      name: "NominalOps".to_string(),
-      priority: 0,
-      activation: Some(Activation::Immediate(Expr::Var(Variable::Bool(GenericVariable::Literal(true))))),
+        name: "NominalOps".to_string(),
+        priority: 0,
+        activation: Some(Activation::Immediate(Expr::Var(Variable::Bool(
+            GenericVariable::Literal(true),
+        )))),
     };
     router.register_autonomy_mode(mode, &config);
-    
+
     let config_clone = config.clone();
     tokio::spawn(async move {
         if let Err(e) = router.run(&config_clone).await {
             warn!("Router error: {}", e); // TODO: This needs to be more than a warning
         }
     });
-    
+
     // let c2_listener = TcpListener::bind("127.0.0.1:8001").await?;
     // info!("C2 interface listening on 127.0.0.1:8001");
     // tokio::spawn(async move {
@@ -840,7 +922,7 @@ async fn main() -> Result<()> {
     //         ).await;
     //     }
     // });
-          
+
     // let config_listener = TcpListener::bind("127.0.0.1:8002").await?;
     // info!("Config interface listening on 127.0.0.1:8002");
     // tokio::spawn(async move {
@@ -850,18 +932,43 @@ async fn main() -> Result<()> {
     //     }
     // });
 
-    tx_telemetry_to_router.send(Telemetry { timestamp: 12, proximity_m: 1200 }).await?;
-    tx_telemetry_to_router.send(Telemetry { timestamp: 13, proximity_m: 1200 }).await?;
+    tx_telemetry_to_router
+        .send(Telemetry {
+            timestamp: 12,
+            proximity_m: 1200,
+        })
+        .await?;
+    tx_telemetry_to_router
+        .send(Telemetry {
+            timestamp: 13,
+            proximity_m: 1200,
+        })
+        .await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router.send(Telemetry { timestamp: 14, proximity_m: 99 }).await?;
+    tx_telemetry_to_router
+        .send(Telemetry {
+            timestamp: 14,
+            proximity_m: 99,
+        })
+        .await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router.send(Telemetry { timestamp: 14, proximity_m: 99 }).await?;
+    tx_telemetry_to_router
+        .send(Telemetry {
+            timestamp: 14,
+            proximity_m: 99,
+        })
+        .await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router.send(Telemetry { timestamp: 14, proximity_m: 200 }).await?;
-    
+    tx_telemetry_to_router
+        .send(Telemetry {
+            timestamp: 14,
+            proximity_m: 200,
+        })
+        .await?;
+
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
-    
+
     Ok(())
 }
 
@@ -879,7 +986,7 @@ async fn main() -> Result<()> {
 - Is it important to guarantee that Modes can't issue commands when Router logic would deactivate them?  Do we need to work out the races here or is this acceptable?
  */
 
-/* 
+/*
 Known issues:
 - Can start the Mode and also hold it as mutable because the run awaits indefinitely
 - Need to better Activation interpreter
