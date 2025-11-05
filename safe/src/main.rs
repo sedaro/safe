@@ -11,17 +11,18 @@ use async_trait::async_trait;
 use c2::{Command, Telemetry};
 use config::Config;
 use definitions::{
-    Activation, AutonomyModeDefinition, Expr, GenericVariable, Variable, VariableDefinition,
+    Activation, Expr, Value, Variable,
 };
 use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
 use observability as obs;
 use router::{AutonomyMode, Router};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
     name: String,
     priority: u8,
@@ -64,7 +65,7 @@ impl AutonomyMode for CollisionAvoidanceAutonomyMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct NominalOperationsAutonomyMode {
     name: String,
     priority: u8,
@@ -128,37 +129,6 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    let thing = AutonomyModeDefinition {
-        name: "CollisionAvoidance".to_string(),
-        priority: 1,
-        activation: Some(Activation::Hysteretic {
-            enter: Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
-                    "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-            ),
-            exit: Expr::LessThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
-                    "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
-            ),
-        }),
-    };
-    let var = VariableDefinition::<f64> {
-        name: "proximity_m".to_string(),
-        initial_value: Some(0.0),
-    };
-    let v = serde_json::to_string_pretty(&thing)?;
-    println!("{}", v);
-    let v = serde_json::from_str::<AutonomyModeDefinition>(&v)?;
-    println!("{:?}", v);
-    let v = serde_json::to_string_pretty(&var)?;
-    println!("{}", v);
-    let v = serde_json::from_str::<VariableDefinition<f64>>(&v)?;
-    println!("{:?}", v);
-
     info!("SAFE is in start up.");
 
     let observability = Arc::new(obs::ObservabilitySubsystem::new(None));
@@ -189,16 +159,16 @@ async fn main() -> Result<()> {
         priority: 1,
         activation: Some(Activation::Hysteretic {
             enter: Expr::Not(Box::new(Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
             ))),
             exit: Expr::GreaterThan(
-                Box::new(Variable::Float64(GenericVariable::TelemetryRef(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "proximity_m".to_string(),
-                ))),
-                Box::new(Variable::Float64(GenericVariable::Literal(150.0))),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
             ),
         }),
     };
@@ -207,8 +177,8 @@ async fn main() -> Result<()> {
     let mode = NominalOperationsAutonomyMode {
         name: "NominalOps".to_string(),
         priority: 0,
-        activation: Some(Activation::Immediate(Expr::Var(Variable::Bool(
-            GenericVariable::Literal(true),
+        activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
+            Value::Literal(true),
         )))),
     };
     router.register_autonomy_mode(mode, &config);
@@ -284,9 +254,6 @@ async fn main() -> Result<()> {
 }
 
 /*
-- CI/CD
-- Implement Routing (review with Alex)
--- later --
 - Have a rust-native autonomy mode or two
 - Mode transition command purging
 - Try to compile it for Raspberry PI and STM MCU
