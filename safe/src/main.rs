@@ -225,6 +225,10 @@ struct ManagedAutonomyMode {
     handle: tokio::task::JoinHandle<()>,
 }
 
+// ============================================================================
+// Definition Ontology
+// ============================================================================
+
 // TODO: Get feedback from Team on all of this Ontology!
 // TODO: SedaroTS here instead?  QK awareness would be awesome for telem
 
@@ -321,16 +325,6 @@ enum Activation {
 // Router
 // ============================================================================
 
-// #[async_trait]
-// pub trait AutonomyModeHandle: Send + Sync {
-//     async fn run(&mut self) -> Result<()>;
-// }
-// impl<P: AutonomyMode + 'static> AutonomyModeHandle for ManagedAutonomyMode<P> {
-//     async fn run(&mut self) -> Result<()> {
-//         ManagedAutonomyMode::run(self).await
-//     }
-// }
-
 struct Router {
     engagement_mode: EngagementMode,
     rx_telem: mpsc::Receiver<Telemetry>,
@@ -339,7 +333,6 @@ struct Router {
     tx_command: mpsc::Sender<Command>,
     observability: Arc<ObservabilitySubsystem>,
     selected_mode: Option<String>,
-    // autonomy_modes: HashMap<String, (Arc<tokio::sync::Mutex<dyn AutonomyMode + Send>>, mpsc::Receiver<Command>)>,
     autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
     telem_buffer: VecDeque<Telemetry>,
 }
@@ -374,8 +367,7 @@ impl Router {
         let active = Arc::new(tokio::sync::Mutex::new(false));
         let active_clone = active.clone();
         let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
-        let handle = tokio::spawn(async move { // TODO: Make thread
-          // let mut mode = mode_for_task.lock().await;
+        let handle = tokio::spawn(async move { // TODO: Make thread/process
           if let Err(e) = mode.run(rx_telem_in_mode, tx_command_to_router.clone(), active_clone).await {
             warn!("Autonomy Mode error: {}", e);
           }
@@ -387,8 +379,6 @@ impl Router {
           active,
           handle,
         };
-        // let mode = Arc::new(tokio::sync::Mutex::new(mode));
-        // let mode_for_task = mode.clone();
         self.autonomy_modes.insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
         self.selected_mode = Some(mode_name); // TODO: Remove and based on router activations
       }
@@ -498,11 +488,6 @@ impl Router {
           !self.eval_activation_expr(clause, latest_telem)
         }
         Expr::GreaterThan(var1, var2) => {
-          // match var1.partial_cmp(&var2) {
-          //   Some(order) => order == std::cmp::Ordering::Greater,
-          //   None => false, // TODO: Can't compare natively so evaluate further
-          // }
-            
             return match (&**var1, &**var2) {
               (Variable::Float64(var1), Variable::Float64(var2)) => {
                 let a = match var1 {
@@ -718,7 +703,7 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
       loop {
           if let Ok(telemetry) = rx_telem.recv().await {
             let active = active.lock().await;
-            info!("{}: {} received telemetry: {:?}", active, self.name(), telemetry);
+            info!("{} [{}] received telemetry: {:?}", self.name(), active, telemetry);
             tx_command.send(Command { cmd_id: 1, payload: vec![3, 4, 5] }).await?;
           }
       }
