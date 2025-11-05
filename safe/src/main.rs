@@ -175,6 +175,8 @@ async fn main() -> Result<()> {
     let (tx_command_to_c2, rx_command_in_c2) =
         mpsc::channel::<Command>(config.router.command_channel_buffer_size);
 
+    // Create router and then register Modes to it.
+    // This allows for us to dynamically create and destroy Modes while running.
     let mut router = Router::new(
         rx_telemetry_in_router,
         tx_command_to_c2,
@@ -282,7 +284,6 @@ async fn main() -> Result<()> {
 }
 
 /*
-- Refactor file and format
 - CI/CD
 - Implement Routing (review with Alex)
 -- later --
@@ -313,9 +314,5 @@ Think hard about how SAFE comes up if state already exists!!!
 
 /*
 How is routing logic defined?  Part of the Ontology?  Ask team.
- */
-
-/*
-Create router and then register Modes to it.
-This allows for us to dynamically create and destroy modes as needed.
+Needs to be able to implement arbitrary logic as rust code as a fall back.
  */
