@@ -1,0 +1,27 @@
+[package]
+name = "safe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+miette = { version = "7.2.0", features = ["fancy"] }
+tempfile = "3.14.0"
+rand = "0.8.5"
+rand_distr = "0.4.3"
+tokio = { version = "1", features = ["full", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.133"
+bincode = "1"
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-appender = "0.2"
+redb = "2"
+figment = { version = "0.10", features = ["yaml", "env"] }
+sysinfo = "0.30"
