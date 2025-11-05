@@ -9,7 +9,8 @@ use tokio::time;
 use tracing::{debug, info, warn};
 use crate::c2::{Command, Telemetry};
 use crate::config::{Config, EngagementMode};
-use crate::definitions::{Activation, Expr, GenericVariable, Variable};
+use crate::definitions::Variable;
+use crate::definitions::{Activation, Expr, Value, Resolvable};
 use crate::observability as obs;
 
 
@@ -38,6 +39,27 @@ pub struct ManagedAutonomyMode {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
+pub struct Resolver {
+    telem_buffer: VecDeque<Telemetry>,
+    vars: HashMap<String, Variable>,
+}
+impl Resolvable for Resolver {
+    fn get_telemetry(&self, var: &str) -> Option<Variable> {
+        if let Some(latest_telem) = self.telem_buffer.front() {
+            match var {
+                "proximity_m" => Some(Variable::Float64(Value::Literal(latest_telem.proximity_m as f64))),
+                "timestamp" => Some(Variable::Float64(Value::Literal(latest_telem.timestamp as f64))),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+    fn get_variable(&self, var: &str) -> Option<Variable> {
+        self.vars.get(var).cloned()
+    }
+}
+
 pub struct Router {
     engagement_mode: EngagementMode,
     rx_telem: mpsc::Receiver<Telemetry>,
@@ -47,7 +69,7 @@ pub struct Router {
     observability: Arc<obs::ObservabilitySubsystem>,
     selected_mode: Option<String>,
     autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
-    telem_buffer: VecDeque<Telemetry>,
+    resolver: Resolver,
 }
 
 impl Router {
@@ -69,7 +91,10 @@ impl Router {
             observability,
             selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
             autonomy_modes: HashMap::new(),
-            telem_buffer: VecDeque::with_capacity(config.router.historic_telem_buffer_size),
+            resolver: Resolver {
+                telem_buffer: VecDeque::with_capacity(config.router.historic_telem_buffer_size),
+                vars: HashMap::new(),
+            },
         }
     }
 
@@ -114,9 +139,9 @@ impl Router {
                         obs::Location::Router,
                         obs::Event::TelemetryReceived(telemetry.clone()),
                     );
-                    self.telem_buffer.push_front(telemetry.clone());
-                    if self.telem_buffer.len() > config.router.historic_telem_buffer_size {
-                      self.telem_buffer.pop_back();
+                    self.resolver.telem_buffer.push_front(telemetry.clone());
+                    if self.resolver.telem_buffer.len() > config.router.historic_telem_buffer_size {
+                      self.resolver.telem_buffer.pop_back();
                     }
                     if let Err(_) = self.tx_telem_to_modes.send(telemetry) {
                         warn!("No active subscribers for telemetry");
@@ -147,15 +172,22 @@ impl Router {
 
                 // Updating Routing Decision
                 _ = routing_interval.tick() => {
-                  let latest_telem = self.telem_buffer.front().cloned();
                   let mut candidate_modes: Vec<(u8, String)> = vec![];
                   // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
                   if let Some(current_mode_name) = &self.selected_mode {
                     let (current_mode, _) = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
                     if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
                       // Evaluate exit criteria
-                      if !eval_activation_expr(exit, &latest_telem) {
-                        continue;
+                      match exit.eval(&self.resolver) {
+                        Ok(exit_met) => {
+                          if !exit_met {
+                            continue;
+                          }
+                        }
+                        Err(e) => {
+                          warn!("Failed to evaluate exit criteria for mode {}: {:?}.  Exiting.", current_mode_name, e); // TODO: Figure out what desired behavior is here (and make configurable)
+                          continue;
+                        }
                       }
                     }
                   }
@@ -166,8 +198,15 @@ impl Router {
                         Activation::Immediate(expr) => expr,
                         Activation::Hysteretic { enter, exit: _ } => enter,
                       };
-                      if eval_activation_expr(activation, &latest_telem) {
-                        candidate_modes.push((managed_mode.priority, mode_name.clone()));
+                      match activation.eval(&self.resolver) {
+                        Ok(activation_met) => {
+                          if activation_met {
+                            candidate_modes.push((managed_mode.priority, mode_name.clone()));
+                          }
+                        }
+                        Err(e) => {
+                          warn!("Failed to evaluate activation criteria for mode {}: {:?}.  Mode will not be activated.", mode_name, e);
+                        }
                       }
                     }
                   }
@@ -197,93 +236,44 @@ impl Router {
         }
     }
 }
-
-// TODO: Write comprehensive unit tests
-// TODO: Make this not panic
-fn eval_activation_expr(expr: &Expr, latest_telem: &Option<Telemetry>) -> bool {
-    match expr {
-        Expr::Var(v) => {
-            true // TODO: Fixme
-        }
-        Expr::And(clauses) => {
-            for clause in clauses {
-                if !eval_activation_expr(clause, latest_telem) {
-                    return false;
-                }
-            }
-            true
-        }
-        Expr::Or(clauses) => {
-            for clause in clauses {
-                if eval_activation_expr(clause, latest_telem) {
-                    return true;
-                }
-            }
-            false
-        }
-        Expr::Not(clause) => !eval_activation_expr(clause, latest_telem),
-        Expr::GreaterThan(var1, var2) => {
-            return match (&**var1, &**var2) {
-                (Variable::Float64(var1), Variable::Float64(var2)) => {
-                    let a = match var1 {
-                        GenericVariable::Literal(v) => *v,
-                        GenericVariable::TelemetryRef(name) => {
-                            if let Some(telem) = &latest_telem {
-                                match name.as_str() {
-                                    "proximity_m" => telem.proximity_m as f64,
-                                    _ => return false, // Unknown telemetry field
-                                }
-                            } else {
-                                return false; // No telemetry available
-                            }
-                        }
-                        _ => return false, // TODO: Implement rest
-                    };
-                    let b = match var2 {
-                        GenericVariable::Literal(v) => *v,
-                        GenericVariable::TelemetryRef(name) => {
-                            if let Some(telem) = &latest_telem {
-                                match name.as_str() {
-                                    "proximity_m" => telem.proximity_m as f64,
-                                    _ => return false, // Unknown telemetry field
-                                }
-                            } else {
-                                return false; // No telemetry available
-                            }
-                        }
-                        _ => return false, // TODO: Implement rest
-                    };
-                    println!("Comparing {} > {}", a, b);
-                    a > b
-                }
-                _ => false, // TODO: Implement rest
-            };
-        }
-        _ => false, // TODO: Implement rest
-    }
-}
-
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use crate::definitions::{Value, Variable};
+
+use super::*;
 
   #[test]
   fn test_eval() {
-    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
-        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-    )), &None), false);
-    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
-        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
-    )), &None), false);
-    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
-        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
-        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-    )), &None), true);
-    assert_eq!(eval_activation_expr(&Expr::Not(Box::new(Expr::GreaterThan(
-        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
-        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
-    ))), &None), false);
+
+    let resolver = Resolver {
+        telem_buffer: VecDeque::from(vec![
+            Telemetry {
+                timestamp: 1000,
+                proximity_m: 150,
+            },
+            Telemetry {
+                timestamp: 2000,
+                proximity_m: 50,
+            },
+        ]),
+        vars: HashMap::from_iter([
+          ("a".into(), Variable::Float64(Value::Literal(0.0))),
+          ("b".into(), Variable::Bool(Value::Literal(true))),
+          ("c".into(), Variable::String(Value::Literal("test".to_string()))),
+        ]),
+    };
+
+    assert_eq!(Expr::GreaterThan(
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+    ).eval(&resolver).unwrap(), false);
+    assert_eq!(Expr::GreaterThan(
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+    ).eval(&resolver).unwrap(), false);
+    assert_eq!(Expr::GreaterThan(
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+    ).eval(&resolver).unwrap(), true);
   }
 }
