@@ -154,7 +154,7 @@ impl Router {
                     let (current_mode, _) = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
                     if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
                       // Evaluate exit criteria
-                      if !self.eval_activation_expr(exit, &latest_telem) {
+                      if !eval_activation_expr(exit, &latest_telem) {
                         continue;
                       }
                     }
@@ -166,7 +166,7 @@ impl Router {
                         Activation::Immediate(expr) => expr,
                         Activation::Hysteretic { enter, exit: _ } => enter,
                       };
-                      if self.eval_activation_expr(activation, &latest_telem) {
+                      if eval_activation_expr(activation, &latest_telem) {
                         candidate_modes.push((managed_mode.priority, mode_name.clone()));
                       }
                     }
@@ -196,68 +196,94 @@ impl Router {
             }
         }
     }
+}
 
-    // TODO: Write comprehensive unit tests
-    // TODO: Make this not panic
-    fn eval_activation_expr(&self, expr: &Expr, latest_telem: &Option<Telemetry>) -> bool {
-        match expr {
-            Expr::Var(v) => {
-                true // TODO: Fixme
-            }
-            Expr::And(clauses) => {
-                for clause in clauses {
-                    if !self.eval_activation_expr(clause, latest_telem) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Expr::Or(clauses) => {
-                for clause in clauses {
-                    if self.eval_activation_expr(clause, latest_telem) {
-                        return true;
-                    }
-                }
-                false
-            }
-            Expr::Not(clause) => !self.eval_activation_expr(clause, latest_telem),
-            Expr::GreaterThan(var1, var2) => {
-                return match (&**var1, &**var2) {
-                    (Variable::Float64(var1), Variable::Float64(var2)) => {
-                        let a = match var1 {
-                            GenericVariable::Literal(v) => *v,
-                            GenericVariable::TelemetryRef(name) => {
-                                if let Some(telem) = &latest_telem {
-                                    match name.as_str() {
-                                        "proximity_m" => telem.proximity_m as f64,
-                                        _ => return false, // Unknown telemetry field
-                                    }
-                                } else {
-                                    return false; // No telemetry available
-                                }
-                            }
-                            _ => return false, // TODO: Implement rest
-                        };
-                        let b = match var2 {
-                            GenericVariable::Literal(v) => *v,
-                            GenericVariable::TelemetryRef(name) => {
-                                if let Some(telem) = &latest_telem {
-                                    match name.as_str() {
-                                        "proximity_m" => telem.proximity_m as f64,
-                                        _ => return false, // Unknown telemetry field
-                                    }
-                                } else {
-                                    return false; // No telemetry available
-                                }
-                            }
-                            _ => return false, // TODO: Implement rest
-                        };
-                        a > b
-                    }
-                    _ => false, // TODO: Implement rest
-                };
-            }
-            _ => false, // TODO: Implement rest
+// TODO: Write comprehensive unit tests
+// TODO: Make this not panic
+fn eval_activation_expr(expr: &Expr, latest_telem: &Option<Telemetry>) -> bool {
+    match expr {
+        Expr::Var(v) => {
+            true // TODO: Fixme
         }
+        Expr::And(clauses) => {
+            for clause in clauses {
+                if !eval_activation_expr(clause, latest_telem) {
+                    return false;
+                }
+            }
+            true
+        }
+        Expr::Or(clauses) => {
+            for clause in clauses {
+                if eval_activation_expr(clause, latest_telem) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Not(clause) => !eval_activation_expr(clause, latest_telem),
+        Expr::GreaterThan(var1, var2) => {
+            return match (&**var1, &**var2) {
+                (Variable::Float64(var1), Variable::Float64(var2)) => {
+                    let a = match var1 {
+                        GenericVariable::Literal(v) => *v,
+                        GenericVariable::TelemetryRef(name) => {
+                            if let Some(telem) = &latest_telem {
+                                match name.as_str() {
+                                    "proximity_m" => telem.proximity_m as f64,
+                                    _ => return false, // Unknown telemetry field
+                                }
+                            } else {
+                                return false; // No telemetry available
+                            }
+                        }
+                        _ => return false, // TODO: Implement rest
+                    };
+                    let b = match var2 {
+                        GenericVariable::Literal(v) => *v,
+                        GenericVariable::TelemetryRef(name) => {
+                            if let Some(telem) = &latest_telem {
+                                match name.as_str() {
+                                    "proximity_m" => telem.proximity_m as f64,
+                                    _ => return false, // Unknown telemetry field
+                                }
+                            } else {
+                                return false; // No telemetry available
+                            }
+                        }
+                        _ => return false, // TODO: Implement rest
+                    };
+                    println!("Comparing {} > {}", a, b);
+                    a > b
+                }
+                _ => false, // TODO: Implement rest
+            };
+        }
+        _ => false, // TODO: Implement rest
     }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_eval() {
+    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
+        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+    )), &None), false);
+    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
+        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
+    )), &None), false);
+    assert_eq!(eval_activation_expr(&Box::new(Expr::GreaterThan(
+        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
+        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+    )), &None), true);
+    assert_eq!(eval_activation_expr(&Expr::Not(Box::new(Expr::GreaterThan(
+        Box::new(Variable::Float64(GenericVariable::Literal(101.0))),
+        Box::new(Variable::Float64(GenericVariable::Literal(100.0))),
+    ))), &None), false);
+  }
 }
