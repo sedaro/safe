@@ -214,36 +214,15 @@ trait AutonomyMode: Send + Sync {
     fn name(&self) -> String;
     fn activation(&self) -> Option<Activation>;
     fn priority(&self) -> u8;
-    async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: &bool) -> Result<()>;
+    async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()>;
 }
 
-pub struct ManagedAutonomyMode<M: AutonomyMode> {
-    mode: M,
+struct ManagedAutonomyMode {
     name: String,
-    started_at: Instant,
-    rx_telem: broadcast::Receiver<Telemetry>,
-    tx_command: mpsc::Sender<Command>,
-    active: bool,
+    active: Arc<tokio::sync::Mutex<bool>>,
     priority: u8,
     activation: Option<Activation>,
-}
-
-impl<M: AutonomyMode> ManagedAutonomyMode<M> {
-    pub fn new(name: String, mode: M, rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, priority: u8, activation: Option<Activation>) -> Self {
-        Self {
-            mode,
-            name,
-            started_at: Instant::now(),
-            rx_telem,
-            tx_command,
-            active: false,
-            priority,
-            activation,
-        }
-    }
-    pub async fn run(&mut self) -> Result<()> {
-        self.mode.run(self.rx_telem.resubscribe(), self.tx_command.clone(), &self.active).await
-    }
+    handle: tokio::task::JoinHandle<()>,
 }
 
 // TODO: Get feedback from Team on all of this Ontology!
@@ -268,6 +247,22 @@ enum GenericVariable<T> {
   VariableRef(String),
   TelemetryRef(String),
 }
+// impl<T: PartialEq> PartialEq for GenericVariable<T> {
+//     fn eq(&self, other: &Self) -> bool {
+//         match (self, other) {
+//             (GenericVariable::Literal(a), GenericVariable::Literal(b)) => a == b,
+//             _ => false,
+//         }
+//     }
+// }
+// impl<T: PartialOrd> PartialOrd for GenericVariable<T> {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         match (self, other) {
+//             (GenericVariable::Literal(a), GenericVariable::Literal(b)) => a.partial_cmp(b),
+//             _ => None,
+//         }
+//     }
+// }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Variable {
@@ -275,6 +270,32 @@ enum Variable {
   Float64(GenericVariable<f64>),
   Bool(GenericVariable<bool>),
 }
+// impl PartialEq for Variable {
+//     fn eq(&self, other: &Self) -> bool {
+//         match (self, other) {
+//             (Variable::Float64(a), Variable::Float64(b)) => a == b,
+//             (Variable::String(a), Variable::String(b)) => a == b,
+//             (Variable::Bool(a), Variable::Bool(b)) => a == b,
+//             (Variable::Float64(a), Variable::Bool(b)) => a == (if *b { 1.0 } else { 0.0 }),
+//             (Variable::Bool(a), Variable::Float64(b)) => (if *a { 1.0 } else { 0.0 }) == b,
+//             // (Variable::Float64(a), Variable::Bool(b)) => a == b.into(),
+//             // (Variable::Bool(a), Variable::Float64(b)) => a.into() == b,
+//             _ => false,
+//         }
+//     }
+// }
+// impl PartialOrd for Variable {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         match (self, other) {
+//             (Variable::Float64(a), Variable::Float64(b)) => a.partial_cmp(b),
+//             (Variable::String(a), Variable::String(b)) => a.partial_cmp(b),
+//             (Variable::Bool(a), Variable::Bool(b)) => a.partial_cmp(b),
+//             (Variable::Float64(a), Variable::Bool(b)) => a.partial_cmp(&(if *b { 1.0 } else { 0.0 })),
+//             (Variable::Bool(a), Variable::Float64(b)) => (if *a { 1.0 } else { 0.0 }).partial_cmp(b),
+//             _ => None,
+//         }
+//     }
+// }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum Expr {
@@ -300,15 +321,15 @@ enum Activation {
 // Router
 // ============================================================================
 
-#[async_trait]
-pub trait AutonomyModeHandle: Send + Sync {
-    async fn run(&mut self) -> Result<()>;
-}
-impl<P: AutonomyMode + 'static> AutonomyModeHandle for ManagedAutonomyMode<P> {
-    async fn run(&mut self) -> Result<()> {
-        ManagedAutonomyMode::run(self).await
-    }
-}
+// #[async_trait]
+// pub trait AutonomyModeHandle: Send + Sync {
+//     async fn run(&mut self) -> Result<()>;
+// }
+// impl<P: AutonomyMode + 'static> AutonomyModeHandle for ManagedAutonomyMode<P> {
+//     async fn run(&mut self) -> Result<()> {
+//         ManagedAutonomyMode::run(self).await
+//     }
+// }
 
 struct Router {
     engagement_mode: EngagementMode,
@@ -319,7 +340,7 @@ struct Router {
     observability: Arc<ObservabilitySubsystem>,
     selected_mode: Option<String>,
     // autonomy_modes: HashMap<String, (Arc<tokio::sync::Mutex<dyn AutonomyMode + Send>>, mpsc::Receiver<Command>)>,
-    autonomy_modes: HashMap<String, (Box<dyn AutonomyModeHandle>, mpsc::Receiver<Command>)>,
+    autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
     telem_buffer: VecDeque<Telemetry>,
 }
 
@@ -345,30 +366,31 @@ impl Router {
         }
     }
 
-    fn register_autonomy_mode<M: AutonomyMode + 'static>(&mut self, mode: M, config: &Config) {
+    fn register_autonomy_mode<M: AutonomyMode + 'static>(&mut self, mut mode: M, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) = mpsc::channel::<Command>(config.router.command_channel_buffer_size);
-        let mode_name = mode.name();
+        let mode_name = mode.name().clone();
         let priority = mode.priority().clone();
         let activation = mode.activation().clone();
-        let mut managed_mode = Box::new(ManagedAutonomyMode::new(
-          mode_name.clone(),
-          mode,
-          self.rx_telem_in_modes.resubscribe(),
-          tx_command_to_router.clone(),
-          priority,
-          activation,
-        ));
-        // let mode = Arc::new(tokio::sync::Mutex::new(mode));
-        // let mode_for_task = mode.clone();
-        self.autonomy_modes.insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
-        let m = self.autonomy_modes.get_mut(&mode_name).unwrap().0.as_mut();
-        self.selected_mode = Some(mode_name); // TODO: Remove and based on router activations
-        tokio::spawn(async move { // TODO: Make thread
+        let active = Arc::new(tokio::sync::Mutex::new(false));
+        let active_clone = active.clone();
+        let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
+        let handle = tokio::spawn(async move { // TODO: Make thread
           // let mut mode = mode_for_task.lock().await;
-          if let Err(e) = m.run().await {
+          if let Err(e) = mode.run(rx_telem_in_mode, tx_command_to_router.clone(), active_clone).await {
             warn!("Autonomy Mode error: {}", e);
           }
         });
+        let managed_mode = ManagedAutonomyMode {
+          name: mode_name.clone(),
+          priority,
+          activation,
+          active,
+          handle,
+        };
+        // let mode = Arc::new(tokio::sync::Mutex::new(mode));
+        // let mode_for_task = mode.clone();
+        self.autonomy_modes.insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
+        self.selected_mode = Some(mode_name); // TODO: Remove and based on router activations
       }
 
     async fn run(&mut self, config: &Config) -> Result<()> {
@@ -415,7 +437,6 @@ impl Router {
                   // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
                   if let Some(current_mode_name) = &self.selected_mode {
                     let (current_mode, _) = self.autonomy_modes.get(current_mode_name).unwrap();
-                    let current_mode = current_mode.lock().await;
                     if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
                       // Evaluate exit criteria
                       if !self.eval_activation_expr(exit, &latest_telem) {
@@ -424,15 +445,14 @@ impl Router {
                     }
                   }
                   // Else find highest priority mode whose activation criteria is met and switch to it
-                  for (mode_name, (mode_arc, _)) in &self.autonomy_modes {
-                    let mode = mode_arc.lock().await;
-                    if let Some(activation) = &mode.activation {
+                  for (mode_name, (managed_mode, _)) in &self.autonomy_modes {
+                    if let Some(activation) = &managed_mode.activation {
                       let activation = match activation {
                         Activation::Immediate(expr) => expr,
                         Activation::Hysteretic { enter, exit: _ } => enter,
                       };
                       if self.eval_activation_expr(activation, &latest_telem) {
-                        candidate_modes.push((mode.priority, mode_name.clone()));
+                        candidate_modes.push((managed_mode.priority, mode_name.clone()));
                       }
                     }
                   }
@@ -667,23 +687,39 @@ struct CollisionAvoidanceAutonomyMode {
   priority: u8,
   activation: Option<Activation>,
 }
-
 #[async_trait]
 impl AutonomyMode for CollisionAvoidanceAutonomyMode {
-  fn name(&self) -> String {
-      self.name.clone()
-  }
-  fn priority(&self) -> u8 {
-      self.priority
-  }
-  fn activation(&self) -> Option<Activation> {
-      self.activation.clone()
-  }
-  async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: &bool) -> Result<()> {
+  fn name(&self) -> String { self.name.clone() }
+  fn priority(&self) -> u8 { self.priority }
+  fn activation(&self) -> Option<Activation> { self.activation.clone() }
+  async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()> {
       loop {
           if let Ok(telemetry) = rx_telem.recv().await {
+            let active = active.lock().await;
             info!("{}: {} received telemetry: {:?}", active, self.name(), telemetry);
             tx_command.send(Command { cmd_id: 1, payload: vec![0, 1, 2] }).await?;
+          }
+      }
+  }
+}
+
+#[derive(Debug)]
+struct NominalOperationsAutonomyMode {
+  name: String,
+  priority: u8,
+  activation: Option<Activation>,
+}
+#[async_trait]
+impl AutonomyMode for NominalOperationsAutonomyMode {
+  fn name(&self) -> String { self.name.clone() }
+  fn priority(&self) -> u8 { self.priority }
+  fn activation(&self) -> Option<Activation> { self.activation.clone() }
+  async fn run(&mut self, mut rx_telem: broadcast::Receiver<Telemetry>, tx_command: mpsc::Sender<Command>, active: Arc<tokio::sync::Mutex<bool>>) -> Result<()> {
+      loop {
+          if let Ok(telemetry) = rx_telem.recv().await {
+            let active = active.lock().await;
+            info!("{}: {} received telemetry: {:?}", active, self.name(), telemetry);
+            tx_command.send(Command { cmd_id: 1, payload: vec![3, 4, 5] }).await?;
           }
       }
   }
@@ -777,7 +813,7 @@ async fn main() -> Result<()> {
     };
     router.register_autonomy_mode(mode, &config);
 
-    let mode = CollisionAvoidanceAutonomyMode {
+    let mode = NominalOperationsAutonomyMode {
       name: "NominalOps".to_string(),
       priority: 0,
       activation: Some(Activation::Immediate(Expr::Var(Variable::Bool(GenericVariable::Literal(true))))),
