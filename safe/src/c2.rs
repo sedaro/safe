@@ -16,8 +16,8 @@ pub struct Telemetry {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Command {
-    pub cmd_id: u16,
-    pub payload: Vec<u8>,
+    pub commanded_attitude: Vec<u8>,
+    pub thrust: u8,
 }
 
 // TODO: Revisit
