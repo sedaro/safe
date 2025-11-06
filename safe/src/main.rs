@@ -17,7 +17,10 @@ use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
 use observability as obs;
 use router::{AutonomyMode, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio::fs;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
@@ -56,8 +59,8 @@ impl AutonomyMode for CollisionAvoidanceAutonomyMode {
                 );
                 tx_command
                     .send(Command {
-                        cmd_id: 1,
-                        payload: vec![0, 1, 2],
+                      commanded_attitude: vec![0, 0, 1],
+                      thrust: rand::random::<u8>() % 26 + 65,
                     })
                     .await?;
             }
@@ -99,12 +102,34 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
                 );
                 tx_command
                     .send(Command {
-                        cmd_id: 1,
-                        payload: vec![3, 4, 5],
+                        commanded_attitude: vec![0, 1, 0],
+                        thrust: 0,
                     })
                     .await?;
             }
         }
+    }
+}
+
+async fn handle_client(mut stream: UnixStream, tx_telemetry_to_router: mpsc::Sender<Telemetry>) {
+    let mut buf = [0u8; 1024];
+    let mut message_acc = String::new();
+    
+    match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => {
+            let msg = String::from_utf8_lossy(&buf[..n]);
+            message_acc.push_str(&msg);
+            
+            // // Echo back to client
+            // stream.write_all(msg.as_bytes()).await.ok();
+        }
+        _ => println!("Client disconnected"),
+    }
+    while let Some(idx) = message_acc.find('\n') {
+        let tlm: Telemetry = serde_json::from_str(&message_acc[..idx]).unwrap();
+        println!("Received: {:?}", tlm);
+        tx_telemetry_to_router.send(tlm).await.ok();
+        message_acc = message_acc[idx+1..].to_string();
     }
 }
 
@@ -130,6 +155,13 @@ async fn main() -> Result<()> {
         .init();
 
     info!("SAFE is in start up.");
+
+    const SOCKET_PATH: &str = "/tmp/safe.sock";
+    // Remove socket if it already exists
+    if std::path::Path::new(SOCKET_PATH).exists() {
+        fs::remove_file(SOCKET_PATH).await?;
+    }
+    
 
     let observability = Arc::new(obs::ObservabilitySubsystem::new(None));
     let observability_clone = observability.clone();
@@ -219,33 +251,50 @@ async fn main() -> Result<()> {
             proximity_m: 1200,
         })
         .await?;
-    tx_telemetry_to_router
-        .send(Telemetry {
-            timestamp: 13,
-            proximity_m: 1200,
-        })
-        .await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router
-        .send(Telemetry {
-            timestamp: 14,
-            proximity_m: 99,
-        })
-        .await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router
-        .send(Telemetry {
-            timestamp: 14,
-            proximity_m: 99,
-        })
-        .await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    tx_telemetry_to_router
-        .send(Telemetry {
-            timestamp: 14,
-            proximity_m: 200,
-        })
-        .await?;
+    // tx_telemetry_to_router
+    //     .send(Telemetry {
+    //         timestamp: 13,
+    //         proximity_m: 1200,
+    //     })
+    //     .await?;
+    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // tx_telemetry_to_router
+    //     .send(Telemetry {
+    //         timestamp: 14,
+    //         proximity_m: 99,
+    //     })
+    //     .await?;
+    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // tx_telemetry_to_router
+    //     .send(Telemetry {
+    //         timestamp: 14,
+    //         proximity_m: 99,
+    //     })
+    //     .await?;
+    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // tx_telemetry_to_router
+    //     .send(Telemetry {
+    //         timestamp: 14,
+    //         proximity_m: 200,
+    //     })
+    //     .await?;
+
+    let listener = UnixListener::bind(SOCKET_PATH)?;
+    println!("Server listening on {}", SOCKET_PATH);
+    // Spawn server loop in a task
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx_telemetry_to_router = tx_telemetry_to_router.clone();
+                    tokio::spawn(async move {
+                        handle_client(stream, tx_telemetry_to_router).await;
+                    });
+                }
+                Err(e) => eprintln!("Connection error: {}", e),
+            }
+        }
+    });
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
