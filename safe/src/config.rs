@@ -1,9 +1,4 @@
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tracing::{info, warn};
-
-use crate::transports::ConfigTransport;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -85,27 +80,4 @@ pub enum EngagementMode {
     Off,
     Passive,
     Active,
-}
-
-// TOOD: Revisit or delete
-async fn config_interface_task(
-    mut transport: Box<dyn ConfigTransport>,
-    config_tx: mpsc::Sender<ConfigMessage>,
-) -> Result<()> {
-    info!("Config interface started");
-
-    loop {
-        match transport.recv_config().await {
-            Ok(config) => {
-                config_tx.send(config).await?;
-                transport.send_response("OK".to_string()).await?;
-            }
-            Err(e) => {
-                warn!("Config recv error: {}", e);
-                break;
-            }
-        }
-    }
-
-    Ok(())
 }

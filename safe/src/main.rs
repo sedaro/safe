@@ -25,6 +25,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
+use crate::transports::{UnixTransport, Stream};
+use crate::transports::Transport;
+
 #[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
     name: String,
@@ -113,31 +116,18 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client(mut stream: UnixStream, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
-    let mut buf = [0u8; 1024];
-    let mut message_acc = String::new();
-    
+async fn handle_client(mut stream: impl Stream, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
     loop { // TODO: Figure out how to break out of this loop when client hangs up!
       tokio::select! {
-        Ok(n) = stream.read(&mut buf) => {
-            if n > 0 {
-              let msg = String::from_utf8_lossy(&buf[..n]);
-              message_acc.push_str(&msg);
-              
-              // Echo back to client
-              stream.write_all(msg.as_bytes()).await.ok();
-            }
-            while let Some(idx) = message_acc.find('\n') {
-                let tlm: Telemetry = serde_json::from_str(&message_acc[..idx]).unwrap();
-                println!("Received: {:?}", tlm);
-                tx_telemetry.send(tlm).await.ok();
-                message_acc = message_acc[idx+1..].to_string();
-            }
+        Ok(msg) = stream.read() => {
+          stream.write(msg.clone()).await.ok();
+          let tlm: Telemetry = serde_json::from_str(&msg).unwrap();
+          println!("Received: {:?}", tlm);
+          tx_telemetry.send(tlm).await.ok();
         }
         Ok(cmd) = rx_commands.recv() => {
-          let mut msg = serde_json::to_string(&cmd).unwrap();
-          msg.push_str("\n");
-          stream.write_all(msg.as_bytes()).await.ok();
+          let msg = serde_json::to_string(&cmd).unwrap();
+          stream.write(msg).await.ok();
         }
       }
     }
@@ -290,13 +280,11 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
-    println!("Server listening on {}", SOCKET_PATH);
-    // Spawn server loop in a task
+    let mut transport = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: FIXME
     tokio::spawn(async move {
         loop {
-          match listener.accept().await {
-            Ok((stream, _)) => {
+          match transport.accept().await {
+            Ok((stream)) => {
                   let tx_telemetry_to_router = tx_telemetry_to_router.clone();
                   let rx_command_in_c2 = rx_command_in_c2.resubscribe();
                   tokio::spawn(async move {
