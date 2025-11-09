@@ -66,7 +66,7 @@ pub struct Router {
     rx_telem: mpsc::Receiver<Telemetry>,
     tx_telem_to_modes: broadcast::Sender<Telemetry>,
     rx_telem_in_modes: broadcast::Receiver<Telemetry>,
-    tx_command: mpsc::Sender<Command>,
+    tx_command: broadcast::Sender<Command>,
     observability: Arc<obs::ObservabilitySubsystem>,
     selected_mode: Option<String>,
     autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
@@ -76,7 +76,7 @@ pub struct Router {
 impl Router {
     pub fn new(
         rx_telem: mpsc::Receiver<Telemetry>,
-        tx_command: mpsc::Sender<Command>,
+        tx_command: broadcast::Sender<Command>,
         observability: Arc<obs::ObservabilitySubsystem>,
         config: &Config,
     ) -> Self {
@@ -168,8 +168,8 @@ impl Router {
                             reason: None,
                         },
                     );
-                    if let Err(_) = self.tx_command.send(command).await {
-                        warn!("No active subscribers for commands");
+                    if let Err(e) = self.tx_command.send(command) {
+                        warn!("No active subscribers for commands: {}", e);
                     }
                 }
 
