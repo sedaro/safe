@@ -20,7 +20,7 @@ use router::{AutonomyMode, Router};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
@@ -49,21 +49,22 @@ impl AutonomyMode for CollisionAvoidanceAutonomyMode {
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()> {
         loop {
-            if let Ok(telemetry) = rx_telem.recv().await {
-                let active = active.lock().await;
-                info!(
-                    "{} [{}] received telemetry: {:?}",
-                    self.name(),
-                    active,
-                    telemetry
-                );
-                tx_command
-                    .send(Command {
-                      commanded_attitude: vec![0, 0, 1],
-                      thrust: rand::random::<u8>() % 26 + 65,
-                    })
-                    .await?;
-            }
+            tx_command
+                .send(Command {
+                  commanded_attitude: vec![0, 0, 1],
+                  thrust: rand::random::<u8>() % 26 + 65,
+                })
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // if let Ok(telemetry) = rx_telem.recv().await {
+            //     let active = active.lock().await;
+            //     info!(
+            //         "{} [{}] received telemetry: {:?}",
+            //         self.name(),
+            //         active,
+            //         telemetry
+            //     );
+            // }
         }
     }
 }
@@ -92,46 +93,56 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()> {
         loop {
-            if let Ok(telemetry) = rx_telem.recv().await {
-                let active = active.lock().await;
-                info!(
-                    "{} [{}] received telemetry: {:?}",
-                    self.name(),
-                    active,
-                    telemetry
-                );
-                tx_command
-                    .send(Command {
-                        commanded_attitude: vec![0, 1, 0],
-                        thrust: 0,
-                    })
-                    .await?;
-            }
+            tx_command
+              .send(Command {
+                  commanded_attitude: vec![0, 1, 0],
+                  thrust: 0,
+              })
+              .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // if let Ok(telemetry) = rx_telem.recv().await {
+            //     let active = active.lock().await;
+            //     info!(
+            //         "{} [{}] received telemetry: {:?}",
+            //         self.name(),
+            //         active,
+            //         telemetry
+            //     );
+            // }
         }
     }
 }
 
-async fn handle_client(mut stream: UnixStream, tx_telemetry_to_router: mpsc::Sender<Telemetry>) {
+async fn handle_client(mut stream: UnixStream, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
     let mut buf = [0u8; 1024];
     let mut message_acc = String::new();
     
-    match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => {
-            let msg = String::from_utf8_lossy(&buf[..n]);
-            message_acc.push_str(&msg);
-            
-            // // Echo back to client
-            // stream.write_all(msg.as_bytes()).await.ok();
+    loop { // TODO: Figure out how to break out of this loop when client hangs up!
+      tokio::select! {
+        Ok(n) = stream.read(&mut buf) => {
+            if n > 0 {
+              let msg = String::from_utf8_lossy(&buf[..n]);
+              message_acc.push_str(&msg);
+              
+              // Echo back to client
+              stream.write_all(msg.as_bytes()).await.ok();
+            }
+            while let Some(idx) = message_acc.find('\n') {
+                let tlm: Telemetry = serde_json::from_str(&message_acc[..idx]).unwrap();
+                println!("Received: {:?}", tlm);
+                tx_telemetry.send(tlm).await.ok();
+                message_acc = message_acc[idx+1..].to_string();
+            }
         }
-        _ => println!("Client disconnected"),
-    }
-    while let Some(idx) = message_acc.find('\n') {
-        let tlm: Telemetry = serde_json::from_str(&message_acc[..idx]).unwrap();
-        println!("Received: {:?}", tlm);
-        tx_telemetry_to_router.send(tlm).await.ok();
-        message_acc = message_acc[idx+1..].to_string();
+        Ok(cmd) = rx_commands.recv() => {
+          let mut msg = serde_json::to_string(&cmd).unwrap();
+          msg.push_str("\n");
+          stream.write_all(msg.as_bytes()).await.ok();
+        }
+      }
     }
 }
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -175,7 +186,7 @@ async fn main() -> Result<()> {
     let (tx_telemetry_to_router, rx_telemetry_in_router) =
         mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
     let (tx_command_to_c2, rx_command_in_c2) =
-        mpsc::channel::<Command>(config.router.command_channel_buffer_size);
+            broadcast::channel(config.router.command_channel_buffer_size);
 
     // Create router and then register Modes to it.
     // This allows for us to dynamically create and destroy Modes while running.
@@ -284,15 +295,16 @@ async fn main() -> Result<()> {
     // Spawn server loop in a task
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let tx_telemetry_to_router = tx_telemetry_to_router.clone();
-                    tokio::spawn(async move {
-                        handle_client(stream, tx_telemetry_to_router).await;
-                    });
-                }
-                Err(e) => eprintln!("Connection error: {}", e),
-            }
+          match listener.accept().await {
+            Ok((stream, _)) => {
+                  let tx_telemetry_to_router = tx_telemetry_to_router.clone();
+                  let rx_command_in_c2 = rx_command_in_c2.resubscribe();
+                  tokio::spawn(async move {
+                      handle_client(stream, tx_telemetry_to_router, rx_command_in_c2).await;
+                  });
+              }
+              Err(e) => eprintln!("Connection error: {}", e),
+          }
         }
     });
 
@@ -301,6 +313,13 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/*
+On deck:
+Other transports
+Logs
+Config changes
+ */
 
 /*
 - Have a rust-native autonomy mode or two
