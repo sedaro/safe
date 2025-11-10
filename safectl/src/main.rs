@@ -170,6 +170,7 @@ async fn main() -> std::io::Result<()> {
           let telemetry: Telemetry = serde_json::from_str(&json)
             .expect("Failed to parse JSON string");
           let msg = serde_json::to_string(&telemetry).unwrap();
+          let msg = bincode::serialize(&msg).unwrap();
           framed_stream.send(msg.into()).await?;
         }
         Some(Commands::Receive {}) => {

@@ -114,7 +114,7 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client<T>(mut stream: impl Stream<T>, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
+async fn handle_client(mut stream: impl Stream<String>, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
     loop { // TODO: Figure out how to break out of this loop when client hangs up!
       tokio::select! {
         Ok(msg) = stream.read() => {
@@ -283,11 +283,11 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let mut transport = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: FIXME
+    let mut transport: UnixTransport<String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: FIXME
     tokio::spawn(async move {
         loop {
           match transport.accept().await {
-            Ok((stream)) => {
+            Ok(stream) => {
                   let tx_telemetry_to_router = tx_telemetry_to_router.clone();
                   let rx_command_in_c2 = rx_command_in_c2.resubscribe();
                   tokio::spawn(async move {
