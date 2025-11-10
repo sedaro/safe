@@ -2,17 +2,24 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use serde::{Serialize, Deserialize};
 
-// TODO: Revisit
 
 #[async_trait]
-pub trait Stream: Send + Sync {
-  async fn read(&mut self) -> Result<String, std::io::Error>; // TODO: Interface via bytes instead?
-  async fn write(&mut self, msg: String) -> Result<(), std::io::Error>;
+pub trait Stream<T>: Send + Sync 
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
+  async fn read(&mut self) -> Result<T, std::io::Error>;
+  async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
 }
+
 #[async_trait]
-pub trait Transport: Send + Sync {
-    async fn accept(&mut self) -> Result<impl Stream, std::io::Error>;
+pub trait Transport<T>: Send + Sync 
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
+    async fn accept(&mut self) -> Result<impl Stream<T>, std::io::Error>;
 }
 
 // ============================================================================
@@ -23,29 +30,39 @@ pub struct UnixStream {
   framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
 }
 #[async_trait]
-impl Stream for UnixStream {
-  async fn read(&mut self) -> Result<String, std::io::Error> {
-    return self.framed_stream.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
-      .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+impl<T> Stream<T> for UnixStream
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
+  async fn read(&mut self) -> Result<T, std::io::Error> {
+    let bytes = self.framed_stream.next().await
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
+    bincode::deserialize(&bytes)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
   }
-  async fn write(&mut self, msg: String) -> Result<(), std::io::Error> {
-    return self.framed_stream.send(msg.into()).await;
+  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+    let bytes = bincode::serialize(&msg)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    self.framed_stream.send(bytes.into()).await
   }
 }
-pub struct UnixTransport {
+pub struct UnixTransport<T> {
     path: String,
     listener: tokio::net::UnixListener,
+    _phantom: std::marker::PhantomData<T>,
 }
-impl UnixTransport {
+impl<T> UnixTransport<T> {
   pub async fn new(path: String) -> Result<Self, std::io::Error> {
       let listener = tokio::net::UnixListener::bind(path.clone())?;
       println!("SAFE listening on {}", path);
-      Ok(Self { path, listener })
+      Ok(Self { path, listener, _phantom: std::marker::PhantomData })
   }
 }
 #[async_trait]
-impl Transport for UnixTransport {
+impl<T> Transport<T> for UnixTransport<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+{
   async fn accept(&mut self) -> Result<UnixStream, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => Ok(UnixStream { 
@@ -63,14 +80,20 @@ pub struct TcpStream {
   framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
 }
 #[async_trait]
-impl Stream for TcpStream {
-  async fn read(&mut self) -> Result<String, std::io::Error> {
-    return self.framed_stream.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
-      .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+impl<T> Stream<T> for TcpStream
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
+  async fn read(&mut self) -> Result<T, std::io::Error> {
+    let bytes = self.framed_stream.next().await
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
+    bincode::deserialize(&bytes)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
   }
-  async fn write(&mut self, msg: String) -> Result<(), std::io::Error> {
-    return self.framed_stream.send(msg.into()).await;
+  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+    let bytes = bincode::serialize(&msg)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    self.framed_stream.send(bytes.into()).await
   }
 }
 pub struct TcpTransport {
@@ -88,7 +111,10 @@ impl TcpTransport {
   }
 }
 #[async_trait]
-impl Transport for TcpTransport {
+impl<T> Transport<T> for TcpTransport
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
   async fn accept(&mut self) -> Result<TcpStream, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => Ok(TcpStream { 
@@ -101,6 +127,51 @@ impl Transport for TcpTransport {
     }
   }
 }
+
+// ============================================================================
+// MPSC
+// ============================================================================
+
+pub struct MpscStream<T> {
+    rx: tokio::sync::mpsc::Receiver<T>,
+    tx: tokio::sync::mpsc::Sender<T>,
+}
+#[async_trait]
+impl<T> Stream<T> for MpscStream<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+{
+    async fn read(&mut self) -> Result<T, std::io::Error> {
+        self.rx.recv().await
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Channel closed"))
+    }
+    
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        self.tx.send(msg).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))
+    }
+}
+
+pub struct MpscTransport<T> {
+    buffer: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+impl<T> MpscTransport<T> {
+    pub fn new(buffer: usize) -> Self {
+        Self { buffer, _phantom: std::marker::PhantomData }
+    }
+}
+#[async_trait]
+impl<T> Transport<T> for MpscTransport<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+{
+    async fn accept(&mut self) -> Result<MpscStream<T>, std::io::Error> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<T>(self.buffer);
+        Ok(MpscStream { rx, tx })
+    }
+}
+
 
 // ============================================================================
 // C2 Transport Abstraction
