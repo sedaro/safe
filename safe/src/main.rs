@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use crate::transports::{UnixTransport, Stream};
+use crate::transports::{MpscTransport, Stream, UnixTransport};
 use crate::transports::Transport;
 
 #[derive(Debug, Serialize)]
@@ -114,7 +114,7 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client(mut stream: impl Stream, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
+async fn handle_client<T>(mut stream: impl Stream<T>, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
     loop { // TODO: Figure out how to break out of this loop when client hangs up!
       tokio::select! {
         Ok(msg) = stream.read() => {
@@ -173,6 +173,11 @@ async fn main() -> Result<()> {
 
     let (tx_telemetry_to_router, rx_telemetry_in_router) =
         mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
+    
+    // let mut transport = MpscTransport::new(config.router.telem_channel_buffer_size);
+    // let telem_to_router_stream = transport.accept().await?;
+    // let (tx_telemetry_to_router, rx_telemetry_in_router) = 
+    
     let (tx_command_to_c2, rx_command_in_c2) =
             broadcast::channel(config.router.command_channel_buffer_size);
 
