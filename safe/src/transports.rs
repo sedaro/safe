@@ -1,13 +1,7 @@
-use std::fmt::Error;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
-
-use crate::c2::{Command, Telemetry};
-use crate::config::ConfigMessage;
 
 // TODO: Revisit
 
@@ -26,30 +20,17 @@ pub trait Transport: Send + Sync {
 // ============================================================================
 
 pub struct UnixStream {
-  stream: tokio::net::UnixStream,
-  msg_acc: String,
+  framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
 }
 #[async_trait]
 impl Stream for UnixStream {
   async fn read(&mut self) -> Result<String, std::io::Error> {
-    let mut buf = [0u8; 1024];
-    loop {
-      let n = self.stream.read(&mut buf).await?;
-      if n > 0 {
-        let msg = String::from_utf8_lossy(&buf[..n]);
-        self.msg_acc.push_str(&msg);
-        if let Some(idx) = self.msg_acc.find('\n') {
-          let line = self.msg_acc[..idx].to_string();
-          self.msg_acc = self.msg_acc[idx+1..].to_string();
-          return Ok(line);
-        }
-      }
-    }
+    return self.framed_stream.next().await
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
+      .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
   }
   async fn write(&mut self, msg: String) -> Result<(), std::io::Error> {
-    let mut msg = msg.clone();
-    msg.push_str("\n"); // TODO: Common delim for tcp streams?  Should we have our own guard that ensures this is always present?
-    return self.stream.write_all(msg.as_bytes()).await;
+    return self.framed_stream.send(msg.into()).await;
   }
 }
 pub struct UnixTransport {
@@ -60,15 +41,16 @@ impl UnixTransport {
   pub async fn new(path: String) -> Result<Self, std::io::Error> {
       let listener = tokio::net::UnixListener::bind(path.clone())?;
       println!("SAFE listening on {}", path);
-      let s = Self { path, listener };
-      Ok(s)
+      Ok(Self { path, listener })
   }
 }
 #[async_trait]
 impl Transport for UnixTransport {
   async fn accept(&mut self) -> Result<UnixStream, std::io::Error> {
     match self.listener.accept().await {
-      Ok((stream, _)) => Ok(UnixStream { stream, msg_acc: String::new() }),
+      Ok((stream, _)) => Ok(UnixStream { 
+        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+      }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
         Err(e)
@@ -78,30 +60,17 @@ impl Transport for UnixTransport {
 }
 
 pub struct TcpStream {
-  stream: tokio::net::TcpStream,
-  msg_acc: String,
+  framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
 }
 #[async_trait]
 impl Stream for TcpStream {
   async fn read(&mut self) -> Result<String, std::io::Error> {
-    let mut buf = [0u8; 1024];
-    loop {
-      let n = self.stream.read(&mut buf).await?;
-      if n > 0 {
-        let msg = String::from_utf8_lossy(&buf[..n]);
-        self.msg_acc.push_str(&msg);
-      }
-      if let Some(idx) = self.msg_acc.find('\n') {
-        let line = self.msg_acc[..idx].to_string();
-        self.msg_acc = self.msg_acc[idx+1..].to_string();
-        return Ok(line);
-      }
-    }
+    return self.framed_stream.next().await
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
+      .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
   }
   async fn write(&mut self, msg: String) -> Result<(), std::io::Error> {
-    let mut msg = msg.clone();
-    msg.push_str("\n"); // TODO: Common delim for tcp streams? Look into LengthDelimitedCodec as a replacement for netlines
-    return self.stream.write_all(msg.as_bytes()).await;
+    return self.framed_stream.send(msg.into()).await;
   }
 }
 pub struct TcpTransport {
@@ -122,7 +91,9 @@ impl TcpTransport {
 impl Transport for TcpTransport {
   async fn accept(&mut self) -> Result<TcpStream, std::io::Error> {
     match self.listener.accept().await {
-      Ok((stream, _)) => Ok(TcpStream { stream, msg_acc: String::new() }),
+      Ok((stream, _)) => Ok(TcpStream { 
+        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+      }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
         Err(e)

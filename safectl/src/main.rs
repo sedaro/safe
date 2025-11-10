@@ -1,10 +1,9 @@
-use std::os::unix::net::UnixStream;
-use std::io::Write;
-use std::io::Read;
-
 use serde::{Deserialize, Serialize};
-use std::env;
+use tokio_util::codec::Framed;
+use tokio_util::codec::LengthDelimitedCodec;
+use futures::{SinkExt, StreamExt};
 use clap::{CommandFactory, Parser, Subcommand};
+use tokio::net::UnixStream as TokioUnixStream;
 
 const SOCKET_PATH: &str = "/tmp/safe.sock";
 
@@ -129,8 +128,8 @@ enum Commands {
     Receive,
 }
 
-fn main() -> std::io::Result<()> {
-
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
 
     let cli = Cli::parse();
     // setup_logging(cli.debug);
@@ -164,29 +163,24 @@ fn main() -> std::io::Result<()> {
           println!("{:?} {:?}", all, tail);
         }
         Some(Commands::Transmit { json }) => {
-          let mut stream = UnixStream::connect(SOCKET_PATH)?;
+          let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
           println!("Connected");
+          let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
           
           let telemetry: Telemetry = serde_json::from_str(&json)
             .expect("Failed to parse JSON string");
-          let mut msg = serde_json::to_string(&telemetry).unwrap();
-          msg.push_str("\n");
-          stream.write_all(msg.as_bytes())?;
+          let msg = serde_json::to_string(&telemetry).unwrap();
+          framed_stream.send(msg.into()).await?;
         }
         Some(Commands::Receive {}) => {
-          let mut stream = UnixStream::connect(SOCKET_PATH)?;
+          let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
           println!("Connected");
-          
-          let mut buf = [0u8; 1024];
-          let mut message_acc = String::new();
+          let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
           loop {
-            // Read response
-            let n = stream.read(&mut buf)?;
-            message_acc.push_str(&String::from_utf8_lossy(&buf[..n]));
-            while let Some(idx) = message_acc.find('\n') {
-                println!("Received: {}", message_acc[..idx].to_string());
-                message_acc = message_acc[idx+1..].to_string();
-            }
+            let msg = framed_stream.next().await
+              .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
+              .map(|bytes| String::from_utf8_lossy(&bytes).to_string())?;
+            println!("Received: {}", msg);
           }
         }
         None => Cli::command().print_help().unwrap()
