@@ -1,11 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
+use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Serialize, Deserialize};
+use std::{collections::VecDeque, sync::Arc};
 
 #[async_trait]
-pub trait Stream<T>: Send + Sync
+pub trait Stream<T>: Send + Sync + 'static
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static
 {
@@ -14,26 +16,33 @@ where
 }
 
 #[async_trait]
-pub trait Transport<T>: Send + Sync 
+pub trait Transport<T>: Send + Sync
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static
 {
-    async fn accept(&mut self) -> Result<impl Stream<T>, std::io::Error>;
-    async fn connect(&mut self) -> Result<impl Stream<T>, std::io::Error>;
+    type StreamType: Stream<T> + Send;
+    async fn accept(&mut self) -> Result<Self::StreamType, std::io::Error>;
+    async fn connect(&self) -> Result<Self::StreamType, std::io::Error>;
+    async fn channel(&mut self) -> Result<(Self::StreamType, Self::StreamType), std::io::Error> {
+        let client_stream = self.connect().await?; // Initiate client connection
+        let server_stream = self.accept().await?; // Accept client connection
+        Ok((client_stream, server_stream))
+    }
 }
 
 // ============================================================================
 // Unix Socket
 // ============================================================================
 
-pub struct UnixStream {
+pub struct UnixStream<T> {
   framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
+  _phantom: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
-impl<T> Stream<T> for UnixStream
+impl<T> Stream<T> for UnixStream<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
   async fn read(&mut self) -> Result<T, std::io::Error> {
     let bytes = self.framed_stream.next().await
@@ -57,6 +66,14 @@ pub struct UnixTransport<T> {
 
 impl<T> UnixTransport<T> {
   pub async fn new(path: String) -> Result<Self, std::io::Error> {
+      // Require path ends in .sock to protect against accidental file deletion
+      if !path.ends_with(".sock") {
+          return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Socket path must end with .sock"));
+      }
+      // Remove socket if it already exists
+      if std::path::Path::new(&path).exists() {
+          tokio::fs::remove_file(&path).await?;
+      }
       let listener = tokio::net::UnixListener::bind(path.clone())?;
       println!("SAFE listening on {}", path);
       Ok(Self { path, listener, _phantom: std::marker::PhantomData })
@@ -68,10 +85,12 @@ impl<T> Transport<T> for UnixTransport<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  async fn accept(&mut self) -> Result<UnixStream, std::io::Error> {
+  type StreamType = UnixStream<T>;
+  async fn accept(&mut self) -> Result<Self::StreamType, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => Ok(UnixStream { 
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _phantom: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -79,10 +98,11 @@ where
       },
     }
   }
-  async fn connect(&mut self) -> Result<UnixStream, std::io::Error> {
+  async fn connect(&self) -> Result<Self::StreamType, std::io::Error> {
     match tokio::net::UnixStream::connect(self.path.clone()).await {
       Ok(stream) => Ok(UnixStream {
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _phantom: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -96,14 +116,15 @@ where
 // TCP Socket
 // ============================================================================
 
-pub struct TcpStream {
+pub struct TcpStream<T> {
   framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
+  _phantom: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
-impl<T> Stream<T> for TcpStream
+impl<T> Stream<T> for TcpStream<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
   async fn read(&mut self) -> Result<T, std::io::Error> {
     let bytes = self.framed_stream.next().await
@@ -119,32 +140,35 @@ where
   }
 }
 
-pub struct TcpTransport {
+pub struct TcpTransport<T> {
     address: String,
     port: u16,
     listener: tokio::net::TcpListener,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl TcpTransport {
+impl<T> TcpTransport<T> {
   async fn new(address: String, port: u16) -> Result<Self, std::io::Error> {
     let full_address = format!("{address}:{port}");
     let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
     println!("SAFE listening on {}", full_address);
-    let s = Self { address, port, listener };
+    let s = Self { address, port, listener, _phantom: std::marker::PhantomData };
     Ok(s)
   }
 }
 
 #[async_trait]
-impl<T> Transport<T> for TcpTransport
+impl<T> Transport<T> for TcpTransport<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  async fn accept(&mut self) -> Result<TcpStream, std::io::Error> {
+  type StreamType = TcpStream<T>;
+  async fn accept(&mut self) -> Result<Self::StreamType, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => {
         Ok(TcpStream { 
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _phantom: std::marker::PhantomData,
         })
       },
       Err(e) => {
@@ -153,11 +177,12 @@ where
       },
     }
   }
-  async fn connect(&mut self) -> Result<TcpStream, std::io::Error> {
+  async fn connect(&self) -> Result<Self::StreamType, std::io::Error> {
     let full_address = format!("{}:{}", self.address, self.port);
     match tokio::net::TcpStream::connect(full_address.clone()).await {
       Ok(stream) => Ok(TcpStream {
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _phantom: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -179,7 +204,7 @@ pub struct MpscStream<T> {
 #[async_trait]
 impl<T> Stream<T> for MpscStream<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + Clone
 {
     async fn read(&mut self) -> Result<T, std::io::Error> {
         self.rx.recv().await
@@ -194,34 +219,38 @@ where
 
 pub struct MpscTransport<T> {
     buffer: usize,
-    rx_from_client: Option<tokio::sync::mpsc::Receiver<T>>,
-    tx_to_client: tokio::sync::mpsc::Sender<T>,
-    rx_in_client: Option<tokio::sync::mpsc::Receiver<T>>,
-    tx_from_client: tokio::sync::mpsc::Sender<T>,
+    pending: Arc<Mutex<VecDeque<(tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>)>>>,
 }
 
-impl<T> MpscTransport<T> {
+impl<T: Clone> MpscTransport<T> {
     pub fn new(buffer: usize) -> Self {
-        let (tx_to_client, rx_in_client) = tokio::sync::mpsc::channel::<T>(buffer);
-        let (tx_from_client, rx_from_client) = tokio::sync::mpsc::channel::<T>(buffer);
-        Self { buffer, rx_from_client: Some(rx_from_client), tx_to_client, rx_in_client: Some(rx_in_client), tx_from_client }
+        Self { buffer, pending: Arc::new(Mutex::new(VecDeque::new())) } // TODO: Init vecdeque with capacity?
     }
 }
 
 #[async_trait]
 impl<T> Transport<T> for MpscTransport<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone
 {
-    async fn accept(&mut self) -> Result<MpscStream<T>, std::io::Error> {
-        let rx = self.rx_from_client.take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Accept already called. Implement broadcast channels if needed."))?;
-        Ok(MpscStream { rx, tx: self.tx_to_client.clone() })
+    type StreamType = MpscStream<T>;
+    async fn accept(&mut self) -> Result<Self::StreamType, std::io::Error> {
+        let (tx_to_client, rx_from_client) = loop {
+            let mut pending = self.pending.lock().await;
+            if let Some(conn) = pending.pop_front() {
+              break conn;
+            }
+            drop(pending);
+            tokio::task::yield_now().await;
+        };
+        Ok(MpscStream { rx: rx_from_client, tx: tx_to_client })
     }
-    async fn connect(&mut self) -> Result<MpscStream<T>, std::io::Error> {
-        let rx = self.rx_in_client.take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Connect already called. Implement broadcast channels if needed."))?;
-        Ok(MpscStream { rx, tx: self.tx_from_client.clone() })
+    async fn connect(&self) -> Result<Self::StreamType, std::io::Error> {
+        let (tx_to_client, rx_in_client) = tokio::sync::mpsc::channel::<T>(self.buffer);
+        let (tx_from_client, rx_from_client) = tokio::sync::mpsc::channel::<T>(self.buffer);
+        let mut pending = self.pending.lock().await;
+        pending.push_back((tx_to_client, rx_from_client));
+        Ok(MpscStream { rx: rx_in_client, tx: tx_from_client })
     }
 }
 

@@ -13,6 +13,8 @@ use crate::config::{Config, EngagementMode};
 use crate::definitions::Variable;
 use crate::definitions::{Activation, Expr, Value, Resolvable};
 use crate::observability as obs;
+use crate::transports::Stream;
+use crate::transports::Transport;
 
 
 enum AutonomyModeSignal {
@@ -20,7 +22,7 @@ enum AutonomyModeSignal {
 }
 
 #[async_trait]
-pub trait AutonomyMode: Send + Sync {
+pub trait AutonomyMode: Send + Sync + Serialize + 'static {
     fn name(&self) -> String;
     fn activation(&self) -> Option<Activation>;
     fn priority(&self) -> u8;
@@ -63,7 +65,7 @@ impl Resolvable for Resolver {
 
 pub struct Router {
     engagement_mode: EngagementMode,
-    rx_telem: mpsc::Receiver<Telemetry>,
+    rx_telem: Box<dyn Stream<Telemetry>>,
     tx_telem_to_modes: broadcast::Sender<Telemetry>,
     rx_telem_in_modes: broadcast::Receiver<Telemetry>,
     tx_command: broadcast::Sender<Command>,
@@ -75,17 +77,19 @@ pub struct Router {
 
 impl Router {
     pub fn new(
-        rx_telem: mpsc::Receiver<Telemetry>,
+        rx_telem: impl Stream<Telemetry>,
         tx_command: broadcast::Sender<Command>,
         observability: Arc<obs::ObservabilitySubsystem>,
         config: &Config,
+        transport: &mut impl Transport<Telemetry>,
     ) -> Self {
         debug!("Initializing Router with config: {:?}", config.router);
         let (tx_telem_to_modes, rx_telem_in_modes) =
             broadcast::channel(config.router.max_autonomy_modes);
+        let _a = transport.accept();
         Self {
             engagement_mode: EngagementMode::Off,
-            rx_telem,
+            rx_telem: Box::new(rx_telem),
             tx_telem_to_modes,
             rx_telem_in_modes,
             tx_command,
@@ -99,7 +103,7 @@ impl Router {
         }
     }
 
-    pub fn register_autonomy_mode<M: AutonomyMode + Serialize + 'static>(&mut self, mut mode: M, config: &Config) {
+    pub fn register_autonomy_mode<M: AutonomyMode>(&mut self, mut mode: M, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) =
             mpsc::channel::<Command>(config.router.command_channel_buffer_size);
         let mode_name = mode.name().clone();
@@ -137,7 +141,7 @@ impl Router {
         loop {
             tokio::select! {
                 // Receive telemetry from C2 and forward to modes
-                Some(telemetry) = self.rx_telem.recv() => {
+                Ok(telemetry) = self.rx_telem.read() => {
                     self.observability.log_event(
                         obs::Location::Router,
                         obs::Event::TelemetryReceived(telemetry.clone()),
