@@ -1,12 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Serialize, Deserialize};
 
-
 #[async_trait]
-pub trait Stream<T>: Send + Sync 
+pub trait Stream<T>: Send + Sync
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static
 {
@@ -20,6 +19,7 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static
 {
     async fn accept(&mut self) -> Result<impl Stream<T>, std::io::Error>;
+    async fn connect(&mut self) -> Result<impl Stream<T>, std::io::Error>;
 }
 
 // ============================================================================
@@ -29,6 +29,7 @@ where
 pub struct UnixStream {
   framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
 }
+
 #[async_trait]
 impl<T> Stream<T> for UnixStream
 where
@@ -40,17 +41,20 @@ where
     bincode::deserialize(&bytes)
       .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
   }
+  
   async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
     let bytes = bincode::serialize(&msg)
       .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     self.framed_stream.send(bytes.into()).await
   }
 }
+
 pub struct UnixTransport<T> {
     path: String,
     listener: tokio::net::UnixListener,
     _phantom: std::marker::PhantomData<T>,
 }
+
 impl<T> UnixTransport<T> {
   pub async fn new(path: String) -> Result<Self, std::io::Error> {
       let listener = tokio::net::UnixListener::bind(path.clone())?;
@@ -58,6 +62,7 @@ impl<T> UnixTransport<T> {
       Ok(Self { path, listener, _phantom: std::marker::PhantomData })
   }
 }
+
 #[async_trait]
 impl<T> Transport<T> for UnixTransport<T>
 where
@@ -74,11 +79,27 @@ where
       },
     }
   }
+  async fn connect(&mut self) -> Result<UnixStream, std::io::Error> {
+    match tokio::net::UnixStream::connect(self.path.clone()).await {
+      Ok(stream) => Ok(UnixStream {
+        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+      }),
+      Err(e) => {
+        eprintln!("Connection error: {}", e);
+        Err(e)
+      },
+    }
+  }
 }
+
+// ============================================================================
+// TCP Socket
+// ============================================================================
 
 pub struct TcpStream {
   framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
 }
+
 #[async_trait]
 impl<T> Stream<T> for TcpStream
 where
@@ -90,17 +111,20 @@ where
     bincode::deserialize(&bytes)
       .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
   }
+  
   async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
     let bytes = bincode::serialize(&msg)
       .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     self.framed_stream.send(bytes.into()).await
   }
 }
+
 pub struct TcpTransport {
     address: String,
     port: u16,
     listener: tokio::net::TcpListener,
 }
+
 impl TcpTransport {
   async fn new(address: String, port: u16) -> Result<Self, std::io::Error> {
     let full_address = format!("{address}:{port}");
@@ -110,6 +134,7 @@ impl TcpTransport {
     Ok(s)
   }
 }
+
 #[async_trait]
 impl<T> Transport<T> for TcpTransport
 where
@@ -117,7 +142,21 @@ where
 {
   async fn accept(&mut self) -> Result<TcpStream, std::io::Error> {
     match self.listener.accept().await {
-      Ok((stream, _)) => Ok(TcpStream { 
+      Ok((stream, _)) => {
+        Ok(TcpStream { 
+        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        })
+      },
+      Err(e) => {
+        eprintln!("Connection error: {}", e);
+        Err(e)
+      },
+    }
+  }
+  async fn connect(&mut self) -> Result<TcpStream, std::io::Error> {
+    let full_address = format!("{}:{}", self.address, self.port);
+    match tokio::net::TcpStream::connect(full_address.clone()).await {
+      Ok(stream) => Ok(TcpStream {
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
       }),
       Err(e) => {
@@ -136,6 +175,7 @@ pub struct MpscStream<T> {
     rx: tokio::sync::mpsc::Receiver<T>,
     tx: tokio::sync::mpsc::Sender<T>,
 }
+
 #[async_trait]
 impl<T> Stream<T> for MpscStream<T>
 where
@@ -154,24 +194,36 @@ where
 
 pub struct MpscTransport<T> {
     buffer: usize,
-    _phantom: std::marker::PhantomData<T>,
+    rx_from_client: Option<tokio::sync::mpsc::Receiver<T>>,
+    tx_to_client: tokio::sync::mpsc::Sender<T>,
+    rx_in_client: Option<tokio::sync::mpsc::Receiver<T>>,
+    tx_from_client: tokio::sync::mpsc::Sender<T>,
 }
+
 impl<T> MpscTransport<T> {
     pub fn new(buffer: usize) -> Self {
-        Self { buffer, _phantom: std::marker::PhantomData }
+        let (tx_to_client, rx_in_client) = tokio::sync::mpsc::channel::<T>(buffer);
+        let (tx_from_client, rx_from_client) = tokio::sync::mpsc::channel::<T>(buffer);
+        Self { buffer, rx_from_client: Some(rx_from_client), tx_to_client, rx_in_client: Some(rx_in_client), tx_from_client }
     }
 }
+
 #[async_trait]
 impl<T> Transport<T> for MpscTransport<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
     async fn accept(&mut self) -> Result<MpscStream<T>, std::io::Error> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<T>(self.buffer);
-        Ok(MpscStream { rx, tx })
+        let rx = self.rx_from_client.take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Accept already called. Implement broadcast channels if needed."))?;
+        Ok(MpscStream { rx, tx: self.tx_to_client.clone() })
+    }
+    async fn connect(&mut self) -> Result<MpscStream<T>, std::io::Error> {
+        let rx = self.rx_in_client.take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Connect already called. Implement broadcast channels if needed."))?;
+        Ok(MpscStream { rx, tx: self.tx_from_client.clone() })
     }
 }
-
 
 // ============================================================================
 // C2 Transport Abstraction
