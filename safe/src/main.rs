@@ -114,14 +114,14 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client(mut stream: impl Stream<String>, tx_telemetry: mpsc::Sender<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
+async fn handle_client(mut stream: impl Stream<String>, mut tx_telemetry: impl Stream<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
     loop { // TODO: Figure out how to break out of this loop when client hangs up!
       tokio::select! {
         Ok(msg) = stream.read() => {
           stream.write(msg.clone()).await.ok();
           let tlm: Telemetry = serde_json::from_str(&msg).unwrap();
           println!("Received: {:?}", tlm);
-          tx_telemetry.send(tlm).await.ok();
+          tx_telemetry.write(tlm).await.ok();
         }
         Ok(cmd) = rx_commands.recv() => {
           let msg = serde_json::to_string(&cmd).unwrap();
@@ -171,12 +171,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (tx_telemetry_to_router, rx_telemetry_in_router) =
-        mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
+    // let (tx_telemetry_to_router, rx_telemetry_in_router) =
+    //     mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
     
-    // let mut transport = MpscTransport::new(config.router.telem_channel_buffer_size);
-    // let telem_to_router_stream = transport.accept().await?;
-    // let (tx_telemetry_to_router, rx_telemetry_in_router) = 
+    let mut c2_to_router_telemetry_transport: MpscTransport<Telemetry> = MpscTransport::new(config.router.telem_channel_buffer_size);
+    let (mut c2_telem_stream, router_telem_stream) = c2_to_router_telemetry_transport.channel().await?;
+    // let c2_telem_stream = c2_to_router_telemetry_transport.connect().await?;
+    // let router_telem_stream = c2_to_router_telemetry_transport.accept().await?;
     
     let (tx_command_to_c2, rx_command_in_c2) =
             broadcast::channel(config.router.command_channel_buffer_size);
@@ -184,10 +185,11 @@ async fn main() -> Result<()> {
     // Create router and then register Modes to it.
     // This allows for us to dynamically create and destroy Modes while running.
     let mut router = Router::new(
-        rx_telemetry_in_router,
+        router_telem_stream,
         tx_command_to_c2,
         observability.clone(),
         &config,
+        &mut c2_to_router_telemetry_transport,
     );
 
     let mode = CollisionAvoidanceAutonomyMode {
@@ -249,8 +251,8 @@ async fn main() -> Result<()> {
     //     }
     // });
 
-    tx_telemetry_to_router
-        .send(Telemetry {
+    c2_telem_stream
+        .write(Telemetry {
             timestamp: 12,
             proximity_m: 1200,
         })
@@ -283,15 +285,16 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let mut transport: UnixTransport<String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: FIXME
+    let mut transport: UnixTransport<String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: Fix
     tokio::spawn(async move {
         loop {
           match transport.accept().await {
             Ok(stream) => {
-                  let tx_telemetry_to_router = tx_telemetry_to_router.clone();
+                  // let tx_telemetry_to_router = tx_telemetry_to_router.clone();
                   let rx_command_in_c2 = rx_command_in_c2.resubscribe();
+                  let c2_telem_stream = c2_to_router_telemetry_transport.connect().await.unwrap();
                   tokio::spawn(async move {
-                      handle_client(stream, tx_telemetry_to_router, rx_command_in_c2).await;
+                      handle_client(stream, c2_telem_stream, rx_command_in_c2).await;
                   });
               }
               Err(e) => eprintln!("Connection error: {}", e),
@@ -320,6 +323,7 @@ Config changes
 - CLI to issue commands over unix socket to Config and C2 interfaces
 - Integrate redb
 - Is it important to guarantee that Modes can't issue commands when Router logic would deactivate them?  Do we need to work out the races here or is this acceptable?
+- Add resiliency and reconnect to Transports which can theoretically drop connections (TCP, Unix sockets, etc.)
  */
 
 /*
