@@ -18,7 +18,6 @@ use figment::Figment;
 use observability as obs;
 use router::{AutonomyMode, Router};
 use serde::Serialize;
-use tokio::fs;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};

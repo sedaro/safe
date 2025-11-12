@@ -493,130 +493,206 @@ where
 
 mod tests {
   use super::*;
-  use serde::{Serialize, Deserialize};
+  use futures::lock;
+use serde::{Serialize, Deserialize};
   use tokio::time::{timeout, Duration};
 
   #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-  struct TestMsg {
+  struct TxMsg {
+    value: u32,
+  }
+  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+  struct RxMsg {
       value: u32,
   }
 
   #[tokio::test]
   async fn test_unix_transport() {
       let path = "/tmp/safe_test.sock";
-      let mut server = UnixTransport::<TestMsg, TestMsg>::new(path).await.unwrap();
+      let mut server = UnixTransport::<RxMsg, TxMsg>::new(path).await.unwrap();
       let handle = server.handle();
       let mut client_stream = handle.connect().await.unwrap();
       let mut server_stream = server.accept().await.unwrap();
       
       // Write from client, read from server
-      client_stream.write(TestMsg { value: 42 }).await.unwrap();
+      client_stream.write(RxMsg { value: 42 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 42 });
+      assert_eq!(msg, RxMsg { value: 42 });
       
       // Write from server, read from client
-      server_stream.write(TestMsg { value: 99 }).await.unwrap();
+      server_stream.write(TxMsg { value: 99 }).await.unwrap();
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 99 });
+      assert_eq!(msg, TxMsg { value: 99 });
       
       // Assert no broadcast by default
       let mut other_client_stream = handle.connect().await.unwrap();
       let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      server_stream.write(TxMsg { value: 77 }).await.unwrap();
       let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
       assert!(res.is_err(), "Other client should not receive message");
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 77 });
+      assert_eq!(msg, TxMsg { value: 77 });
       // Test initial channel still functional
-      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
       let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 88 });
+      assert_eq!(msg, TxMsg { value: 88 });
       let res = timeout(Duration::from_millis(100), client_stream.read()).await;
       assert!(res.is_err(), "Initial client should not receive message");
 
       // Test channel helper functionality
       let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      client_stream.write(RxMsg { value: 999 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 999 });
+      assert_eq!(msg, RxMsg { value: 999 });
   }
 
   #[tokio::test]
   async fn test_tcp_transport() {
-      let mut server = TcpTransport::<TestMsg, TestMsg>::new("127.0.0.1", 18080).await.unwrap();
+      let mut server = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 18080).await.unwrap();
       let handle = server.handle();
       let mut client_stream = handle.connect().await.unwrap();
       let mut server_stream = server.accept().await.unwrap();
       
       // Write from client, read from server
-      client_stream.write(TestMsg { value: 123 }).await.unwrap();
+      client_stream.write(RxMsg { value: 123 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 123 });
+      assert_eq!(msg, RxMsg { value: 123 });
       
       // Write from server, read from client
-      server_stream.write(TestMsg { value: 456 }).await.unwrap();
+      server_stream.write(TxMsg { value: 456 }).await.unwrap();
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 456 });
+      assert_eq!(msg, TxMsg { value: 456 });
       
       // Assert no broadcast by default
       let mut other_client_stream = handle.connect().await.unwrap();
       let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      server_stream.write(TxMsg { value: 77 }).await.unwrap();
       let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
       assert!(res.is_err(), "Other client should not receive message");
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 77 });
+      assert_eq!(msg, TxMsg { value: 77 });
       // Test initial channel still functional
-      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
       let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 88 });
+      assert_eq!(msg, TxMsg { value: 88 });
       let res = timeout(Duration::from_millis(100), client_stream.read()).await;
       assert!(res.is_err(), "Initial client should not receive message");
 
       // Test channel helper functionality
       let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      client_stream.write(RxMsg { value: 999 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 999 });
+      assert_eq!(msg, RxMsg { value: 999 });
   }
 
   #[tokio::test]
   async fn test_mpsc_transport() {
-      let mut server = MpscTransport::<TestMsg, TestMsg>::new(8);
+      let mut server = MpscTransport::<RxMsg, TxMsg>::new(8);
       let handle = server.handle();
       let mut client_stream = handle.connect().await.unwrap();
       let mut server_stream = server.accept().await.unwrap();
       
       // Write from client, read from server
-      client_stream.write(TestMsg { value: 7 }).await.unwrap();
+      client_stream.write(RxMsg { value: 7 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 7 });
+      assert_eq!(msg, RxMsg { value: 7 });
       
       // Write from server, read from client
-      server_stream.write(TestMsg { value: 8 }).await.unwrap();
+      server_stream.write(TxMsg { value: 8 }).await.unwrap();
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 8 });
+      assert_eq!(msg, TxMsg { value: 8 });
       
       // Assert no broadcast by default
       let mut other_client_stream = handle.connect().await.unwrap();
       let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      server_stream.write(TxMsg { value: 77 }).await.unwrap();
       let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
       assert!(res.is_err(), "Other client should not receive message");
       let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 77 });
+      assert_eq!(msg, TxMsg { value: 77 });
       // Test initial channel still functional
-      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
       let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 88 });
+      assert_eq!(msg, TxMsg { value: 88 });
       let res = timeout(Duration::from_millis(100), client_stream.read()).await;
       assert!(res.is_err(), "Initial client should not receive message");
 
       // Test channel helper functionality
       let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      client_stream.write(RxMsg { value: 999 }).await.unwrap();
       let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, TestMsg { value: 999 });
+      assert_eq!(msg, RxMsg { value: 999 });
+  }
+
+  async fn assert_ownership_model(mut transport: impl Transport<RxMsg, TxMsg> + 'static) {
+      let handle = transport.handle();
+      let lock = Arc::new(Mutex::new(())); // Only for synchronization in this test
+      let lock_clone = lock.clone();
+
+      // Move client stream to another task
+      let client_task = tokio::spawn(async move {
+          let _ = lock_clone.lock().await;
+          let mut client_stream = handle.connect().await.unwrap();
+          client_stream.write(RxMsg { value: 1 }).await.unwrap();
+          let msg = client_stream.read().await.unwrap();
+          assert_eq!(msg, TxMsg { value: 101 });
+      });
+
+      let other_handle = transport.handle();
+
+      // Move server stream to another task
+      let server_task = tokio::spawn(async move {
+        let mut i = 0;
+        while i < 3 {
+            let mut server_stream = transport.accept().await.unwrap();
+            let msg = server_stream.read().await.unwrap();
+            assert_eq!(msg, RxMsg { value: i });
+            server_stream.write(TxMsg { value: i + 100 }).await.unwrap();
+            i += 1;
+          }
+      });
+
+      // Confirm driver process can still communicate with server
+      {
+        let mut other_client_stream = other_handle.connect().await.unwrap();
+        let _ = lock.lock().await;
+        other_client_stream.write(RxMsg { value: 0 }).await.unwrap();
+        let msg = other_client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 100 });
+      }
+
+      // Test splitting streams
+      let (mut read, mut write) = other_handle.connect().await.unwrap().split();
+      let write_task = tokio::spawn(async move {
+          write.write(RxMsg { value: 2 }).await.unwrap();
+      });
+      let read_task = tokio::spawn(async move {
+          let msg = read.read().await.unwrap();
+          assert_eq!(msg, TxMsg { value: 102 });
+      });
+
+      client_task.await.unwrap();
+      server_task.await.unwrap();
+      write_task.await.unwrap();
+      read_task.await.unwrap();
+  }
+  
+  #[tokio::test]
+  async fn test_mpsc_ownership_model() {
+      let transport = MpscTransport::<RxMsg, TxMsg>::new(8);
+      assert_ownership_model(transport).await;
+  }
+
+  #[tokio::test]
+  async fn test_unix_ownership_model() {
+      let transport = UnixTransport::<RxMsg, TxMsg>::new("/tmp/safe_ownership_test.sock").await.unwrap();
+      assert_ownership_model(transport).await;
+  }
+
+  #[tokio::test]
+  async fn test_tcp_ownership_model() {
+      let transport = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 10000).await.unwrap();
+      assert_ownership_model(transport).await;
   }
 }
 
