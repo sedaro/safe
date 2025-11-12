@@ -25,6 +25,7 @@ use tracing::{info, warn};
 
 use crate::transports::{MpscTransport, Stream, UnixTransport};
 use crate::transports::Transport;
+use crate::transports::TransportHandle;
 
 #[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
@@ -114,16 +115,16 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client(mut stream: impl Stream<String>, mut tx_telemetry: impl Stream<Telemetry>, mut rx_commands: broadcast::Receiver<Command>) {
+async fn handle_client(mut stream: impl Stream<String, String>, mut router_stream: impl Stream<Command, Telemetry>) {
     loop { // TODO: Figure out how to break out of this loop when client hangs up!
       tokio::select! {
         Ok(msg) = stream.read() => {
           stream.write(msg.clone()).await.ok();
           let tlm: Telemetry = serde_json::from_str(&msg).unwrap();
           println!("Received: {:?}", tlm);
-          tx_telemetry.write(tlm).await.ok();
+          router_stream.write(tlm).await.ok();
         }
-        Ok(cmd) = rx_commands.recv() => {
+        Ok(cmd) = router_stream.read() => {
           let msg = serde_json::to_string(&cmd).unwrap();
           stream.write(msg).await.ok();
         }
@@ -174,22 +175,20 @@ async fn main() -> Result<()> {
     // let (tx_telemetry_to_router, rx_telemetry_in_router) =
     //     mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
     
-    let mut c2_to_router_telemetry_transport: MpscTransport<Telemetry> = MpscTransport::new(config.router.telem_channel_buffer_size);
-    let (mut c2_telem_stream, router_telem_stream) = c2_to_router_telemetry_transport.channel().await?;
+    let mut c2_to_router_telemetry_transport: MpscTransport<Telemetry, Command> = MpscTransport::new(config.router.telem_channel_buffer_size);
+    let handle = c2_to_router_telemetry_transport.handle();
+    // let (mut c2_telem_stream, router_telem_stream) = c2_to_router_telemetry_transport.channel().await?;
     // let c2_telem_stream = c2_to_router_telemetry_transport.connect().await?;
     // let router_telem_stream = c2_to_router_telemetry_transport.accept().await?;
     
-    let (tx_command_to_c2, rx_command_in_c2) =
-            broadcast::channel(config.router.command_channel_buffer_size);
-
     // Create router and then register Modes to it.
     // This allows for us to dynamically create and destroy Modes while running.
     let mut router = Router::new(
-        router_telem_stream,
-        tx_command_to_c2,
+        c2_to_router_telemetry_transport,
+        // router_telem_stream,
+        // tx_command_to_c2,
         observability.clone(),
         &config,
-        &mut c2_to_router_telemetry_transport,
     );
 
     let mode = CollisionAvoidanceAutonomyMode {
@@ -251,6 +250,7 @@ async fn main() -> Result<()> {
     //     }
     // });
 
+    let mut c2_telem_stream = handle.connect().await?;
     c2_telem_stream
         .write(Telemetry {
             timestamp: 12,
@@ -285,16 +285,14 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let mut transport: UnixTransport<String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: Fix
+    let mut transport: UnixTransport<String, String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: Fix
     tokio::spawn(async move {
         loop {
           match transport.accept().await {
             Ok(stream) => {
-                  // let tx_telemetry_to_router = tx_telemetry_to_router.clone();
-                  let rx_command_in_c2 = rx_command_in_c2.resubscribe();
-                  let c2_telem_stream = c2_to_router_telemetry_transport.connect().await.unwrap();
+                  let c2_telem_stream = handle.connect().await.unwrap();
                   tokio::spawn(async move {
-                      handle_client(stream, c2_telem_stream, rx_command_in_c2).await;
+                      handle_client(stream, c2_telem_stream).await;
                   });
               }
               Err(e) => eprintln!("Connection error: {}", e),
