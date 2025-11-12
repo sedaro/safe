@@ -99,12 +99,14 @@ where
     self.inner.send(bytes.into()).await
   }
 }
-pub struct UnixStream {
+pub struct UnixStream<R, T> {
   framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
+  _r: std::marker::PhantomData<R>,
+  _t: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
-impl<R, T> Stream<R, T> for UnixStream
+impl<R, T> Stream<R, T> for UnixStream<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
@@ -142,11 +144,13 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  type ClientStreamType = UnixStream;
+  type ClientStreamType = UnixStream<T, R>;
   async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
     match tokio::net::UnixStream::connect(self.path.clone()).await {
       Ok(stream) => Ok(UnixStream {
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _r: std::marker::PhantomData,
+        _t: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -164,7 +168,7 @@ pub struct UnixTransport<R, T> {
 }
 
 impl<R, T> UnixTransport<R, T> {
-  pub async fn new(path: String) -> Result<Self, std::io::Error> {
+  pub async fn new(path: &str) -> Result<Self, std::io::Error> {
       // Require path ends in .sock to protect against accidental file deletion
       if !path.ends_with(".sock") {
           return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Socket path must end with .sock"));
@@ -173,9 +177,9 @@ impl<R, T> UnixTransport<R, T> {
       if std::path::Path::new(&path).exists() {
           tokio::fs::remove_file(&path).await?;
       }
-      let listener = tokio::net::UnixListener::bind(path.clone())?;
+      let listener = tokio::net::UnixListener::bind(path)?;
       println!("SAFE listening on {}", path);
-      Ok(Self { path, listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData })
+      Ok(Self { path: path.to_string(), listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData })
   }
 }
 
@@ -185,13 +189,15 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  type ServerStreamType = UnixStream;
-  type ClientStreamType = UnixStream;
+  type ServerStreamType = UnixStream<R, T>;
+  type ClientStreamType = UnixStream<T, R>;
   type TransportHandleType = UnixTransportHandle<R, T>;
   async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => Ok(UnixStream { 
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _r: std::marker::PhantomData,
+        _t: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -248,12 +254,14 @@ where
   }
 }
 
-pub struct TcpStream {
+pub struct TcpStream<R, T> {
   framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
+  _r: std::marker::PhantomData<R>,
+  _t: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
-impl<R, T> Stream<R, T> for TcpStream
+impl<R, T> Stream<R, T> for TcpStream<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de>+ Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
@@ -291,12 +299,14 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  type ClientStreamType = TcpStream;
+  type ClientStreamType = TcpStream<T, R>;
   async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
     let full_address = format!("{}:{}", self.address, self.port);
     match tokio::net::TcpStream::connect(full_address.clone()).await {
       Ok(stream) => Ok(TcpStream {  
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _r: std::marker::PhantomData,
+        _t: std::marker::PhantomData,
       }),
       Err(e) => {
         eprintln!("Connection error: {}", e);
@@ -315,11 +325,11 @@ pub struct TcpTransport<R, T> {
 }
 
 impl<R, T> TcpTransport<R, T> {
-  pub async fn new(address: String, port: u16) -> Result<Self, std::io::Error> {
+  pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
     let full_address = format!("{address}:{port}");
     let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
     println!("SAFE listening on {}", full_address);
-    let s = Self { address, port, listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData };
+    let s = Self { address: address.to_string(), port, listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData };
     Ok(s)
   }
 }
@@ -330,14 +340,16 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
 {
-  type ServerStreamType = TcpStream;
-  type ClientStreamType = TcpStream;
+  type ServerStreamType = TcpStream<R, T>;
+  type ClientStreamType = TcpStream<T, R>;
   type TransportHandleType = TcpTransportHandle<R, T>;
   async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
     match self.listener.accept().await {
       Ok((stream, _)) => {
         Ok(TcpStream { 
         framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+        _r: std::marker::PhantomData,
+        _t: std::marker::PhantomData,
         })
       },
       Err(e) => {
@@ -479,83 +491,3 @@ where
         }
     }
 }
-
-// ============================================================================
-// C2 Transport Abstraction
-// ============================================================================
-
-// #[async_trait]
-// pub trait C2Transport: Send + Sync {
-//     async fn recv_telemetry(&mut self) -> Result<Telemetry>;
-//     async fn send_command(&mut self, cmd: Command) -> Result<()>;
-// }
-
-// struct TcpC2Transport {
-//     framed: Framed<TcpStream, LengthDelimitedCodec>,
-// }
-
-// impl TcpC2Transport {
-//     fn new(stream: TcpStream) -> Self {
-//         Self {
-//             framed: Framed::new(stream, LengthDelimitedCodec::new()),
-//         }
-//     }
-// }
-
-// #[async_trait]
-// impl C2Transport for TcpC2Transport {
-//     async fn recv_telemetry(&mut self) -> Result<Telemetry> {
-//         let bytes = self
-//             .framed
-//             .next()
-//             .await
-//             .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
-//         Ok(bincode::deserialize(&bytes)?)
-//     }
-
-//     async fn send_command(&mut self, cmd: Command) -> Result<()> {
-//         let bytes = bincode::serialize(&cmd)?;
-//         self.framed.send(bytes.into()).await?;
-//         Ok(())
-//     }
-// }
-
-// ============================================================================
-// Config Transport
-// ============================================================================
-
-// #[async_trait]
-// pub trait ConfigTransport: Send + Sync {
-//     async fn recv_config(&mut self) -> Result<ConfigMessage>;
-//     async fn send_response(&mut self, response: String) -> Result<()>;
-// }
-
-// struct TcpConfigTransport {
-//     framed: Framed<TcpStream, LengthDelimitedCodec>,
-// }
-
-// impl TcpConfigTransport {
-//     fn new(stream: TcpStream) -> Self {
-//         Self {
-//             framed: Framed::new(stream, LengthDelimitedCodec::new()),
-//         }
-//     }
-// }
-
-// #[async_trait]
-// impl ConfigTransport for TcpConfigTransport {
-//     async fn recv_config(&mut self) -> Result<ConfigMessage> {
-//         let bytes = self
-//             .framed
-//             .next()
-//             .await
-//             .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
-//         Ok(bincode::deserialize(&bytes)?)
-//     }
-
-//     async fn send_response(&mut self, response: String) -> Result<()> {
-//         let bytes = response.into_bytes();
-//         self.framed.send(bytes.into()).await?;
-//         Ok(())
-//     }
-// }
