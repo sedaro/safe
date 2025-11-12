@@ -1,7 +1,16 @@
+use crate::c2::{Command, Telemetry};
+use crate::config::{Config, EngagementMode};
+use crate::definitions::Variable;
+use crate::definitions::{Activation, Resolvable, Value};
+use crate::observability as obs;
+use crate::transports::ReadHalf;
+use crate::transports::Stream;
+use crate::transports::Transport;
+use crate::transports::WriteHalf;
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
 use core::panic;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,15 +18,6 @@ use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use tracing::{debug, info, warn};
-use crate::c2::{Command, Telemetry};
-use crate::config::{Config, EngagementMode};
-use crate::definitions::Variable;
-use crate::definitions::{Activation, Value, Resolvable};
-use crate::observability as obs;
-use crate::transports::Stream;
-use crate::transports::Transport;
-use crate::transports::ReadHalf;
-use crate::transports::WriteHalf;
 
 enum AutonomyModeSignal {
     // TODO: Warn of getting unscheduled
@@ -53,8 +53,12 @@ impl Resolvable for Resolver {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         if let Some(latest_telem) = telem_buffer.front() {
             match var {
-                "proximity_m" => Some(Variable::Float64(Value::Literal(latest_telem.proximity_m as f64))),
-                "timestamp" => Some(Variable::Float64(Value::Literal(latest_telem.timestamp as f64))),
+                "proximity_m" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.proximity_m as f64,
+                ))),
+                "timestamp" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.timestamp as f64,
+                ))),
                 _ => None,
             }
         } else {
@@ -101,7 +105,9 @@ where
             selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
             autonomy_modes: HashMap::new(),
             resolver: Resolver {
-                telem_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(config.router.historic_telem_buffer_size))),
+                telem_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(
+                    config.router.historic_telem_buffer_size,
+                ))),
                 vars: HashMap::new(),
             },
         }
@@ -277,109 +283,216 @@ where
 #[cfg(test)]
 mod tests {
 
-use crate::definitions::{Expr, Value, Variable};
+    use crate::definitions::{Expr, Value, Variable};
 
-use super::*;
+    use super::*;
 
-  #[test]
-  fn test_eval() {
+    #[test]
+    fn test_eval() {
+        let resolver = Resolver {
+            telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
+                Telemetry {
+                    timestamp: 1000,
+                    proximity_m: 150,
+                },
+                Telemetry {
+                    timestamp: 2000,
+                    proximity_m: 50,
+                },
+            ]))),
+            vars: HashMap::from_iter([
+                ("a".into(), Variable::Float64(Value::Literal(49.0))),
+                ("b".into(), Variable::Bool(Value::Literal(true))),
+                (
+                    "c".into(),
+                    Variable::String(Value::Literal("test".to_string())),
+                ),
+            ]),
+        };
 
-    let resolver = Resolver {
-        telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
-            Telemetry {
-                timestamp: 1000,
-                proximity_m: 150,
-            },
-            Telemetry {
-                timestamp: 2000,
-                proximity_m: 50,
-            },
-        ]))),
-        vars: HashMap::from_iter([
-          ("a".into(), Variable::Float64(Value::Literal(49.0))),
-          ("b".into(), Variable::Bool(Value::Literal(true))),
-          ("c".into(), Variable::String(Value::Literal("test".to_string()))),
-        ]),
-    };
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
 
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-    ).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-        Box::new(Expr::Term(Variable::Float64(Value::VariableRef("a".to_string())))),
-    ).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::VariableRef("a".to_string())))),
-        Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::Term(Variable::Bool(Value::Literal(true))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::Bool(Value::Literal(false))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("true".to_string()))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("false".to_string()))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("".to_string()))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::Float64(Value::Literal(0.0))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::Float64(Value::Literal(1.0))).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(0.0)))),
-    ).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::GreaterThan(
-      Box::new(Expr::Term(Variable::Bool(Value::VariableRef("b".to_string())))),
-      Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-    ).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Equal(
-        Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-    ).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-      )
-    ])).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
-      )
-    ])).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::Or(Vec::from([
-        Expr::Term(Variable::Bool(Value::Literal(false))),
-        Expr::Term(Variable::Bool(Value::Literal(true))),
-      ])),
-    ])).eval(&resolver).unwrap(), true);
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
 
-    // Test type mismatches
-    let result = Expr::Equal(
-      Box::new(Expr::Term(Variable::String(Value::Literal("test".to_string())))),
-      Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-    ).eval(&resolver);
-    assert!(result.is_err());
-    let error: crate::definitions::Error = result.unwrap_err();
-    assert!(matches!(error, crate::definitions::Error::TypeMismatch));
-  }
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
+                    "a".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
+                    "a".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+
+        assert_eq!(
+            Expr::Term(Variable::Bool(Value::Literal(true)))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::Bool(Value::Literal(false)))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("true".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("false".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::Float64(Value::Literal(0.0)))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::Float64(Value::Literal(1.0)))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(0.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Bool(Value::VariableRef(
+                    "b".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Equal(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+                )
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
+                )
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::Or(Vec::from([
+                    Expr::Term(Variable::Bool(Value::Literal(false))),
+                    Expr::Term(Variable::Bool(Value::Literal(true))),
+                ])),
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        // Test type mismatches
+        let result = Expr::Equal(
+            Box::new(Expr::Term(Variable::String(Value::Literal(
+                "test".to_string(),
+            )))),
+            Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+        )
+        .eval(&resolver);
+        assert!(result.is_err());
+        let error: crate::definitions::Error = result.unwrap_err();
+        assert!(matches!(error, crate::definitions::Error::TypeMismatch));
+    }
 }
