@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
-use serde_json::de::Read;
 use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Serialize, Deserialize};
@@ -491,3 +490,136 @@ where
         }
     }
 }
+
+mod tests {
+  use super::*;
+  use serde::{Serialize, Deserialize};
+  use tokio::time::{timeout, Duration};
+
+  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+  struct TestMsg {
+      value: u32,
+  }
+
+  #[tokio::test]
+  async fn test_unix_transport() {
+      let path = "/tmp/safe_test.sock";
+      let mut server = UnixTransport::<TestMsg, TestMsg>::new(path).await.unwrap();
+      let handle = server.handle();
+      let mut client_stream = handle.connect().await.unwrap();
+      let mut server_stream = server.accept().await.unwrap();
+      
+      // Write from client, read from server
+      client_stream.write(TestMsg { value: 42 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 42 });
+      
+      // Write from server, read from client
+      server_stream.write(TestMsg { value: 99 }).await.unwrap();
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 99 });
+      
+      // Assert no broadcast by default
+      let mut other_client_stream = handle.connect().await.unwrap();
+      let mut other_server_stream= server.accept().await.unwrap();
+      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+      assert!(res.is_err(), "Other client should not receive message");
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 77 });
+      // Test initial channel still functional
+      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      let msg = other_client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 88 });
+      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+      assert!(res.is_err(), "Initial client should not receive message");
+
+      // Test channel helper functionality
+      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 999 });
+  }
+
+  #[tokio::test]
+  async fn test_tcp_transport() {
+      let mut server = TcpTransport::<TestMsg, TestMsg>::new("127.0.0.1", 18080).await.unwrap();
+      let handle = server.handle();
+      let mut client_stream = handle.connect().await.unwrap();
+      let mut server_stream = server.accept().await.unwrap();
+      
+      // Write from client, read from server
+      client_stream.write(TestMsg { value: 123 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 123 });
+      
+      // Write from server, read from client
+      server_stream.write(TestMsg { value: 456 }).await.unwrap();
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 456 });
+      
+      // Assert no broadcast by default
+      let mut other_client_stream = handle.connect().await.unwrap();
+      let mut other_server_stream= server.accept().await.unwrap();
+      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+      assert!(res.is_err(), "Other client should not receive message");
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 77 });
+      // Test initial channel still functional
+      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      let msg = other_client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 88 });
+      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+      assert!(res.is_err(), "Initial client should not receive message");
+
+      // Test channel helper functionality
+      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 999 });
+  }
+
+  #[tokio::test]
+  async fn test_mpsc_transport() {
+      let mut server = MpscTransport::<TestMsg, TestMsg>::new(8);
+      let handle = server.handle();
+      let mut client_stream = handle.connect().await.unwrap();
+      let mut server_stream = server.accept().await.unwrap();
+      
+      // Write from client, read from server
+      client_stream.write(TestMsg { value: 7 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 7 });
+      
+      // Write from server, read from client
+      server_stream.write(TestMsg { value: 8 }).await.unwrap();
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 8 });
+      
+      // Assert no broadcast by default
+      let mut other_client_stream = handle.connect().await.unwrap();
+      let mut other_server_stream= server.accept().await.unwrap();
+      server_stream.write(TestMsg { value: 77 }).await.unwrap();
+      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+      assert!(res.is_err(), "Other client should not receive message");
+      let msg = client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 77 });
+      // Test initial channel still functional
+      other_server_stream.write(TestMsg { value: 88 }).await.unwrap();
+      let msg = other_client_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 88 });
+      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+      assert!(res.is_err(), "Initial client should not receive message");
+
+      // Test channel helper functionality
+      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+      client_stream.write(TestMsg { value: 999 }).await.unwrap();
+      let msg = server_stream.read().await.unwrap();
+      assert_eq!(msg, TestMsg { value: 999 });
+  }
+}
+
+// TODO:
+// - Implement timeouts on reads?
+// - Implement connection retries and reconnect on any transport that can be disrupted
