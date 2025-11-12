@@ -213,41 +213,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut c2_telem_stream = handle.connect().await?;
-    c2_telem_stream
-        .write(Telemetry {
-            timestamp: 12,
-            proximity_m: 1200,
-        })
-        .await?;
-    // tx_telemetry_to_router
-    //     .send(Telemetry {
-    //         timestamp: 13,
-    //         proximity_m: 1200,
-    //     })
-    //     .await?;
-    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    // tx_telemetry_to_router
-    //     .send(Telemetry {
-    //         timestamp: 14,
-    //         proximity_m: 99,
-    //     })
-    //     .await?;
-    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    // tx_telemetry_to_router
-    //     .send(Telemetry {
-    //         timestamp: 14,
-    //         proximity_m: 99,
-    //     })
-    //     .await?;
-    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    // tx_telemetry_to_router
-    //     .send(Telemetry {
-    //         timestamp: 14,
-    //         proximity_m: 200,
-    //     })
-    //     .await?;
-
     // let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
     let mut transport: TcpTransport<String, String> = TcpTransport::new("127.0.0.1", 8001).await?;
     tokio::spawn(async move {
@@ -272,7 +237,6 @@ async fn main() -> Result<()> {
 
 /*
 On deck:
-Other transports
 Logs
 Config changes
  */
