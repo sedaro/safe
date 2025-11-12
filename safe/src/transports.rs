@@ -756,6 +756,49 @@ mod tests {
             .unwrap();
         assert_ownership_model(transport).await;
     }
+
+    async fn assert_perf(mut transport: impl Transport<RxMsg, TxMsg> + 'static) -> f64 {
+        let handle = transport.handle();
+        let mut client_stream = handle.connect().await.unwrap();
+        let mut server_stream = transport.accept().await.unwrap();
+
+        let iterations = 10000;
+        let start = tokio::time::Instant::now();
+        for i in 0..iterations {
+            client_stream.write(RxMsg { value: i }).await.unwrap();
+            let msg = server_stream.read().await.unwrap();
+            assert_eq!(msg, RxMsg { value: i });
+        }
+        let duration = start.elapsed();
+        let avg_latency = duration.as_micros() as f64 / iterations as f64;
+        println!(
+            "Transport average round-trip latency over {} iterations: {:.2} µs",
+            iterations, avg_latency
+        );
+        avg_latency
+    }
+
+    #[tokio::test]
+    async fn test_mpsc_perf() {
+        let transport = MpscTransport::<RxMsg, TxMsg>::new(1024);
+        assert!(assert_perf(transport).await < 2.0); // Expect under 2 µs RTT
+    }
+
+    #[tokio::test]
+    async fn test_unix_perf() {
+        let transport = UnixTransport::<RxMsg, TxMsg>::new("/tmp/safe_perf_test.sock")
+            .await
+            .unwrap();
+        assert!(assert_perf(transport).await < 20.0); // Expect under 20 µs RTT
+    }
+
+    #[tokio::test]
+    async fn test_tcp_perf() {
+        let transport = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 10001)
+            .await
+            .unwrap();
+        assert!(assert_perf(transport).await < 60.0); // Expect under 60 µs RTT
+    }
 }
 
 // TODO:
