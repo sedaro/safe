@@ -1,9 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde::Serialize;
+use tokio::sync::Mutex;
 use core::panic;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
@@ -15,7 +20,9 @@ use crate::definitions::{Activation, Expr, Value, Resolvable};
 use crate::observability as obs;
 use crate::transports::Stream;
 use crate::transports::Transport;
-
+use crate::transports::TransportHandle;
+use crate::transports::ReadHalf;
+use crate::transports::WriteHalf;
 
 enum AutonomyModeSignal {
     // TODO: Warn of getting unscheduled
@@ -43,12 +50,13 @@ pub struct ManagedAutonomyMode {
 }
 
 pub struct Resolver {
-    telem_buffer: VecDeque<Telemetry>,
+    telem_buffer: Arc<std::sync::Mutex<VecDeque<Telemetry>>>,
     vars: HashMap<String, Variable>,
 }
 impl Resolvable for Resolver {
     fn get_telemetry(&self, var: &str) -> Option<Variable> {
-        if let Some(latest_telem) = self.telem_buffer.front() {
+        let telem_buffer = self.telem_buffer.lock().unwrap();
+        if let Some(latest_telem) = telem_buffer.front() {
             match var {
                 "proximity_m" => Some(Variable::Float64(Value::Literal(latest_telem.proximity_m as f64))),
                 "timestamp" => Some(Variable::Float64(Value::Literal(latest_telem.timestamp as f64))),
@@ -63,41 +71,44 @@ impl Resolvable for Resolver {
     }
 }
 
-pub struct Router {
+pub struct Router<TR>
+where
+    TR: Transport<Telemetry, Command>,
+{
     engagement_mode: EngagementMode,
-    rx_telem: Box<dyn Stream<Telemetry>>,
+    transport: TR,
+    // transport_handle: TR::TransportHandleType,
     tx_telem_to_modes: broadcast::Sender<Telemetry>,
     rx_telem_in_modes: broadcast::Receiver<Telemetry>,
-    tx_command: broadcast::Sender<Command>,
     observability: Arc<obs::ObservabilitySubsystem>,
     selected_mode: Option<String>,
     autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
     resolver: Resolver,
 }
 
-impl Router {
+impl<TR> Router<TR>
+where
+    TR: Transport<Telemetry, Command>,
+{
     pub fn new(
-        rx_telem: impl Stream<Telemetry>,
-        tx_command: broadcast::Sender<Command>,
+        transport: TR,
         observability: Arc<obs::ObservabilitySubsystem>,
         config: &Config,
-        transport: &mut impl Transport<Telemetry>,
     ) -> Self {
         debug!("Initializing Router with config: {:?}", config.router);
         let (tx_telem_to_modes, rx_telem_in_modes) =
             broadcast::channel(config.router.max_autonomy_modes);
-        let _a = transport.accept();
         Self {
             engagement_mode: EngagementMode::Off,
-            rx_telem: Box::new(rx_telem),
+            // transport_handle: transport.handle(),
+            transport: transport,
             tx_telem_to_modes,
             rx_telem_in_modes,
-            tx_command,
             observability,
             selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
             autonomy_modes: HashMap::new(),
             resolver: Resolver {
-                telem_buffer: VecDeque::with_capacity(config.router.historic_telem_buffer_size),
+                telem_buffer: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(config.router.historic_telem_buffer_size))),
                 vars: HashMap::new(),
             },
         }
@@ -134,26 +145,91 @@ impl Router {
         println!("Registered Autonomy Mode:\n{}", mode_str);
     }
 
+    // pub async fn connect(&self) -> Result<<<TR as Transport<Telemetry, Command>>::TransportHandleType as TransportHandle<Telemetry, Command>>::ClientStreamType, std::io::Error> {
+    // pub async fn connect(&self) -> Result<TR::TransportHandleType, std::io::Error> {
+    //     self.transport_handle.connect().await
+    // }
+
     pub async fn run(&mut self, config: &Config) -> Result<()> {
         info!("Router is starting");
         let mut routing_interval =
             time::interval(std::time::Duration::from_secs(config.router.period_seconds));
+        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<Command> + Send>>::new();
         loop {
             tokio::select! {
-                // Receive telemetry from C2 and forward to modes
-                Ok(telemetry) = self.rx_telem.read() => {
-                    self.observability.log_event(
-                        obs::Location::Router,
-                        obs::Event::TelemetryReceived(telemetry.clone()),
-                    );
-                    self.resolver.telem_buffer.push_front(telemetry.clone());
-                    if self.resolver.telem_buffer.len() > config.router.historic_telem_buffer_size {
-                      self.resolver.telem_buffer.pop_back();
-                    }
-                    if let Err(_) = self.tx_telem_to_modes.send(telemetry) {
-                        warn!("No active subscribers for telemetry");
-                    }
+                // Accept new connections from C2
+                Ok(stream) = self.transport.accept() => {
+                    info!("C2 connected to Router");
+                    let (mut read_half, write_half) = stream.split();
+                    // let read_half = Box::new(read_half);
+                    // let read_future = read_half.read();
+                    // client_reads.push(read_future);
+                    // let a = read_half.read().await;
+                    // client_stream_read_halves.lock().await.push(Box::new(read_half));
+
+                    client_stream_write_halves.push(Box::new(write_half));
+
+                    let observability = self.observability.clone();
+                    let telem_buffer = self.resolver.telem_buffer.clone();
+                    let tx_telem_to_modes = self.tx_telem_to_modes.clone();
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                      loop {
+                        match read_half.read().await {
+                          Ok(telemetry) => {
+                              // handle msg from clients
+                              observability.log_event(
+                                  obs::Location::Router,
+                                  obs::Event::TelemetryReceived(telemetry.clone()),
+                              );
+                              let mut telem_buffer = telem_buffer.lock().unwrap();
+                              telem_buffer.push_front(telemetry.clone());
+                              if telem_buffer.len() > config.router.historic_telem_buffer_size {
+                                telem_buffer.pop_back();
+                              }
+                              if let Err(_) = tx_telem_to_modes.send(telemetry) {
+                                  warn!("No active subscribers for telemetry");
+                              }
+                          }
+                          Err(e) => {
+                              warn!("Error reading from C2 client: {}", e);
+                              break;
+                          }
+                        }
+                      }
+                    });
+                    // client_reads.push(a);
                 }
+
+                // Receive telemetry from C2 and forward to modes
+                // Some(result) = client_reads.next() => {
+                //   match result {
+                //     Ok(telemetry) => {
+                //         // handle msg from clients
+                //         self.observability.log_event(
+                //             obs::Location::Router,
+                //             obs::Event::TelemetryReceived(telemetry.clone()),
+                //         );
+                //         self.resolver.telem_buffer.push_front(telemetry.clone());
+                //         if self.resolver.telem_buffer.len() > config.router.historic_telem_buffer_size {
+                //           self.resolver.telem_buffer.pop_back();
+                //         }
+                //         if let Err(_) = self.tx_telem_to_modes.send(telemetry) {
+                //             warn!("No active subscribers for telemetry");
+                //         }
+                //     }
+                //     Err(e) => {
+                //         warn!("Error reading from C2 client: {}", e);
+                //     }
+                //   }
+                  // Always push a new read for this client if still connected
+                  // if client_is_still_connected {
+                  //     client_reads.push(async move {
+                  //         let result = clients[idx].read().await;
+                  //         (idx, result)
+                  //     });
+                  // }
+                // }
 
                 // Forward commands from active mode to C2
                 // TODO: There is an issue here where modes can send a bunch of commands when inactive and then when the become active we'll forward them along
@@ -172,8 +248,10 @@ impl Router {
                             reason: None,
                         },
                     );
-                    if let Err(e) = self.tx_command.send(command) {
-                        warn!("No active subscribers for commands: {}", e);
+                    for write_half in client_stream_write_halves.iter_mut() {
+                        if let Err(e) = write_half.write(command.clone()).await {
+                            warn!("Error writing command to C2: {}", e);
+                        }
                     }
                 }
 
@@ -255,7 +333,7 @@ use super::*;
   fn test_eval() {
 
     let resolver = Resolver {
-        telem_buffer: VecDeque::from(vec![
+        telem_buffer: Arc::new(std::sync::Mutex::new(VecDeque::from(vec![
             Telemetry {
                 timestamp: 1000,
                 proximity_m: 150,
@@ -264,7 +342,7 @@ use super::*;
                 timestamp: 2000,
                 proximity_m: 50,
             },
-        ]),
+        ]))),
         vars: HashMap::from_iter([
           ("a".into(), Variable::Float64(Value::Literal(49.0))),
           ("b".into(), Variable::Bool(Value::Literal(true))),
