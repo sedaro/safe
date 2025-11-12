@@ -3,7 +3,8 @@ use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
 use futures::{SinkExt, StreamExt};
 use clap::{CommandFactory, Parser, Subcommand};
-use tokio::net::UnixStream as TokioUnixStream;
+use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 
 const SOCKET_PATH: &str = "/tmp/safe.sock";
 
@@ -163,7 +164,8 @@ async fn main() -> std::io::Result<()> {
           println!("{:?} {:?}", all, tail);
         }
         Some(Commands::Transmit { json }) => {
-          let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
+          // let stream = UnixStream::connect(SOCKET_PATH).await?;
+          let stream = TcpStream::connect("127.0.0.1:8001").await?;
           println!("Connected");
           let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
           
@@ -174,7 +176,8 @@ async fn main() -> std::io::Result<()> {
           framed_stream.send(msg.into()).await?;
         }
         Some(Commands::Receive {}) => {
-          let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
+          // let stream = UnixStream::connect(SOCKET_PATH).await?;
+          let stream = TcpStream::connect("127.0.0.1:8001").await?;
           println!("Connected");
           let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
           loop {
