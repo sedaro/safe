@@ -1,26 +1,30 @@
-use anyhow::Result;
-use async_trait::async_trait;
-use serde::Serialize;
-use core::panic;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
-use tokio::time;
-use tracing::{debug, info, warn};
 use crate::c2::{Command, Telemetry};
 use crate::config::{Config, EngagementMode};
 use crate::definitions::Variable;
-use crate::definitions::{Activation, Expr, Value, Resolvable};
+use crate::definitions::{Activation, Resolvable, Value};
 use crate::observability as obs;
-
+use crate::transports::ReadHalf;
+use crate::transports::Stream;
+use crate::transports::Transport;
+use crate::transports::WriteHalf;
+use anyhow::Result;
+use async_trait::async_trait;
+use core::panic;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::{broadcast, mpsc};
+use tokio::time;
+use tracing::{debug, info, warn};
 
 enum AutonomyModeSignal {
     // TODO: Warn of getting unscheduled
 }
 
 #[async_trait]
-pub trait AutonomyMode: Send + Sync {
+pub trait AutonomyMode: Send + Sync + Serialize + 'static {
     fn name(&self) -> String;
     fn activation(&self) -> Option<Activation>;
     fn priority(&self) -> u8;
@@ -41,15 +45,20 @@ pub struct ManagedAutonomyMode {
 }
 
 pub struct Resolver {
-    telem_buffer: VecDeque<Telemetry>,
+    telem_buffer: Arc<Mutex<VecDeque<Telemetry>>>,
     vars: HashMap<String, Variable>,
 }
 impl Resolvable for Resolver {
     fn get_telemetry(&self, var: &str) -> Option<Variable> {
-        if let Some(latest_telem) = self.telem_buffer.front() {
+        let telem_buffer = self.telem_buffer.lock().unwrap();
+        if let Some(latest_telem) = telem_buffer.front() {
             match var {
-                "proximity_m" => Some(Variable::Float64(Value::Literal(latest_telem.proximity_m as f64))),
-                "timestamp" => Some(Variable::Float64(Value::Literal(latest_telem.timestamp as f64))),
+                "proximity_m" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.proximity_m as f64,
+                ))),
+                "timestamp" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.timestamp as f64,
+                ))),
                 _ => None,
             }
         } else {
@@ -61,22 +70,26 @@ impl Resolvable for Resolver {
     }
 }
 
-pub struct Router {
+pub struct Router<TR>
+where
+    TR: Transport<Telemetry, Command>,
+{
     engagement_mode: EngagementMode,
-    rx_telem: mpsc::Receiver<Telemetry>,
+    transport: TR,
     tx_telem_to_modes: broadcast::Sender<Telemetry>,
     rx_telem_in_modes: broadcast::Receiver<Telemetry>,
-    tx_command: broadcast::Sender<Command>,
     observability: Arc<obs::ObservabilitySubsystem>,
     selected_mode: Option<String>,
     autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
     resolver: Resolver,
 }
 
-impl Router {
+impl<TR> Router<TR>
+where
+    TR: Transport<Telemetry, Command>,
+{
     pub fn new(
-        rx_telem: mpsc::Receiver<Telemetry>,
-        tx_command: broadcast::Sender<Command>,
+        transport: TR,
         observability: Arc<obs::ObservabilitySubsystem>,
         config: &Config,
     ) -> Self {
@@ -85,21 +98,22 @@ impl Router {
             broadcast::channel(config.router.max_autonomy_modes);
         Self {
             engagement_mode: EngagementMode::Off,
-            rx_telem,
+            transport: transport,
             tx_telem_to_modes,
             rx_telem_in_modes,
-            tx_command,
             observability,
             selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
             autonomy_modes: HashMap::new(),
             resolver: Resolver {
-                telem_buffer: VecDeque::with_capacity(config.router.historic_telem_buffer_size),
+                telem_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(
+                    config.router.historic_telem_buffer_size,
+                ))),
                 vars: HashMap::new(),
             },
         }
     }
 
-    pub fn register_autonomy_mode<M: AutonomyMode + Serialize + 'static>(&mut self, mut mode: M, config: &Config) {
+    pub fn register_autonomy_mode<M: AutonomyMode>(&mut self, mut mode: M, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) =
             mpsc::channel::<Command>(config.router.command_channel_buffer_size);
         let mode_name = mode.name().clone();
@@ -134,21 +148,45 @@ impl Router {
         info!("Router is starting");
         let mut routing_interval =
             time::interval(std::time::Duration::from_secs(config.router.period_seconds));
+        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<Command> + Send>>::new();
         loop {
             tokio::select! {
-                // Receive telemetry from C2 and forward to modes
-                Some(telemetry) = self.rx_telem.recv() => {
-                    self.observability.log_event(
-                        obs::Location::Router,
-                        obs::Event::TelemetryReceived(telemetry.clone()),
-                    );
-                    self.resolver.telem_buffer.push_front(telemetry.clone());
-                    if self.resolver.telem_buffer.len() > config.router.historic_telem_buffer_size {
-                      self.resolver.telem_buffer.pop_back();
-                    }
-                    if let Err(_) = self.tx_telem_to_modes.send(telemetry) {
-                        warn!("No active subscribers for telemetry");
-                    }
+                // Accept new connections from C2
+                Ok(stream) = self.transport.accept() => {
+                    info!("C2 connected to Router");
+                    let (mut read_half, write_half) = stream.split();
+                    client_stream_write_halves.push(Box::new(write_half));
+
+                    // Spawn read handler
+                    let observability = self.observability.clone();
+                    let telem_buffer = self.resolver.telem_buffer.clone();
+                    let tx_telem_to_modes = self.tx_telem_to_modes.clone();
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                      loop {
+                        match read_half.read().await {
+                          Ok(telemetry) => {
+                              // handle msg from clients
+                              observability.log_event(
+                                  obs::Location::Router,
+                                  obs::Event::TelemetryReceived(telemetry.clone()),
+                              );
+                              let mut telem_buffer = telem_buffer.lock().unwrap();
+                              telem_buffer.push_front(telemetry.clone());
+                              if telem_buffer.len() > config.router.historic_telem_buffer_size {
+                                telem_buffer.pop_back();
+                              }
+                              if let Err(_) = tx_telem_to_modes.send(telemetry) {
+                                  warn!("No active subscribers for telemetry");
+                              }
+                          }
+                          Err(e) => {
+                              warn!("Error reading from C2 client: {}", e);
+                              break;
+                          }
+                        }
+                      }
+                    });
                 }
 
                 // Forward commands from active mode to C2
@@ -168,8 +206,10 @@ impl Router {
                             reason: None,
                         },
                     );
-                    if let Err(e) = self.tx_command.send(command) {
-                        warn!("No active subscribers for commands: {}", e);
+                    for write_half in client_stream_write_halves.iter_mut() {
+                        if let Err(e) = write_half.write(command.clone()).await {
+                            warn!("Error writing command to C2: {}", e);
+                        }
                     }
                 }
 
@@ -243,109 +283,216 @@ impl Router {
 #[cfg(test)]
 mod tests {
 
-use crate::definitions::{Value, Variable};
+    use crate::definitions::{Expr, Value, Variable};
 
-use super::*;
+    use super::*;
 
-  #[test]
-  fn test_eval() {
+    #[test]
+    fn test_eval() {
+        let resolver = Resolver {
+            telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
+                Telemetry {
+                    timestamp: 1000,
+                    proximity_m: 150,
+                },
+                Telemetry {
+                    timestamp: 2000,
+                    proximity_m: 50,
+                },
+            ]))),
+            vars: HashMap::from_iter([
+                ("a".into(), Variable::Float64(Value::Literal(49.0))),
+                ("b".into(), Variable::Bool(Value::Literal(true))),
+                (
+                    "c".into(),
+                    Variable::String(Value::Literal("test".to_string())),
+                ),
+            ]),
+        };
 
-    let resolver = Resolver {
-        telem_buffer: VecDeque::from(vec![
-            Telemetry {
-                timestamp: 1000,
-                proximity_m: 150,
-            },
-            Telemetry {
-                timestamp: 2000,
-                proximity_m: 50,
-            },
-        ]),
-        vars: HashMap::from_iter([
-          ("a".into(), Variable::Float64(Value::Literal(49.0))),
-          ("b".into(), Variable::Bool(Value::Literal(true))),
-          ("c".into(), Variable::String(Value::Literal("test".to_string()))),
-        ]),
-    };
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
 
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-    ).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-        Box::new(Expr::Term(Variable::Float64(Value::VariableRef("a".to_string())))),
-    ).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::VariableRef("a".to_string())))),
-        Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-    ).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::Term(Variable::Bool(Value::Literal(true))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::Bool(Value::Literal(false))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("true".to_string()))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("false".to_string()))).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::Term(Variable::String(Value::Literal("".to_string()))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::Float64(Value::Literal(0.0))).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Term(Variable::Float64(Value::Literal(1.0))).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(0.0)))),
-    ).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::GreaterThan(
-      Box::new(Expr::Term(Variable::Bool(Value::VariableRef("b".to_string())))),
-      Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string())))),
-    ).eval(&resolver).unwrap(), false);
-    assert_eq!(Expr::Equal(
-        Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-    ).eval(&resolver).unwrap(), true);
-    
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-      )
-    ])).eval(&resolver).unwrap(), true);
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::GreaterThan(
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
-        Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
-      )
-    ])).eval(&resolver).unwrap(), false);
-    
-    assert_eq!(Expr::And(Vec::from([
-      Expr::Term(Variable::Bool(Value::Literal(true))),
-      Expr::Term(Variable::Float64(Value::Literal(1.0))),
-      Expr::Or(Vec::from([
-        Expr::Term(Variable::Bool(Value::Literal(false))),
-        Expr::Term(Variable::Bool(Value::Literal(true))),
-      ])),
-    ])).eval(&resolver).unwrap(), true);
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
 
-    // Test type mismatches
-    let result = Expr::Equal(
-      Box::new(Expr::Term(Variable::String(Value::Literal("test".to_string())))),
-      Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
-    ).eval(&resolver);
-    assert!(result.is_err());
-    let error: crate::definitions::Error = result.unwrap_err();
-    assert!(matches!(error, crate::definitions::Error::TypeMismatch));
-  }
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(101.0)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
+                    "a".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
+                    "a".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+
+        assert_eq!(
+            Expr::Term(Variable::Bool(Value::Literal(true)))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::Bool(Value::Literal(false)))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("true".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("false".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::String(Value::Literal("".to_string())))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::Float64(Value::Literal(0.0)))
+                .eval(&resolver)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Term(Variable::Float64(Value::Literal(1.0)))
+                .eval(&resolver)
+                .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(0.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Bool(Value::VariableRef(
+                    "b".to_string()
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string()
+                )))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            Expr::Equal(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+                )
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(1.0)))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
+                )
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            false
+        );
+
+        assert_eq!(
+            Expr::And(Vec::from([
+                Expr::Term(Variable::Bool(Value::Literal(true))),
+                Expr::Term(Variable::Float64(Value::Literal(1.0))),
+                Expr::Or(Vec::from([
+                    Expr::Term(Variable::Bool(Value::Literal(false))),
+                    Expr::Term(Variable::Bool(Value::Literal(true))),
+                ])),
+            ]))
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+
+        // Test type mismatches
+        let result = Expr::Equal(
+            Box::new(Expr::Term(Variable::String(Value::Literal(
+                "test".to_string(),
+            )))),
+            Box::new(Expr::Term(Variable::Bool(Value::Literal(true)))),
+        )
+        .eval(&resolver);
+        assert!(result.is_err());
+        let error: crate::definitions::Error = result.unwrap_err();
+        assert!(matches!(error, crate::definitions::Error::TypeMismatch));
+    }
 }
