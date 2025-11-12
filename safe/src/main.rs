@@ -1,18 +1,16 @@
 mod c2;
 mod config;
 mod definitions;
+mod kits;
 mod observability;
 mod router;
 mod transports;
-mod kits;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use c2::{Command, Telemetry};
 use config::Config;
-use definitions::{
-    Activation, Expr, Value, Variable,
-};
+use definitions::{Activation, Expr, Value, Variable};
 use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
 use observability as obs;
@@ -22,9 +20,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
 use crate::transports::Transport;
 use crate::transports::TransportHandle;
+use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
 
 #[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
@@ -52,8 +50,8 @@ impl AutonomyMode for CollisionAvoidanceAutonomyMode {
         loop {
             tx_command
                 .send(Command {
-                  commanded_attitude: vec![0, 0, 1],
-                  thrust: rand::random::<u8>() % 26 + 65,
+                    commanded_attitude: vec![0, 0, 1],
+                    thrust: rand::random::<u8>() % 26 + 65,
                 })
                 .await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -95,11 +93,11 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     ) -> Result<()> {
         loop {
             tx_command
-              .send(Command {
-                  commanded_attitude: vec![0, 1, 0],
-                  thrust: 0,
-              })
-              .await?;
+                .send(Command {
+                    commanded_attitude: vec![0, 1, 0],
+                    thrust: 0,
+                })
+                .await?;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             // if let Ok(telemetry) = rx_telem.recv().await {
             //     let active = active.lock().await;
@@ -114,23 +112,26 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
     }
 }
 
-async fn handle_client(mut stream: impl Stream<String, String>, mut router_stream: impl Stream<Command, Telemetry>) {
-    loop { // TODO: Figure out how to break out of this loop when client hangs up!
-      tokio::select! {
-        Ok(msg) = stream.read() => {
-          stream.write(msg.clone()).await.ok();
-          let tlm: Telemetry = serde_json::from_str(&msg).unwrap();
-          println!("Received: {:?}", tlm);
-          router_stream.write(tlm).await.ok();
+async fn handle_client(
+    mut stream: impl Stream<String, String>,
+    mut router_stream: impl Stream<Command, Telemetry>,
+) {
+    loop {
+        // TODO: Figure out how to break out of this loop when client hangs up!
+        tokio::select! {
+          Ok(msg) = stream.read() => {
+            stream.write(msg.clone()).await.ok();
+            let tlm: Telemetry = serde_json::from_str(&msg).unwrap();
+            println!("Received: {:?}", tlm);
+            router_stream.write(tlm).await.ok();
+          }
+          Ok(cmd) = router_stream.read() => {
+            let msg = serde_json::to_string(&cmd).unwrap();
+            stream.write(msg).await.ok();
+          }
         }
-        Ok(cmd) = router_stream.read() => {
-          let msg = serde_json::to_string(&cmd).unwrap();
-          stream.write(msg).await.ok();
-        }
-      }
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -165,10 +166,11 @@ async fn main() -> Result<()> {
     });
 
     // let c2_to_router_telemetry_transport: MpscTransport<Telemetry, Command> = MpscTransport::new(config.router.telem_channel_buffer_size);
-    let c2_to_router_telemetry_transport: TcpTransport<Telemetry, Command> = TcpTransport::new("127.0.0.1", 8000).await?;
+    let c2_to_router_telemetry_transport: TcpTransport<Telemetry, Command> =
+        TcpTransport::new("127.0.0.1", 8000).await?;
     // let c2_to_router_telemetry_transport: UnixTransport<Telemetry, Command> = UnixTransport::new("/tmp/my.sock").await?;
     let handle = c2_to_router_telemetry_transport.handle();
-    
+
     // Create router and then register Modes to it.
     // This allows for us to dynamically create and destroy Modes while running.
     let mut router = Router::new(
@@ -217,15 +219,15 @@ async fn main() -> Result<()> {
     let mut transport: TcpTransport<String, String> = TcpTransport::new("127.0.0.1", 8001).await?;
     tokio::spawn(async move {
         loop {
-          match transport.accept().await {
-            Ok(stream) => {
-                  let c2_telem_stream = handle.connect().await.unwrap();
-                  tokio::spawn(async move {
-                      handle_client(stream, c2_telem_stream).await;
-                  });
-              }
-              Err(e) => eprintln!("Connection error: {}", e),
-          }
+            match transport.accept().await {
+                Ok(stream) => {
+                    let c2_telem_stream = handle.connect().await.unwrap();
+                    tokio::spawn(async move {
+                        handle_client(stream, c2_telem_stream).await;
+                    });
+                }
+                Err(e) => eprintln!("Connection error: {}", e),
+            }
         }
     });
 
