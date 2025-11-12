@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use crate::transports::{MpscTransport, Stream, UnixTransport};
+use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
 use crate::transports::Transport;
 use crate::transports::TransportHandle;
 
@@ -156,13 +156,6 @@ async fn main() -> Result<()> {
 
     info!("SAFE is in start up.");
 
-    const SOCKET_PATH: &str = "/tmp/safe.sock";
-    // Remove socket if it already exists
-    if std::path::Path::new(SOCKET_PATH).exists() {
-        fs::remove_file(SOCKET_PATH).await?;
-    }
-    
-
     let observability = Arc::new(obs::ObservabilitySubsystem::new(None));
     let observability_clone = observability.clone();
     let config_clone = config.clone();
@@ -172,21 +165,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // let (tx_telemetry_to_router, rx_telemetry_in_router) =
-    //     mpsc::channel::<Telemetry>(config.router.telem_channel_buffer_size); // TODO: Make channels abstract so we can swap them out for different systems (CPU, MCU, etc.)
-    
-    let mut c2_to_router_telemetry_transport: MpscTransport<Telemetry, Command> = MpscTransport::new(config.router.telem_channel_buffer_size);
+    // let c2_to_router_telemetry_transport: MpscTransport<Telemetry, Command> = MpscTransport::new(config.router.telem_channel_buffer_size);
+    let c2_to_router_telemetry_transport: TcpTransport<Telemetry, Command> = TcpTransport::new("127.0.0.1", 8000).await?;
+    // let c2_to_router_telemetry_transport: UnixTransport<Telemetry, Command> = UnixTransport::new("/tmp/my.sock").await?;
     let handle = c2_to_router_telemetry_transport.handle();
-    // let (mut c2_telem_stream, router_telem_stream) = c2_to_router_telemetry_transport.channel().await?;
-    // let c2_telem_stream = c2_to_router_telemetry_transport.connect().await?;
-    // let router_telem_stream = c2_to_router_telemetry_transport.accept().await?;
     
     // Create router and then register Modes to it.
     // This allows for us to dynamically create and destroy Modes while running.
     let mut router = Router::new(
         c2_to_router_telemetry_transport,
-        // router_telem_stream,
-        // tx_command_to_c2,
         observability.clone(),
         &config,
     );
@@ -227,29 +214,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // let c2_listener = TcpListener::bind("127.0.0.1:8001").await?;
-    // info!("C2 interface listening on 127.0.0.1:8001");
-    // tokio::spawn(async move {
-    //     if let Ok((stream, _)) = c2_listener.accept().await {
-    //         let transport = Box::new(TcpC2Transport::new(stream));
-    //         let _ = c2_interface_task(
-    //             transport,
-    //             telemetry_tx,
-    //             c2_command_rx,
-    //             observability,
-    //         ).await;
-    //     }
-    // });
-
-    // let config_listener = TcpListener::bind("127.0.0.1:8002").await?;
-    // info!("Config interface listening on 127.0.0.1:8002");
-    // tokio::spawn(async move {
-    //     if let Ok((stream, _)) = config_listener.accept().await {
-    //         let transport = Box::new(TcpConfigTransport::new(stream));
-    //         let _ = config_interface_task(transport, config_tx).await;
-    //     }
-    // });
-
     let mut c2_telem_stream = handle.connect().await?;
     c2_telem_stream
         .write(Telemetry {
@@ -285,7 +249,7 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let mut transport: UnixTransport<String, String> = UnixTransport::new(SOCKET_PATH.to_string()).await.unwrap(); // TODO: Fix
+    let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
     tokio::spawn(async move {
         loop {
           match transport.accept().await {
