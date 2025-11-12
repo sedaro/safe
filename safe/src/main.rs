@@ -249,7 +249,8 @@ async fn main() -> Result<()> {
     //     })
     //     .await?;
 
-    let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
+    // let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
+    let mut transport: TcpTransport<String, String> = TcpTransport::new("127.0.0.1", 8001).await?;
     tokio::spawn(async move {
         loop {
           match transport.accept().await {
