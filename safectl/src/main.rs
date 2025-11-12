@@ -1,10 +1,10 @@
+use clap::{CommandFactory, Parser, Subcommand};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
-use futures::{SinkExt, StreamExt};
-use clap::{CommandFactory, Parser, Subcommand};
-use tokio::net::UnixStream;
-use tokio::net::TcpStream;
 
 const SOCKET_PATH: &str = "/tmp/safe.sock";
 
@@ -13,7 +13,6 @@ pub struct Telemetry {
     pub timestamp: u64,
     pub proximity_m: i32,
 }
-
 
 /*
 CLI
@@ -27,7 +26,7 @@ CLI
 -- needs more thoughts
 - config -f <file>
 - config set <variable>
-- config 
+- config
 
 Old:
 - safectl get modes -A -w
@@ -38,11 +37,10 @@ Old:
 - safectl top modes -m <mode name> -w
 - safectl top
 = safectl config
-- safectl send 
+- safectl send
 - safectl install/uninstall <file> | <raw>
-- safectl debug 
+- safectl debug
  */
-
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -55,74 +53,73 @@ struct Cli {
     command: Option<Commands>,
 }
 
-
 #[derive(Subcommand)]
 enum Object {
-  Modes {
-    /// Get all Autonomy Modes
-    #[arg(short = 'A', long)]
-    all: bool,
-    
-    /// Get specific Autonomy Mode by name
-    #[arg(short, long)]
-    name: Option<String>,
-    
-    /// Output format (TODO)
-    #[arg(short, long)]
-    output: Option<String>,
-  },
-  Router {
-    /// Output format (TODO)
-    #[arg(short, long)]
-    output: Option<String>,
-  }
+    Modes {
+        /// Get all Autonomy Modes
+        #[arg(short = 'A', long)]
+        all: bool,
+
+        /// Get specific Autonomy Mode by name
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Output format (TODO)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    Router {
+        /// Output format (TODO)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Get Autonomy Mode(s)
     Get {
-      #[command(subcommand)]
-      command: Object
+        #[command(subcommand)]
+        command: Object,
     },
     /// Describe Autonomy Mode(s)
     Describe {
-      #[command(subcommand)]
-      command: Object
+        #[command(subcommand)]
+        command: Object,
     },
     /// Top Autonomy Mode(s)
     Top {
-      #[command(subcommand)]
-      command: Option<Object>,
+        #[command(subcommand)]
+        command: Option<Object>,
     },
     /// Get logs
     Logs {
         /// Get all Autonomy Modes
         #[arg(short = 'A', long)]
         all: bool,
-        
+
         /// Tail the last N lines
         #[arg(short, long)]
         tail: Option<u32>,
-        
+
         /// Stream logs
         #[arg(short, long)]
         follow: Option<bool>,
-        
+
         /// Query for logs since ISO 8601 timestamp
         since: Option<String>,
-        
+
         /// Query for logs before ISO 8601 timestamp
         before: Option<String>,
-        
+
         /// Filter returned logs (TODO)
         filter: Option<String>,
     },
     /// Transmit over C2
     #[command(alias = "tx")]
     Transmit {
-      /// JSON payload to send
-      json: String,
+        /// JSON payload to send
+        json: String,
     },
     /// Receive over C2
     #[command(alias = "rx")]
@@ -131,64 +128,68 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-
     let cli = Cli::parse();
     // setup_logging(cli.debug);
     match &cli.command {
-        Some(Commands::Get{ command }) => {
-          match command {
+        Some(Commands::Get { command }) => match command {
             Object::Modes { all, name, .. } => {
-              println!("{:?} {:?}", all, name);
+                println!("{:?} {:?}", all, name);
             }
             Object::Router { .. } => {}
-          }
-        }
-        Some(Commands::Describe{ command }) => {
-          match command {
+        },
+        Some(Commands::Describe { command }) => match command {
             Object::Modes { all, name, .. } => {
-              println!("{:?} {:?}", all, name);
+                println!("{:?} {:?}", all, name);
             }
             Object::Router { .. } => {}
-          }
-        }
-        Some(Commands::Top{ command }) => {
-          match command {
+        },
+        Some(Commands::Top { command }) => match command {
             Some(Object::Modes { all, name, .. }) => {
-              println!("{:?} {:?}", all, name);
+                println!("{:?} {:?}", all, name);
             }
             Some(Object::Router { .. }) => {}
-            None => Cli::command().print_help().unwrap()
-          }
-        }
-        Some(Commands::Logs { all, tail, follow, since, before, filter }) => {
-          println!("{:?} {:?}", all, tail);
+            None => Cli::command().print_help().unwrap(),
+        },
+        Some(Commands::Logs {
+            all,
+            tail,
+            follow,
+            since,
+            before,
+            filter,
+        }) => {
+            println!("{:?} {:?}", all, tail);
         }
         Some(Commands::Transmit { json }) => {
-          // let stream = UnixStream::connect(SOCKET_PATH).await?;
-          let stream = TcpStream::connect("127.0.0.1:8001").await?;
-          println!("Connected");
-          let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
-          
-          let telemetry: Telemetry = serde_json::from_str(&json)
-            .expect("Failed to parse JSON string");
-          let msg = serde_json::to_string(&telemetry).unwrap();
-          let msg = bincode::serialize(&msg).unwrap();
-          framed_stream.send(msg.into()).await?;
+            // let stream = UnixStream::connect(SOCKET_PATH).await?;
+            let stream = TcpStream::connect("127.0.0.1:8001").await?;
+            println!("Connected");
+            let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
+
+            let telemetry: Telemetry =
+                serde_json::from_str(&json).expect("Failed to parse JSON string");
+            let msg = serde_json::to_string(&telemetry).unwrap();
+            let msg = bincode::serialize(&msg).unwrap();
+            framed_stream.send(msg.into()).await?;
         }
         Some(Commands::Receive {}) => {
-          // let stream = UnixStream::connect(SOCKET_PATH).await?;
-          let stream = TcpStream::connect("127.0.0.1:8001").await?;
-          println!("Connected");
-          let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
-          loop {
-            let msg = framed_stream.next().await
-              .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))?
-              .map(|bytes| String::from_utf8_lossy(&bytes).to_string())?;
-            println!("Received: {}", msg);
-          }
+            // let stream = UnixStream::connect(SOCKET_PATH).await?;
+            let stream = TcpStream::connect("127.0.0.1:8001").await?;
+            println!("Connected");
+            let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
+            loop {
+                let msg = framed_stream
+                    .next()
+                    .await
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+                    })?
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())?;
+                println!("Received: {}", msg);
+            }
         }
-        None => Cli::command().print_help().unwrap()
-      }
+        None => Cli::command().print_help().unwrap(),
+    }
 
     Ok(())
 }
