@@ -1,60 +1,65 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
+use serde::{Deserialize, Serialize};
+use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use serde::{Serialize, Deserialize};
-use std::{collections::VecDeque, sync::Arc};
 
 #[async_trait]
 pub trait ReadHalf<R>: Send + Sync + 'static
 where
-    R: for<'de> Deserialize<'de> + Send + 'static
+    R: for<'de> Deserialize<'de> + Send + 'static,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error>;
+    async fn read(&mut self) -> Result<R, std::io::Error>;
 }
 
 #[async_trait]
 pub trait WriteHalf<T>: Send + Sync + 'static
 where
-    T: Serialize + Send + 'static
+    T: Serialize + Send + 'static,
 {
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
 }
 
 #[async_trait]
 pub trait Stream<R, T>: Send + Sync + 'static
 where
     R: for<'de> Deserialize<'de> + Send + 'static,
-    T: Serialize + Send + 'static
+    T: Serialize + Send + 'static,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error>;
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
-  fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>);
+    async fn read(&mut self) -> Result<R, std::io::Error>;
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
+    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>);
 }
 
 #[async_trait]
 pub trait TransportHandle<R, T>: Send + Sync + 'static
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
-  type ClientStreamType: Stream<T, R> + Send;
-  async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error>;
+    type ClientStreamType: Stream<T, R> + Send;
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error>;
 }
 
 #[async_trait]
 pub trait Transport<R, T>: Send + Sync
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
     type ServerStreamType: Stream<R, T> + Send;
     type ClientStreamType: Stream<T, R> + Send;
     type TransportHandleType: TransportHandle<R, T> + Send;
     async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error>;
     async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error>;
-    async fn channel(&mut self) -> Result<(Self::ClientStreamType, Self::ServerStreamType), std::io::Error> {
+    async fn channel(
+        &mut self,
+    ) -> Result<(Self::ClientStreamType, Self::ServerStreamType), std::io::Error> {
         let client_stream = self.connect().await?; // Initiate client connection
         let server_stream = self.accept().await?; // Accept client connection
         Ok((client_stream, server_stream))
@@ -67,96 +72,104 @@ where
 // ============================================================================
 
 pub struct UnixReadHalf<R> {
-  inner: SplitStream<Framed<tokio::net::UnixStream, LengthDelimitedCodec>>,
-  _r: std::marker::PhantomData<R>,
+    inner: SplitStream<Framed<tokio::net::UnixStream, LengthDelimitedCodec>>,
+    _r: std::marker::PhantomData<R>,
 }
 #[async_trait]
 impl<R> ReadHalf<R> for UnixReadHalf<R>
 where
-    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error> {
-    let bytes = self.inner.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
-    bincode::deserialize(&bytes)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-  }
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let bytes = self.inner.next().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+        })??;
+        bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
 }
 
 pub struct UnixWriteHalf<T> {
-  inner: SplitSink<Framed<tokio::net::UnixStream, LengthDelimitedCodec>, bytes::Bytes>,
-  _t: std::marker::PhantomData<T>,
+    inner: SplitSink<Framed<tokio::net::UnixStream, LengthDelimitedCodec>, bytes::Bytes>,
+    _t: std::marker::PhantomData<T>,
 }
 #[async_trait]
 impl<T> WriteHalf<T> for UnixWriteHalf<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-    let bytes = bincode::serialize(&msg)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    self.inner.send(bytes.into()).await
-  }
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.inner.send(bytes.into()).await
+    }
 }
 pub struct UnixStream<R, T> {
-  framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
-  _r: std::marker::PhantomData<R>,
-  _t: std::marker::PhantomData<T>,
+    framed_stream: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
+    _r: std::marker::PhantomData<R>,
+    _t: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
 impl<R, T> Stream<R, T> for UnixStream<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error> {
-    let bytes = self.framed_stream.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
-    bincode::deserialize(&bytes)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-  }
-  
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-    let bytes = bincode::serialize(&msg)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    self.framed_stream.send(bytes.into()).await
-  }
-  fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
-    let (write, read) = self.framed_stream.split();
-    (
-      UnixReadHalf { inner: read, _r: std::marker::PhantomData },
-      UnixWriteHalf { inner: write, _t: std::marker::PhantomData },
-    )
-  }
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let bytes = self.framed_stream.next().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+        })??;
+        bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.framed_stream.send(bytes.into()).await
+    }
+    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+        let (write, read) = self.framed_stream.split();
+        (
+            UnixReadHalf {
+                inner: read,
+                _r: std::marker::PhantomData,
+            },
+            UnixWriteHalf {
+                inner: write,
+                _t: std::marker::PhantomData,
+            },
+        )
+    }
 }
 
 pub struct UnixTransportHandle<R, T> {
-  path: String,
-  _r: std::marker::PhantomData<R>,
-  _t: std::marker::PhantomData<T>,
+    path: String,
+    _r: std::marker::PhantomData<R>,
+    _t: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
 impl<R, T> TransportHandle<R, T> for UnixTransportHandle<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  type ClientStreamType = UnixStream<T, R>;
-  async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-    match tokio::net::UnixStream::connect(self.path.clone()).await {
-      Ok(stream) => Ok(UnixStream {
-        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
-        _r: std::marker::PhantomData,
-        _t: std::marker::PhantomData,
-      }),
-      Err(e) => {
-        eprintln!("Connection error: {}", e);
-        Err(e)
-      },
+    type ClientStreamType = UnixStream<T, R>;
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        match tokio::net::UnixStream::connect(self.path.clone()).await {
+            Ok(stream) => Ok(UnixStream {
+                framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+                _r: std::marker::PhantomData,
+                _t: std::marker::PhantomData,
+            }),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                Err(e)
+            }
+        }
     }
-  }
 }
 
 pub struct UnixTransport<R, T> {
@@ -167,53 +180,61 @@ pub struct UnixTransport<R, T> {
 }
 
 impl<R, T> UnixTransport<R, T> {
-  pub async fn new(path: &str) -> Result<Self, std::io::Error> {
-      // Require path ends in .sock to protect against accidental file deletion
-      if !path.ends_with(".sock") {
-          return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Socket path must end with .sock"));
-      }
-      // Remove socket if it already exists
-      if std::path::Path::new(&path).exists() {
-          tokio::fs::remove_file(&path).await?;
-      }
-      let listener = tokio::net::UnixListener::bind(path)?;
-      println!("SAFE listening on {}", path);
-      Ok(Self { path: path.to_string(), listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData })
-  }
+    pub async fn new(path: &str) -> Result<Self, std::io::Error> {
+        // Require path ends in .sock to protect against accidental file deletion
+        if !path.ends_with(".sock") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Socket path must end with .sock",
+            ));
+        }
+        // Remove socket if it already exists
+        if std::path::Path::new(&path).exists() {
+            tokio::fs::remove_file(&path).await?;
+        }
+        let listener = tokio::net::UnixListener::bind(path)?;
+        println!("SAFE listening on {}", path);
+        Ok(Self {
+            path: path.to_string(),
+            listener,
+            _r: std::marker::PhantomData,
+            _t: std::marker::PhantomData,
+        })
+    }
 }
 
 #[async_trait]
 impl<R, T> Transport<R, T> for UnixTransport<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  type ServerStreamType = UnixStream<R, T>;
-  type ClientStreamType = UnixStream<T, R>;
-  type TransportHandleType = UnixTransportHandle<R, T>;
-  async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
-    match self.listener.accept().await {
-      Ok((stream, _)) => Ok(UnixStream { 
-        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
-        _r: std::marker::PhantomData,
-        _t: std::marker::PhantomData,
-      }),
-      Err(e) => {
-        eprintln!("Connection error: {}", e);
-        Err(e)
-      },
+    type ServerStreamType = UnixStream<R, T>;
+    type ClientStreamType = UnixStream<T, R>;
+    type TransportHandleType = UnixTransportHandle<R, T>;
+    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+        match self.listener.accept().await {
+            Ok((stream, _)) => Ok(UnixStream {
+                framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+                _r: std::marker::PhantomData,
+                _t: std::marker::PhantomData,
+            }),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                Err(e)
+            }
+        }
     }
-  }
-  async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-    self.handle().connect().await
-  }
-  fn handle(&self) -> Self::TransportHandleType {
-    UnixTransportHandle {
-      path: self.path.clone(),
-      _r: std::marker::PhantomData,
-      _t: std::marker::PhantomData,
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        self.handle().connect().await
     }
-  }
+    fn handle(&self) -> Self::TransportHandleType {
+        UnixTransportHandle {
+            path: self.path.clone(),
+            _r: std::marker::PhantomData,
+            _t: std::marker::PhantomData,
+        }
+    }
 }
 
 // ============================================================================
@@ -221,69 +242,77 @@ where
 // ============================================================================
 
 pub struct TcpReadHalf<R> {
-  inner: SplitStream<Framed<tokio::net::TcpStream, LengthDelimitedCodec>>,
-  _r: std::marker::PhantomData<R>,
+    inner: SplitStream<Framed<tokio::net::TcpStream, LengthDelimitedCodec>>,
+    _r: std::marker::PhantomData<R>,
 }
 #[async_trait]
 impl<R> ReadHalf<R> for TcpReadHalf<R>
 where
-    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error> {
-    let bytes = self.inner.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
-    bincode::deserialize(&bytes)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-  }
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let bytes = self.inner.next().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+        })??;
+        bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
 }
 
 pub struct TcpWriteHalf<T> {
-  inner: SplitSink<Framed<tokio::net::TcpStream, LengthDelimitedCodec>, bytes::Bytes>,
-  _t: std::marker::PhantomData<T>,
+    inner: SplitSink<Framed<tokio::net::TcpStream, LengthDelimitedCodec>, bytes::Bytes>,
+    _t: std::marker::PhantomData<T>,
 }
 #[async_trait]
 impl<T> WriteHalf<T> for TcpWriteHalf<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-    let bytes = bincode::serialize(&msg)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    self.inner.send(bytes.into()).await
-  }
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.inner.send(bytes.into()).await
+    }
 }
 
 pub struct TcpStream<R, T> {
-  framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
-  _r: std::marker::PhantomData<R>,
-  _t: std::marker::PhantomData<T>,
+    framed_stream: Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
+    _r: std::marker::PhantomData<R>,
+    _t: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
 impl<R, T> Stream<R, T> for TcpStream<R, T>
 where
-    R: Serialize + for<'de> Deserialize<'de>+ Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  async fn read(&mut self) -> Result<R, std::io::Error> {
-    let bytes = self.framed_stream.next().await
-      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"))??;
-    bincode::deserialize(&bytes)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-  }
-  
-  async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-    let bytes = bincode::serialize(&msg)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    self.framed_stream.send(bytes.into()).await
-  }
-  fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
-    let (write, read) = self.framed_stream.split();
-    (
-      TcpReadHalf { inner: read, _r: std::marker::PhantomData },
-      TcpWriteHalf { inner: write, _t: std::marker::PhantomData },
-    )
-  }
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let bytes = self.framed_stream.next().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+        })??;
+        bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.framed_stream.send(bytes.into()).await
+    }
+    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+        let (write, read) = self.framed_stream.split();
+        (
+            TcpReadHalf {
+                inner: read,
+                _r: std::marker::PhantomData,
+            },
+            TcpWriteHalf {
+                inner: write,
+                _t: std::marker::PhantomData,
+            },
+        )
+    }
 }
 
 pub struct TcpTransportHandle<R, T> {
@@ -296,23 +325,23 @@ pub struct TcpTransportHandle<R, T> {
 impl<R, T> TransportHandle<R, T> for TcpTransportHandle<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  type ClientStreamType = TcpStream<T, R>;
-  async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-    let full_address = format!("{}:{}", self.address, self.port);
-    match tokio::net::TcpStream::connect(full_address.clone()).await {
-      Ok(stream) => Ok(TcpStream {  
-        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
-        _r: std::marker::PhantomData,
-        _t: std::marker::PhantomData,
-      }),
-      Err(e) => {
-        eprintln!("Connection error: {}", e);
-        Err(e)
-      },
+    type ClientStreamType = TcpStream<T, R>;
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        let full_address = format!("{}:{}", self.address, self.port);
+        match tokio::net::TcpStream::connect(full_address.clone()).await {
+            Ok(stream) => Ok(TcpStream {
+                framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+                _r: std::marker::PhantomData,
+                _t: std::marker::PhantomData,
+            }),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                Err(e)
+            }
+        }
     }
-  }
 }
 
 pub struct TcpTransport<R, T> {
@@ -324,50 +353,54 @@ pub struct TcpTransport<R, T> {
 }
 
 impl<R, T> TcpTransport<R, T> {
-  pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
-    let full_address = format!("{address}:{port}");
-    let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
-    println!("SAFE listening on {}", full_address);
-    let s = Self { address: address.to_string(), port, listener, _r: std::marker::PhantomData, _t: std::marker::PhantomData };
-    Ok(s)
-  }
+    pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
+        let full_address = format!("{address}:{port}");
+        let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
+        println!("SAFE listening on {}", full_address);
+        let s = Self {
+            address: address.to_string(),
+            port,
+            listener,
+            _r: std::marker::PhantomData,
+            _t: std::marker::PhantomData,
+        };
+        Ok(s)
+    }
 }
 
 #[async_trait]
 impl<R, T> Transport<R, T> for TcpTransport<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-  type ServerStreamType = TcpStream<R, T>;
-  type ClientStreamType = TcpStream<T, R>;
-  type TransportHandleType = TcpTransportHandle<R, T>;
-  async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
-    match self.listener.accept().await {
-      Ok((stream, _)) => {
-        Ok(TcpStream { 
-        framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
-        _r: std::marker::PhantomData,
-        _t: std::marker::PhantomData,
-        })
-      },
-      Err(e) => {
-        eprintln!("Connection error: {}", e);
-        Err(e)
-      },
+    type ServerStreamType = TcpStream<R, T>;
+    type ClientStreamType = TcpStream<T, R>;
+    type TransportHandleType = TcpTransportHandle<R, T>;
+    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+        match self.listener.accept().await {
+            Ok((stream, _)) => Ok(TcpStream {
+                framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
+                _r: std::marker::PhantomData,
+                _t: std::marker::PhantomData,
+            }),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                Err(e)
+            }
+        }
     }
-  }
-  async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-    self.handle().connect().await
-  }
-  fn handle(&self) -> Self::TransportHandleType {
-    TcpTransportHandle {
-      address: self.address.clone(),
-      port: self.port,
-      _r: std::marker::PhantomData,
-      _t: std::marker::PhantomData,
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        self.handle().connect().await
     }
-  }
+    fn handle(&self) -> Self::TransportHandleType {
+        TcpTransportHandle {
+            address: self.address.clone(),
+            port: self.port,
+            _r: std::marker::PhantomData,
+            _t: std::marker::PhantomData,
+        }
+    }
 }
 
 // ============================================================================
@@ -380,10 +413,12 @@ pub struct MpscReadHalf<R> {
 #[async_trait]
 impl<R> ReadHalf<R> for MpscReadHalf<R>
 where
-    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
     async fn read(&mut self) -> Result<R, std::io::Error> {
-        self.rx.recv().await
+        self.rx
+            .recv()
+            .await
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Channel closed"))
     }
 }
@@ -393,10 +428,12 @@ pub struct MpscWriteHalf<T> {
 #[async_trait]
 impl<T> WriteHalf<T> for MpscWriteHalf<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
     async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-        self.tx.send(msg).await
+        self.tx
+            .send(msg)
+            .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))
     }
 }
@@ -410,22 +447,23 @@ pub struct MpscStream<R, T> {
 impl<R, T> Stream<R, T> for MpscStream<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
     async fn read(&mut self) -> Result<R, std::io::Error> {
-        self.rx.recv().await
+        self.rx
+            .recv()
+            .await
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Channel closed"))
     }
-    
+
     async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
-        self.tx.send(msg).await
+        self.tx
+            .send(msg)
+            .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))
     }
     fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
-        (
-            MpscReadHalf { rx: self.rx },
-            MpscWriteHalf { tx: self.tx },
-        )
+        (MpscReadHalf { rx: self.rx }, MpscWriteHalf { tx: self.tx })
     }
 }
 
@@ -434,10 +472,10 @@ pub struct MpscTransportHandle<R, T> {
     pending: Arc<Mutex<VecDeque<(tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<R>)>>>,
 }
 #[async_trait]
-impl<R, T> TransportHandle<R, T> for MpscTransportHandle<R, T> 
+impl<R, T> TransportHandle<R, T> for MpscTransportHandle<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
     type ClientStreamType = MpscStream<T, R>;
     async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
@@ -445,7 +483,10 @@ where
         let (tx_from_client, rx_from_client) = tokio::sync::mpsc::channel::<R>(self.buffer);
         let mut pending = self.pending.lock().await;
         pending.push_back((tx_to_client, rx_from_client));
-        Ok(MpscStream { rx: rx_in_client, tx: tx_from_client })
+        Ok(MpscStream {
+            rx: rx_in_client,
+            tx: tx_from_client,
+        })
     }
 }
 
@@ -456,7 +497,10 @@ pub struct MpscTransport<R, T> {
 
 impl<R, T> MpscTransport<R, T> {
     pub fn new(buffer: usize) -> Self {
-        Self { buffer, pending: Arc::new(Mutex::new(VecDeque::new())) } // TODO: Init vecdeque with capacity?
+        Self {
+            buffer,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+        } // TODO: Init vecdeque with capacity?
     }
 }
 
@@ -464,7 +508,7 @@ impl<R, T> MpscTransport<R, T> {
 impl<R, T> Transport<R, T> for MpscTransport<R, T>
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
-    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
     type ServerStreamType = MpscStream<R, T>;
     type ClientStreamType = MpscStream<T, R>;
@@ -473,12 +517,15 @@ where
         let (tx_to_client, rx_from_client) = loop {
             let mut pending = self.pending.lock().await;
             if let Some(conn) = pending.pop_front() {
-              break conn;
+                break conn;
             }
             drop(pending);
             tokio::task::yield_now().await;
         };
-        Ok(MpscStream { rx: rx_from_client, tx: tx_to_client })
+        Ok(MpscStream {
+            rx: rx_from_client,
+            tx: tx_to_client,
+        })
     }
     async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
         self.handle().connect().await
@@ -492,208 +539,223 @@ where
 }
 
 mod tests {
-  use super::*;
-  use futures::lock;
-use serde::{Serialize, Deserialize};
-  use tokio::time::{timeout, Duration};
+    use super::*;
+    use futures::lock;
+    use serde::{Deserialize, Serialize};
+    use tokio::time::{timeout, Duration};
 
-  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-  struct TxMsg {
-    value: u32,
-  }
-  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-  struct RxMsg {
-      value: u32,
-  }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct TxMsg {
+        value: u32,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct RxMsg {
+        value: u32,
+    }
 
-  #[tokio::test]
-  async fn test_unix_transport() {
-      let path = "/tmp/safe_test.sock";
-      let mut server = UnixTransport::<RxMsg, TxMsg>::new(path).await.unwrap();
-      let handle = server.handle();
-      let mut client_stream = handle.connect().await.unwrap();
-      let mut server_stream = server.accept().await.unwrap();
-      
-      // Write from client, read from server
-      client_stream.write(RxMsg { value: 42 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 42 });
-      
-      // Write from server, read from client
-      server_stream.write(TxMsg { value: 99 }).await.unwrap();
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 99 });
-      
-      // Assert no broadcast by default
-      let mut other_client_stream = handle.connect().await.unwrap();
-      let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TxMsg { value: 77 }).await.unwrap();
-      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
-      assert!(res.is_err(), "Other client should not receive message");
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 77 });
-      // Test initial channel still functional
-      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
-      let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 88 });
-      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
-      assert!(res.is_err(), "Initial client should not receive message");
+    #[tokio::test]
+    async fn test_unix_transport() {
+        let path = "/tmp/safe_test.sock";
+        let mut server = UnixTransport::<RxMsg, TxMsg>::new(path).await.unwrap();
+        let handle = server.handle();
+        let mut client_stream = handle.connect().await.unwrap();
+        let mut server_stream = server.accept().await.unwrap();
 
-      // Test channel helper functionality
-      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(RxMsg { value: 999 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 999 });
-  }
+        // Write from client, read from server
+        client_stream.write(RxMsg { value: 42 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 42 });
 
-  #[tokio::test]
-  async fn test_tcp_transport() {
-      let mut server = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 18080).await.unwrap();
-      let handle = server.handle();
-      let mut client_stream = handle.connect().await.unwrap();
-      let mut server_stream = server.accept().await.unwrap();
-      
-      // Write from client, read from server
-      client_stream.write(RxMsg { value: 123 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 123 });
-      
-      // Write from server, read from client
-      server_stream.write(TxMsg { value: 456 }).await.unwrap();
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 456 });
-      
-      // Assert no broadcast by default
-      let mut other_client_stream = handle.connect().await.unwrap();
-      let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TxMsg { value: 77 }).await.unwrap();
-      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
-      assert!(res.is_err(), "Other client should not receive message");
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 77 });
-      // Test initial channel still functional
-      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
-      let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 88 });
-      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
-      assert!(res.is_err(), "Initial client should not receive message");
+        // Write from server, read from client
+        server_stream.write(TxMsg { value: 99 }).await.unwrap();
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 99 });
 
-      // Test channel helper functionality
-      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(RxMsg { value: 999 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 999 });
-  }
-
-  #[tokio::test]
-  async fn test_mpsc_transport() {
-      let mut server = MpscTransport::<RxMsg, TxMsg>::new(8);
-      let handle = server.handle();
-      let mut client_stream = handle.connect().await.unwrap();
-      let mut server_stream = server.accept().await.unwrap();
-      
-      // Write from client, read from server
-      client_stream.write(RxMsg { value: 7 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 7 });
-      
-      // Write from server, read from client
-      server_stream.write(TxMsg { value: 8 }).await.unwrap();
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 8 });
-      
-      // Assert no broadcast by default
-      let mut other_client_stream = handle.connect().await.unwrap();
-      let mut other_server_stream= server.accept().await.unwrap();
-      server_stream.write(TxMsg { value: 77 }).await.unwrap();
-      let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
-      assert!(res.is_err(), "Other client should not receive message");
-      let msg = client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 77 });
-      // Test initial channel still functional
-      other_server_stream.write(TxMsg { value: 88 }).await.unwrap();
-      let msg = other_client_stream.read().await.unwrap();
-      assert_eq!(msg, TxMsg { value: 88 });
-      let res = timeout(Duration::from_millis(100), client_stream.read()).await;
-      assert!(res.is_err(), "Initial client should not receive message");
-
-      // Test channel helper functionality
-      let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
-      client_stream.write(RxMsg { value: 999 }).await.unwrap();
-      let msg = server_stream.read().await.unwrap();
-      assert_eq!(msg, RxMsg { value: 999 });
-  }
-
-  async fn assert_ownership_model(mut transport: impl Transport<RxMsg, TxMsg> + 'static) {
-      let handle = transport.handle();
-      let lock = Arc::new(Mutex::new(())); // Only for synchronization in this test
-      let lock_clone = lock.clone();
-
-      // Move client stream to another task
-      let client_task = tokio::spawn(async move {
-          let _ = lock_clone.lock().await;
-          let mut client_stream = handle.connect().await.unwrap();
-          client_stream.write(RxMsg { value: 1 }).await.unwrap();
-          let msg = client_stream.read().await.unwrap();
-          assert_eq!(msg, TxMsg { value: 101 });
-      });
-
-      let other_handle = transport.handle();
-
-      // Move server stream to another task
-      let server_task = tokio::spawn(async move {
-        let mut i = 0;
-        while i < 3 {
-            let mut server_stream = transport.accept().await.unwrap();
-            let msg = server_stream.read().await.unwrap();
-            assert_eq!(msg, RxMsg { value: i });
-            server_stream.write(TxMsg { value: i + 100 }).await.unwrap();
-            i += 1;
-          }
-      });
-
-      // Confirm driver process can still communicate with server
-      {
-        let mut other_client_stream = other_handle.connect().await.unwrap();
-        let _ = lock.lock().await;
-        other_client_stream.write(RxMsg { value: 0 }).await.unwrap();
+        // Assert no broadcast by default
+        let mut other_client_stream = handle.connect().await.unwrap();
+        let mut other_server_stream = server.accept().await.unwrap();
+        server_stream.write(TxMsg { value: 77 }).await.unwrap();
+        let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+        assert!(res.is_err(), "Other client should not receive message");
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 77 });
+        // Test initial channel still functional
+        other_server_stream
+            .write(TxMsg { value: 88 })
+            .await
+            .unwrap();
         let msg = other_client_stream.read().await.unwrap();
-        assert_eq!(msg, TxMsg { value: 100 });
-      }
+        assert_eq!(msg, TxMsg { value: 88 });
+        let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+        assert!(res.is_err(), "Initial client should not receive message");
 
-      // Test splitting streams
-      let (mut read, mut write) = other_handle.connect().await.unwrap().split();
-      let write_task = tokio::spawn(async move {
-          write.write(RxMsg { value: 2 }).await.unwrap();
-      });
-      let read_task = tokio::spawn(async move {
-          let msg = read.read().await.unwrap();
-          assert_eq!(msg, TxMsg { value: 102 });
-      });
+        // Test channel helper functionality
+        let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+        client_stream.write(RxMsg { value: 999 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 999 });
+    }
 
-      client_task.await.unwrap();
-      server_task.await.unwrap();
-      write_task.await.unwrap();
-      read_task.await.unwrap();
-  }
-  
-  #[tokio::test]
-  async fn test_mpsc_ownership_model() {
-      let transport = MpscTransport::<RxMsg, TxMsg>::new(8);
-      assert_ownership_model(transport).await;
-  }
+    #[tokio::test]
+    async fn test_tcp_transport() {
+        let mut server = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 18080)
+            .await
+            .unwrap();
+        let handle = server.handle();
+        let mut client_stream = handle.connect().await.unwrap();
+        let mut server_stream = server.accept().await.unwrap();
 
-  #[tokio::test]
-  async fn test_unix_ownership_model() {
-      let transport = UnixTransport::<RxMsg, TxMsg>::new("/tmp/safe_ownership_test.sock").await.unwrap();
-      assert_ownership_model(transport).await;
-  }
+        // Write from client, read from server
+        client_stream.write(RxMsg { value: 123 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 123 });
 
-  #[tokio::test]
-  async fn test_tcp_ownership_model() {
-      let transport = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 10000).await.unwrap();
-      assert_ownership_model(transport).await;
-  }
+        // Write from server, read from client
+        server_stream.write(TxMsg { value: 456 }).await.unwrap();
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 456 });
+
+        // Assert no broadcast by default
+        let mut other_client_stream = handle.connect().await.unwrap();
+        let mut other_server_stream = server.accept().await.unwrap();
+        server_stream.write(TxMsg { value: 77 }).await.unwrap();
+        let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+        assert!(res.is_err(), "Other client should not receive message");
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 77 });
+        // Test initial channel still functional
+        other_server_stream
+            .write(TxMsg { value: 88 })
+            .await
+            .unwrap();
+        let msg = other_client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 88 });
+        let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+        assert!(res.is_err(), "Initial client should not receive message");
+
+        // Test channel helper functionality
+        let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+        client_stream.write(RxMsg { value: 999 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 999 });
+    }
+
+    #[tokio::test]
+    async fn test_mpsc_transport() {
+        let mut server = MpscTransport::<RxMsg, TxMsg>::new(8);
+        let handle = server.handle();
+        let mut client_stream = handle.connect().await.unwrap();
+        let mut server_stream = server.accept().await.unwrap();
+
+        // Write from client, read from server
+        client_stream.write(RxMsg { value: 7 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 7 });
+
+        // Write from server, read from client
+        server_stream.write(TxMsg { value: 8 }).await.unwrap();
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 8 });
+
+        // Assert no broadcast by default
+        let mut other_client_stream = handle.connect().await.unwrap();
+        let mut other_server_stream = server.accept().await.unwrap();
+        server_stream.write(TxMsg { value: 77 }).await.unwrap();
+        let res = timeout(Duration::from_millis(100), other_client_stream.read()).await;
+        assert!(res.is_err(), "Other client should not receive message");
+        let msg = client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 77 });
+        // Test initial channel still functional
+        other_server_stream
+            .write(TxMsg { value: 88 })
+            .await
+            .unwrap();
+        let msg = other_client_stream.read().await.unwrap();
+        assert_eq!(msg, TxMsg { value: 88 });
+        let res = timeout(Duration::from_millis(100), client_stream.read()).await;
+        assert!(res.is_err(), "Initial client should not receive message");
+
+        // Test channel helper functionality
+        let (mut client_stream, mut server_stream) = server.channel().await.unwrap();
+        client_stream.write(RxMsg { value: 999 }).await.unwrap();
+        let msg = server_stream.read().await.unwrap();
+        assert_eq!(msg, RxMsg { value: 999 });
+    }
+
+    async fn assert_ownership_model(mut transport: impl Transport<RxMsg, TxMsg> + 'static) {
+        let handle = transport.handle();
+        let lock = Arc::new(Mutex::new(())); // Only for synchronization in this test
+        let lock_clone = lock.clone();
+
+        // Move client stream to another task
+        let client_task = tokio::spawn(async move {
+            let _ = lock_clone.lock().await;
+            let mut client_stream = handle.connect().await.unwrap();
+            client_stream.write(RxMsg { value: 1 }).await.unwrap();
+            let msg = client_stream.read().await.unwrap();
+            assert_eq!(msg, TxMsg { value: 101 });
+        });
+
+        let other_handle = transport.handle();
+
+        // Move server stream to another task
+        let server_task = tokio::spawn(async move {
+            let mut i = 0;
+            while i < 3 {
+                let mut server_stream = transport.accept().await.unwrap();
+                let msg = server_stream.read().await.unwrap();
+                assert_eq!(msg, RxMsg { value: i });
+                server_stream.write(TxMsg { value: i + 100 }).await.unwrap();
+                i += 1;
+            }
+        });
+
+        // Confirm driver process can still communicate with server
+        {
+            let mut other_client_stream = other_handle.connect().await.unwrap();
+            let _ = lock.lock().await;
+            other_client_stream.write(RxMsg { value: 0 }).await.unwrap();
+            let msg = other_client_stream.read().await.unwrap();
+            assert_eq!(msg, TxMsg { value: 100 });
+        }
+
+        // Test splitting streams
+        let (mut read, mut write) = other_handle.connect().await.unwrap().split();
+        let write_task = tokio::spawn(async move {
+            write.write(RxMsg { value: 2 }).await.unwrap();
+        });
+        let read_task = tokio::spawn(async move {
+            let msg = read.read().await.unwrap();
+            assert_eq!(msg, TxMsg { value: 102 });
+        });
+
+        client_task.await.unwrap();
+        server_task.await.unwrap();
+        write_task.await.unwrap();
+        read_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mpsc_ownership_model() {
+        let transport = MpscTransport::<RxMsg, TxMsg>::new(8);
+        assert_ownership_model(transport).await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_ownership_model() {
+        let transport = UnixTransport::<RxMsg, TxMsg>::new("/tmp/safe_ownership_test.sock")
+            .await
+            .unwrap();
+        assert_ownership_model(transport).await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_ownership_model() {
+        let transport = TcpTransport::<RxMsg, TxMsg>::new("127.0.0.1", 10000)
+            .await
+            .unwrap();
+        assert_ownership_model(transport).await;
+    }
 }
 
 // TODO:
