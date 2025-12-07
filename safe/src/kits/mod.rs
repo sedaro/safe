@@ -1,1 +1,1 @@
-mod stats;
+pub mod stats;
