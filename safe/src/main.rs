@@ -5,6 +5,7 @@ mod kits;
 mod observability;
 mod router;
 mod transports;
+mod simulation;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,12 +18,14 @@ use observability as obs;
 use router::{AutonomyMode, Router};
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{info, warn};
+use tokio::sync::Semaphore;
 
 use crate::transports::Transport;
 use crate::transports::TransportHandle;
 use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
+use crate::simulation::SedaroSimulator;
 
 #[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
@@ -109,6 +112,75 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
             //     );
             // }
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GenericUncertaintyQuantificationAutonomyMode {
+    name: String,
+    priority: u8,
+    activation: Option<Activation>,
+    N: usize,
+    concurrency: usize,
+    simulator: SedaroSimulator,
+}
+#[async_trait]
+impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+    fn activation(&self) -> Option<Activation> {
+        self.activation.clone()
+    }
+    async fn run(
+        &mut self,
+        mut rx_telem: broadcast::Receiver<Telemetry>,
+        tx_command: mpsc::Sender<Command>,
+        active: Arc<tokio::sync::Mutex<bool>>,
+    ) -> Result<()> {
+      let semaphore = Arc::new(Semaphore::new(self.concurrency));
+      let mut handles = Vec::new();
+      // let mut results = Arc::new(Mutex::new(Vec::new()));
+
+      for _ in 0..self.N {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let simulator = self.simulator.clone();
+        
+        let handle = tokio::spawn(async move {
+          let result = simulator.run(2.5).await;
+          drop(permit); // Release the permit when done
+          result
+        });
+        
+        handles.push(handle);
+      }
+
+      // Wait for all simulations to complete
+      for handle in handles {
+        match handle.await {
+          Ok(result) => {
+            match result {
+              Ok(output) => {
+                match output.status.success() {
+                  // true => info!("Simulation completed successfully: {:?}", output),
+                  true => info!("Simulation completed successfully!"),
+                  false => warn!("Simulation failed with non-zero exit code: {:?}", String::from_utf8_lossy(&output.stderr)),
+                }
+              }
+              Err(e) => {
+                warn!("Simulation failed: {:?}", e);
+              }
+            }
+          }
+          Err(e) => {
+            warn!("Task join error: {:?}", e);
+          }
+        }
+      }
+      Ok(())
     }
 }
 
@@ -205,6 +277,20 @@ async fn main() -> Result<()> {
         activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
             Value::Literal(true),
         )))),
+    };
+    let mode = GenericUncertaintyQuantificationAutonomyMode {
+        name: "NominalOps".to_string(),
+        priority: 0,
+        activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
+            Value::Literal(true),
+        )))),
+        N: 10,
+        concurrency: 2,
+        simulator: SedaroSimulator::new(
+          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/simulation"),
+          "./target/release/main",
+          None,
+        ),
     };
     router.register_autonomy_mode(mode, &config);
 
