@@ -17,11 +17,15 @@ use figment::Figment;
 use observability as obs;
 use router::{AutonomyMode, Router};
 use serde::Serialize;
+use simvm::sv::data::FloatValue;
+use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tokio::sync::Semaphore;
+use ordered_float::OrderedFloat;
 
+use simvm::sv::{combine::TR, data::Datum, parse::Parse, pretty::Pretty, typ::Type};
 use crate::transports::Transport;
 use crate::transports::TransportHandle;
 use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
@@ -143,19 +147,59 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
     ) -> Result<()> {
       let semaphore = Arc::new(Semaphore::new(self.concurrency));
       let mut handles = Vec::new();
-      // let mut results = Arc::new(Mutex::new(Vec::new()));
+      let start_time = std::time::Instant::now();
+      let success_count = Arc::new(Mutex::new(0.0));
+      let fail_count = Arc::new(Mutex::new(0.0));
+      let init_file_lock = Arc::new(Mutex::new(()));
 
-      for _ in 0..self.N {
+      for i in 0..self.N {
         let permit = semaphore.clone().acquire_owned().await?;
         let simulator = self.simulator.clone();
         
+        let success_count_clone = success_count.clone();
+        let fail_count_clone = fail_count.clone();
+        let init_file_lock_clone = init_file_lock.clone();
         let handle = tokio::spawn(async move {
-          let result = simulator.run(2.5).await;
+
+          let _init_file_guard = init_file_lock_clone.lock().await;
+          let init_type = TR::parse("(gnc: (\"root!.angle\": float, \"root!.angleRate\": float, \"root!.elapsedTime\": float, \"root!.length\": float, \"root!.time\": float, \"root!.timeStep\": s),)").unwrap();
+          let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin")?; // FIXME
+          let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
+          let gnc = init_val.get(0).unwrap();
+          // // FIXME: mutating TypedDatums is currently sketchy
+          let mut gnc = gnc.clone();
+          gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(i as f64)))).unwrap();
+          let mut init_val = init_val.clone();
+          init_val.set(0, gnc).unwrap(); // FIXME: Ugly
+          let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+          std::fs::write("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin", bytes)?; // FIXME
+          drop(_init_file_guard);
+
+          let result = simulator.run(60.0).await;
           drop(permit); // Release the permit when done
+          match &result {
+            Ok(_) => *success_count_clone.lock().await += 1.0,
+            Err(_) => *fail_count_clone.lock().await += 1.0,
+          }
           result
         });
         
         handles.push(handle);
+        
+        // If at 5% increments
+        if (i + 1) % (self.N / 20) == 0 {
+          let s_count = success_count.clone();
+          let s_count = s_count.lock().await.clone();
+          let f_count = fail_count.clone();
+          let f_count = f_count.lock().await.clone();
+          info!(
+            "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
+            (s_count + f_count)/start_time.elapsed().as_secs_f64(),
+            s_count,
+            f_count,
+            handles.len(),
+          );
+        }
       }
 
       // Wait for all simulations to complete
@@ -284,8 +328,8 @@ async fn main() -> Result<()> {
         activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
             Value::Literal(true),
         )))),
-        N: 10,
-        concurrency: 2,
+        N: 100,
+        concurrency: 12,
         simulator: SedaroSimulator::new(
           std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/simulation"),
           "./target/release/main",
