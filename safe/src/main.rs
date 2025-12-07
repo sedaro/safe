@@ -30,6 +30,8 @@ use crate::transports::Transport;
 use crate::transports::TransportHandle;
 use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
 use crate::simulation::SedaroSimulator;
+use crate::kits::stats::NormalDistribution;
+use crate::kits::stats::StatisticalDistribution;
 
 #[derive(Debug, Serialize)]
 struct CollisionAvoidanceAutonomyMode {
@@ -152,15 +154,23 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
       let fail_count = Arc::new(Mutex::new(0.0));
       let init_file_lock = Arc::new(Mutex::new(()));
 
+      let seed = 7;
+      let mut angular_velocity_dist = NormalDistribution::new(0.0, 0.5, 10.0, seed);
+      let mut length_dist = NormalDistribution::new(0.0, 0.01, 1.0, seed);
+
       for i in 0..self.N {
         let permit = semaphore.clone().acquire_owned().await?;
         let simulator = self.simulator.clone();
         
+        let angular_velocity = angular_velocity_dist.sample();
+        let length = length_dist.sample();
+
         let success_count_clone = success_count.clone();
         let fail_count_clone = fail_count.clone();
         let init_file_lock_clone = init_file_lock.clone();
         let handle = tokio::spawn(async move {
 
+          // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
           let _init_file_guard = init_file_lock_clone.lock().await;
           let init_type = TR::parse("(gnc: (\"root!.angle\": float, \"root!.angleRate\": float, \"root!.elapsedTime\": float, \"root!.length\": float, \"root!.time\": float, \"root!.timeStep\": s),)").unwrap();
           let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin")?; // FIXME
@@ -168,18 +178,31 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
           let gnc = init_val.get(0).unwrap();
           // // FIXME: mutating TypedDatums is currently sketchy
           let mut gnc = gnc.clone();
-          gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(i as f64)))).unwrap();
+          gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(angular_velocity)))).unwrap();
+          gnc.set(3, Datum::Float(FloatValue::F64(OrderedFloat(length)))).unwrap();
           let mut init_val = init_val.clone();
           init_val.set(0, gnc).unwrap(); // FIXME: Ugly
           let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+          debug!("Modified simulation input Datum: {:?}", init_val);
           std::fs::write("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin", bytes)?; // FIXME
           drop(_init_file_guard);
 
           let result = simulator.run(60.0).await;
           drop(permit); // Release the permit when done
           match &result {
-            Ok(_) => *success_count_clone.lock().await += 1.0,
-            Err(_) => *fail_count_clone.lock().await += 1.0,
+            Ok(output) => {
+              match output.status.success() {
+                true => *success_count_clone.lock().await += 1.0,
+                false => {
+                  warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
+                  *fail_count_clone.lock().await += 1.0;
+                },
+              }
+            },
+            Err(e) => {
+              warn!("Simulation failed: {:?}", e);
+              *fail_count_clone.lock().await += 1.0;
+            },
           }
           result
         });
@@ -204,24 +227,8 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
 
       // Wait for all simulations to complete
       for handle in handles {
-        match handle.await {
-          Ok(result) => {
-            match result {
-              Ok(output) => {
-                match output.status.success() {
-                  // true => info!("Simulation completed successfully: {:?}", output),
-                  true => info!("Simulation completed successfully!"),
-                  false => warn!("Simulation failed with non-zero exit code: {:?}", String::from_utf8_lossy(&output.stderr)),
-                }
-              }
-              Err(e) => {
-                warn!("Simulation failed: {:?}", e);
-              }
-            }
-          }
-          Err(e) => {
-            warn!("Task join error: {:?}", e);
-          }
+        if let Err(e) = handle.await {
+          warn!("Simulation task join error: {:?}", e);
         }
       }
       Ok(())
