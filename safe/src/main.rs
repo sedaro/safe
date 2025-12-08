@@ -292,7 +292,6 @@ async fn handle_client(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                   }
                   Ok(_) => {
-                    println!("{}", line.trim().to_string());
                     if let Err(_) = stream.write(line.trim().to_string()).await {
                       break; // Client disconnected
                     }
