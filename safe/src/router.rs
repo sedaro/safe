@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{Level, debug, info, debug_span, warn};
+use tracing::Instrument;
 
 enum AutonomyModeSignal {
     // TODO: Warn of getting unscheduled
@@ -123,6 +124,7 @@ where
         let active_clone = active.clone();
         let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
         let mode_str = serde_json::to_string_pretty(&mode).unwrap();
+        let mode_name_clone = mode_name.clone();
         let handle = tokio::spawn(async move {
             // TODO: Make thread/process
             if let Err(e) = mode
@@ -131,7 +133,7 @@ where
             {
                 warn!("Autonomy Mode error: {}", e);
             }
-        });
+        }.instrument(debug_span!("run", autonomy_mode = %mode_name_clone)));
         let managed_mode = ManagedAutonomyMode {
             name: mode_name.clone(),
             priority,

@@ -19,11 +19,16 @@ use router::{AutonomyMode, Router};
 use serde::Serialize;
 use simvm::sv::data::FloatValue;
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn};
 use tokio::sync::Semaphore;
 use ordered_float::OrderedFloat;
+use tracing_subscriber::Layer;
+use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use tracing::Instrument;
 
 use simvm::sv::{combine::TR, data::Datum, parse::Parse, pretty::Pretty, typ::Type};
 use crate::transports::Transport;
@@ -205,7 +210,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             },
           }
           result
-        });
+        }.in_current_span());
         
         handles.push(handle);
         
@@ -268,14 +273,38 @@ async fn main() -> Result<()> {
         .merge(Env::prefixed("SAFE__").split("__"))
         .extract()?;
 
+    // FIXME: Move these to a AM registration step
     let (non_blocking, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "safe.log"));
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_target(false)
-        .with_level(true)
-        .json()
-        .init();
+    let (non_blocking_a, _guard_a) =
+      tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "CollisionAvoidance.log"));
+    let (non_blocking_b, _guard_b) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "NominalOps.log"));
+    tracing_subscriber::registry()
+      .with(
+        tracing_subscriber::fmt::layer()
+          .with_writer(non_blocking)
+          .with_target(false)
+          .with_level(true)
+          .json()
+      )
+      .with(
+        tracing_subscriber::fmt::layer()
+          .with_writer(non_blocking_a)
+          .with_target(false)
+          .with_level(true)
+          .json()
+          .with_filter(EnvFilter::new("[{autonomy_mode=CollisionAvoidance}]=trace"))
+      )
+      .with(
+        tracing_subscriber::fmt::layer()
+          .with_writer(non_blocking_b)
+          .with_target(false)
+          .with_level(true)
+          .json()
+          .with_filter(EnvFilter::new("[{autonomy_mode=NominalOps}]=trace"))
+      )
+      .init();
 
     info!("SAFE is in start up.");
 
