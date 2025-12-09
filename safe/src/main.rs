@@ -36,7 +36,7 @@ use crate::transports::Transport;
 use crate::transports::TransportHandle;
 use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
 use crate::simulation::SedaroSimulator;
-use crate::kits::stats::NormalDistribution;
+use crate::kits::stats::{GuassianSet, NormalDistribution};
 use crate::kits::stats::StatisticalDistribution;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncSeekExt, SeekFrom};
@@ -166,6 +166,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
       let seed = 7;
       let mut angular_velocity_dist = NormalDistribution::new(10.0, 0.5, seed);
       let mut length_dist = NormalDistribution::new(1.0, 0.01, seed);
+      let observations = Arc::new(Mutex::new(GuassianSet::new()));
 
       for i in 0..self.N {
         let permit = semaphore.clone().acquire_owned().await?;
@@ -177,6 +178,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
         let success_count_clone = success_count.clone();
         let fail_count_clone = fail_count.clone();
         let init_file_lock_clone = init_file_lock.clone();
+        let observations_clone = observations.clone();
         let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
 
           // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
@@ -202,16 +204,21 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
           match &result {
             Ok(output) => {
               match output.status.success() {
-                true => *success_count_clone.lock().await += 1.0,
+                true => {
+                  *success_count_clone.lock().await += 1.0;
+                  observations_clone.lock().await.add(1.0);
+                },
                 false => {
                   warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
                   *fail_count_clone.lock().await += 1.0;
+                  observations_clone.lock().await.add(f64::NAN);
                 },
               }
             },
             Err(e) => {
               warn!("Simulation failed: {:?}", e);
               *fail_count_clone.lock().await += 1.0;
+              observations_clone.lock().await.add(f64::NAN);
             },
           }
           result
@@ -232,6 +239,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             f_count,
             handles.len() - (s_count as usize) - (f_count as usize),
           );
+          info!("Interim analysis results: {}", observations.lock().await);
         }
       }
 
@@ -239,6 +247,24 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
       for handle in handles {
         if let Err(e) = handle.await {
           warn!("Simulation task join error: {:?}", e);
+        }
+      }
+
+      // Decide how to proceed
+      let observations = observations.lock().await;
+      if let Some(mean) = observations.mean() {
+        if let Some(std_dev) = observations.std_dev() {
+          if let Some(std_err) = observations.std_err() {
+            info!("Final analysis results: {}", observations);
+            if std_err < 0.05 {
+              tx_command
+                .send(Command {
+                    commanded_attitude: vec![1, 0, 0],
+                    thrust: 0,
+                })
+                .await?;
+            }
+          }
         }
       }
       Ok(())
