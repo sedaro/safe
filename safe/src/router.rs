@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
-use tracing::{Level, debug, info, debug_span, warn};
+use tracing::{Level, debug, info, debug_span, warn, trace};
 use tracing::Instrument;
 
 enum AutonomyModeSignal {
@@ -182,10 +182,7 @@ where
                                   warn!("No active subscribers for telemetry");
                               }
                           }
-                          Err(e) => {
-                              warn!("Error reading from C2 client: {}", e);
-                              break;
-                          }
+                          Err(e) => break, // Connection closed by client
                         }
                       }
                     });
@@ -208,10 +205,16 @@ where
                             reason: None,
                         },
                     );
-                    for write_half in client_stream_write_halves.iter_mut() {
-                        if let Err(e) = write_half.write(command.clone()).await {
-                            warn!("Error writing command to C2: {}", e);
+                    let mut idx_to_remove = vec![];
+                    for (idx, write_half) in client_stream_write_halves.iter_mut().enumerate() {
+                        if let Err(_) = write_half.write(command.clone()).await {
+                            // Connection closed by client so clean up
+                            // Reverse order to not mess up indices when removing
+                            idx_to_remove.insert(0, idx);
                         }
+                    }
+                    for idx in idx_to_remove {
+                        client_stream_write_halves.remove(idx);
                     }
                 }
 

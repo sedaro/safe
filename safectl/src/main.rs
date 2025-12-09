@@ -1,3 +1,6 @@
+use std::thread::sleep;
+use std::time::Duration;
+
 use clap::{CommandFactory, Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,8 @@ pub struct LogsRequest {
     pub level: Option<String>,
     pub follow: bool,
 }
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CommandsRequest {}
 
 /*
 CLI
@@ -216,6 +221,10 @@ async fn main() -> std::io::Result<()> {
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
             println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
+            let request = CommandsRequest {};
+            let msg = serde_json::to_string(&request).unwrap();
+            let msg = bincode::serialize(&msg).unwrap();
+            framed_stream.send(msg.into()).await?;
             loop {
                 let bytes = framed_stream
                     .next()
@@ -224,7 +233,7 @@ async fn main() -> std::io::Result<()> {
                         std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
                     })??;
                 let msg: String = bincode::deserialize(&bytes).unwrap();
-                println!("Received: {}", msg);
+                println!("{}", msg);
             }
         }
         None => Cli::command().print_help().unwrap(),
