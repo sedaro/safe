@@ -21,3 +21,6 @@ pub struct LogsRequest {
     pub level: Option<String>,
     pub follow: bool,
 }
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CommandsRequest {}

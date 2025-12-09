@@ -230,7 +230,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             (s_count + f_count)/start_time.elapsed().as_secs_f64(),
             s_count,
             f_count,
-            handles.len(),
+            handles.len() - (s_count as usize) - (f_count as usize),
           );
         }
       }
@@ -304,7 +304,7 @@ async fn handle_client(
             }
         } else if let Ok(tlm) = serde_json::from_str::<c2::Telemetry>(&msg) {
             router_stream.write(tlm).await.ok();
-        } else { // Assume its a commands request for now
+        } else if let Ok(_) = serde_json::from_str::<c2::CommandsRequest>(&msg) {
           loop {
               // TODO: Figure out how to break out of this loop when client hangs up!
               match router_stream.read().await {
@@ -315,6 +315,8 @@ async fn handle_client(
                   Err(_) => break,
               }
           }
+        } else {
+            error!("Unknown client message: {}", msg);
         }
         
     }
