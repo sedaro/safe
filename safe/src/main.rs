@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{debug, info, info_span, warn};
+use tracing::{debug, error, info, info_span, warn};
 use tokio::sync::Semaphore;
 use ordered_float::OrderedFloat;
 use tracing_subscriber::Layer;
@@ -180,19 +180,20 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
         let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
 
           // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
+          // - random suffix?
+          // - accept file name as input
           let _init_file_guard = init_file_lock_clone.lock().await;
           let init_type = TR::parse("(gnc: (\"root!.angle\": float, \"root!.angleRate\": float, \"root!.elapsedTime\": float, \"root!.length\": float, \"root!.time\": float, \"root!.timeStep\": s),)").unwrap();
           let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin")?; // FIXME
           let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
           let gnc = init_val.get(0).unwrap();
-          // FIXME: mutating TypedDatums is currently sketchy
           let mut gnc = gnc.clone();
           gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(angular_velocity)))).unwrap();
           gnc.set(3, Datum::Float(FloatValue::F64(OrderedFloat(length)))).unwrap();
           let mut init_val = init_val.clone();
           init_val.set(0, gnc).unwrap(); // FIXME: Ugly
           let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
-          debug!("Modified simulation input Datum: {:?}", init_val);
+          // debug!("Modified simulation input Datum: {:?}", init_val);
           std::fs::write("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin", bytes)?; // FIXME
           drop(_init_file_guard);
 
