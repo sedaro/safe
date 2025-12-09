@@ -14,8 +14,28 @@ environment.
 #### Getting Started
 
 ```bash
-cd examples
+cd ./safe
 cargo run
+```
+
+For logs, run the following in a different terminal
+```bash
+cd ./safectl
+cargo run -- logs
+# or
+cargo run -- logs | jq '.fields.message | select( . != null )'
+```
+
+For commands, run the following in a different terminal
+```bash
+cd ./safectl
+cargo run -- rx
+```
+
+For send telemetry, run the following in a different terminal
+```bash
+cd ./safectl
+cargo run -- tx '{"timestamp": 1625247600, "proximity_m": 200 }'
 ```
 
 

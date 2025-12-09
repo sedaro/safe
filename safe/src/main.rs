@@ -110,12 +110,17 @@ impl AutonomyMode for NominalOperationsAutonomyMode {
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()> {
         loop {
-            tx_command
-                .send(Command {
-                    commanded_attitude: vec![0, 1, 0],
-                    thrust: 0,
-                })
-                .await?;
+            if {
+              let active = active.lock().await;
+              *active
+            } {
+              tx_command
+                  .send(Command {
+                      commanded_attitude: vec![0, 1, 0],
+                      thrust: 0,
+                  })
+                  .await?;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             // if let Ok(telemetry) = rx_telem.recv().await {
             //     let active = active.lock().await;
@@ -154,120 +159,136 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
         &mut self,
         mut rx_telem: broadcast::Receiver<Telemetry>,
         tx_command: mpsc::Sender<Command>,
-        active: Arc<tokio::sync::Mutex<bool>>,
+        active: Arc<tokio::sync::Mutex<bool>>, // TODO: Make this an Event that can be efficiently waited on
     ) -> Result<()> {
-      let semaphore = Arc::new(Semaphore::new(self.concurrency));
-      let mut handles = Vec::new();
-      let start_time = std::time::Instant::now();
-      let success_count = Arc::new(Mutex::new(0.0));
-      let fail_count = Arc::new(Mutex::new(0.0));
-      let init_file_lock = Arc::new(Mutex::new(()));
+      
+      let mut first = true;
+      loop {
 
-      let seed = 7;
-      let mut angular_velocity_dist = NormalDistribution::new(10.0, 0.5, seed);
-      let mut length_dist = NormalDistribution::new(1.0, 0.01, seed);
-      let observations = Arc::new(Mutex::new(GuassianSet::new()));
-
-      for i in 0..self.N {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let simulator = self.simulator.clone();
-        
-        let angular_velocity = angular_velocity_dist.sample();
-        let length = length_dist.sample();
-
-        let success_count_clone = success_count.clone();
-        let fail_count_clone = fail_count.clone();
-        let init_file_lock_clone = init_file_lock.clone();
-        let observations_clone = observations.clone();
-        let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
-
-          // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
-          // - random suffix?
-          // - accept file name as input
-          let _init_file_guard = init_file_lock_clone.lock().await;
-          let init_type = TR::parse("(gnc: (\"root!.angle\": float, \"root!.angleRate\": float, \"root!.elapsedTime\": float, \"root!.length\": float, \"root!.time\": float, \"root!.timeStep\": s),)").unwrap();
-          let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin")?; // FIXME
-          let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
-          let gnc = init_val.get(0).unwrap();
-          let mut gnc = gnc.clone();
-          gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(angular_velocity)))).unwrap();
-          gnc.set(3, Datum::Float(FloatValue::F64(OrderedFloat(length)))).unwrap();
-          let mut init_val = init_val.clone();
-          init_val.set(0, gnc).unwrap(); // FIXME: Ugly
-          let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
-          // debug!("Modified simulation input Datum: {:?}", init_val);
-          std::fs::write("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin", bytes)?; // FIXME
-          drop(_init_file_guard);
-
-          let result = simulator.run(60.0).await;
-          drop(permit); // Release the permit when done
-          match &result {
-            Ok(output) => {
-              match output.status.success() {
-                true => {
-                  *success_count_clone.lock().await += 1.0;
-                  observations_clone.lock().await.add(1.0);
-                },
-                false => {
-                  warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
-                  *fail_count_clone.lock().await += 1.0;
-                  observations_clone.lock().await.add(f64::NAN);
-                },
-              }
-            },
-            Err(e) => {
-              warn!("Simulation failed: {:?}", e);
-              *fail_count_clone.lock().await += 1.0;
-              observations_clone.lock().await.add(f64::NAN);
-            },
-          }
-          result
-        }.in_current_span());
-        
-        handles.push(handle);
-        
-        // If at 5% increments
-        if (i + 1) % (self.N / 20) == 0 {
-          let s_count = success_count.clone();
-          let s_count = s_count.lock().await.clone();
-          let f_count = fail_count.clone();
-          let f_count = f_count.lock().await.clone();
-          info!(
-            "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
-            (s_count + f_count)/start_time.elapsed().as_secs_f64(),
-            s_count,
-            f_count,
-            handles.len() - (s_count as usize) - (f_count as usize),
-          );
-          info!("Interim analysis results: {}", observations.lock().await);
+        // FIXME: Very hacky - fix
+        while {
+          let active = active.lock().await;
+          !first && *active
+        } {
+          tokio::time::sleep(Duration::from_millis(100)).await;
         }
-      }
-
-      // Wait for all simulations to complete
-      for handle in handles {
-        if let Err(e) = handle.await {
-          warn!("Simulation task join error: {:?}", e);
+        first = false;
+        while {
+          let active = active.lock().await;
+          !*active
+        } {
+          tokio::time::sleep(Duration::from_millis(100)).await;
         }
-      }
 
-      // Decide how to proceed
-      let observations = observations.lock().await;
-      if let Some(mean) = observations.mean() {
-        if let Some(std_dev) = observations.std_dev() {
-          if let Some(std_err) = observations.std_err() {
-            info!("Final analysis results: {}", observations);
-            if std_err < 0.05 {
-              tx_command
-                .send(Command {
-                    commanded_attitude: vec![1, 0, 0],
-                    thrust: 0,
-                })
-                .await?;
+        let semaphore = Arc::new(Semaphore::new(self.concurrency));
+        let mut handles = Vec::new();
+        let start_time = std::time::Instant::now();
+        let success_count = Arc::new(Mutex::new(0.0));
+        let fail_count = Arc::new(Mutex::new(0.0));
+        let init_file_lock = Arc::new(Mutex::new(()));
+
+        let seed = 7;
+        let mut angular_velocity_dist = NormalDistribution::new(10.0, 0.5, seed);
+        let mut length_dist = NormalDistribution::new(1.0, 0.01, seed);
+        let observations = Arc::new(Mutex::new(GuassianSet::new()));
+
+        for i in 0..self.N {
+          let permit = semaphore.clone().acquire_owned().await?;
+          let simulator = self.simulator.clone();
+          
+          let angular_velocity = angular_velocity_dist.sample();
+          let length = length_dist.sample();
+
+          let success_count_clone = success_count.clone();
+          let fail_count_clone = fail_count.clone();
+          let init_file_lock_clone = init_file_lock.clone();
+          let observations_clone = observations.clone();
+          let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
+
+            // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
+            // - random suffix?
+            // - accept file name as input
+            let _init_file_guard = init_file_lock_clone.lock().await;
+            let init_type = TR::parse("(gnc: (\"root!.angle\": float, \"root!.angleRate\": float, \"root!.elapsedTime\": float, \"root!.length\": float, \"root!.time\": float, \"root!.timeStep\": s),)").unwrap();
+            let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin")?; // FIXME
+            let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
+            let gnc = init_val.get(0).unwrap();
+            let mut gnc = gnc.clone();
+            gnc.set(1, Datum::Float(FloatValue::F64(OrderedFloat(angular_velocity)))).unwrap();
+            gnc.set(3, Datum::Float(FloatValue::F64(OrderedFloat(length)))).unwrap();
+            let mut init_val = init_val.clone();
+            init_val.set(0, gnc).unwrap(); // FIXME: Ugly
+            let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+            // debug!("Modified simulation input Datum: {:?}", init_val);
+            std::fs::write("/Users/sebastianwelsh/Development/sedaro/simulation/generated/data/init_5Czl7pn4hDGr6rjwynzGK2f.bin", bytes)?; // FIXME
+            drop(_init_file_guard);
+
+            let result = simulator.run(60.0).await;
+            drop(permit); // Release the permit when done
+            match &result {
+              Ok(output) => {
+                match output.status.success() {
+                  true => {
+                    *success_count_clone.lock().await += 1.0;
+                    observations_clone.lock().await.add(1.0);
+                  },
+                  false => {
+                    warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
+                    *fail_count_clone.lock().await += 1.0;
+                    observations_clone.lock().await.add(f64::NAN);
+                  },
+                }
+              },
+              Err(e) => {
+                warn!("Simulation failed: {:?}", e);
+                *fail_count_clone.lock().await += 1.0;
+                observations_clone.lock().await.add(f64::NAN);
+              },
             }
+            result
+          }.in_current_span());
+          
+          handles.push(handle);
+          
+          // If at 5% increments
+          if (i + 1) % (self.N / 20) == 0 {
+            let s_count = success_count.clone();
+            let s_count = s_count.lock().await.clone();
+            let f_count = fail_count.clone();
+            let f_count = f_count.lock().await.clone();
+            info!(
+              "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
+              (s_count + f_count)/start_time.elapsed().as_secs_f64(),
+              s_count,
+              f_count,
+              handles.len() - (s_count as usize) - (f_count as usize),
+            );
+            info!("Interim analysis results: {}", observations.lock().await);
+          }
+        }
+
+        // Wait for all simulations to complete
+        for handle in handles {
+          if let Err(e) = handle.await {
+            warn!("Simulation task join error: {:?}", e);
+          }
+        }
+
+        // Decide how to proceed
+        let observations = observations.lock().await;
+        if let Some(std_err) = observations.std_err() {
+          info!("Final analysis results: {}", observations);
+          info!("Analysis completed in {} ms", start_time.elapsed().as_millis());
+          if std_err < 0.05 {
+            tx_command
+              .send(Command {
+                  commanded_attitude: vec![0, 0, 1],
+                  thrust: 2,
+              })
+              .await?;
           }
         }
       }
-      Ok(())
     }
 }
 
@@ -394,6 +415,7 @@ async fn main() -> Result<()> {
       .init();
 
     info!("SAFE is in start up.");
+    println!("SAFE is in start up.");
 
     let observability = Arc::new(obs::ObservabilitySubsystem::new(None));
     let observability_clone = observability.clone();
@@ -436,6 +458,31 @@ async fn main() -> Result<()> {
             ),
         }),
     };
+    let mode = GenericUncertaintyQuantificationAutonomyMode {
+        name: "CollisionAvoidance".to_string(),
+        priority: 1,
+        activation: Some(Activation::Hysteretic {
+            enter: Expr::Not(Box::new(Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string(),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+            ))),
+            exit: Expr::GreaterThan(
+                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                    "proximity_m".to_string(),
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
+            ),
+        }),
+        N: 100,
+        concurrency: 24,
+        simulator: SedaroSimulator::new(
+          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/simulation"),
+          "./target/release/main",
+          None,
+        ),
+    };
     router.register_autonomy_mode(mode, &config);
 
     let mode = NominalOperationsAutonomyMode {
@@ -444,20 +491,6 @@ async fn main() -> Result<()> {
         activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
             Value::Literal(true),
         )))),
-    };
-    let mode = GenericUncertaintyQuantificationAutonomyMode {
-        name: "NominalOps".to_string(),
-        priority: 0,
-        activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
-            Value::Literal(true),
-        )))),
-        N: 100,
-        concurrency: 12,
-        simulator: SedaroSimulator::new(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/simulation"),
-          "./target/release/main",
-          None,
-        ),
     };
     router.register_autonomy_mode(mode, &config);
 
@@ -470,6 +503,7 @@ async fn main() -> Result<()> {
 
     // let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
     let mut transport: TcpTransport<String, String> = TcpTransport::new("127.0.0.1", 8001).await?;
+    println!("SAFE C2 listening on {}:{}", "127.0.0.1", 8001);
     tokio::spawn(async move {
         loop {
             match transport.accept().await {
@@ -498,6 +532,8 @@ Config changes
 
 /*
 - Have a rust-native autonomy mode or two
+- Implement a way to have background modes which are alerted when they are activated/deactivated
+- Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
 - Mode transition command purging
 - Try to compile it for Raspberry PI and STM MCU
 - Focus on the EDS integration piece

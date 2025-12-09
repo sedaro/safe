@@ -183,7 +183,7 @@ async fn main() -> std::io::Result<()> {
             if filter.is_some() { println!("WARNING: --filter is not yet implemented") }
             
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
-            println!("Connected");
+            // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
             let request = LogsRequest {
                 mode: mode.clone(),
@@ -207,7 +207,7 @@ async fn main() -> std::io::Result<()> {
         Some(Commands::Transmit { json }) => {
             // let stream = UnixStream::connect(SOCKET_PATH).await?;
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
-            println!("Connected");
+            // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
 
             let telemetry: Telemetry =
@@ -219,7 +219,7 @@ async fn main() -> std::io::Result<()> {
         Some(Commands::Receive {}) => {
             // let stream = UnixStream::connect(SOCKET_PATH).await?;
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
-            println!("Connected");
+            // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
             let request = CommandsRequest {};
             let msg = serde_json::to_string(&request).unwrap();
