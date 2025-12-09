@@ -164,8 +164,8 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
       let init_file_lock = Arc::new(Mutex::new(()));
 
       let seed = 7;
-      let mut angular_velocity_dist = NormalDistribution::new(0.0, 0.5, 10.0, seed);
-      let mut length_dist = NormalDistribution::new(0.0, 0.01, 1.0, seed);
+      let mut angular_velocity_dist = NormalDistribution::new(10.0, 0.5, seed);
+      let mut length_dist = NormalDistribution::new(1.0, 0.01, seed);
 
       for i in 0..self.N {
         let permit = semaphore.clone().acquire_owned().await?;
