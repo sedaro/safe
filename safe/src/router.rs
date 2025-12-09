@@ -143,7 +143,7 @@ where
         };
         self.autonomy_modes
             .insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
-        println!("Registered Autonomy Mode:\n{}", mode_str);
+        println!("Registered Autonomy Mode: {}", mode_name);
     }
 
     pub async fn run(&mut self, config: &Config) -> Result<()> {
@@ -274,9 +274,6 @@ where
                         *active = true;
                       }
                       self.selected_mode = Some(highest_priority_mode.clone());
-
-                    } else {
-                      debug!("Staying in mode: {}", highest_priority_mode);
                     }
                   }
                 }

@@ -193,7 +193,6 @@ impl<R, T> UnixTransport<R, T> {
             tokio::fs::remove_file(&path).await?;
         }
         let listener = tokio::net::UnixListener::bind(path)?;
-        println!("SAFE listening on {}", path);
         Ok(Self {
             path: path.to_string(),
             listener,
@@ -356,7 +355,6 @@ impl<R, T> TcpTransport<R, T> {
     pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
         let full_address = format!("{address}:{port}");
         let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
-        println!("SAFE listening on {}", full_address);
         let s = Self {
             address: address.to_string(),
             port,
