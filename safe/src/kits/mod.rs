@@ -1,1 +1,1 @@
-mod montecarlo;
+pub mod stats;
