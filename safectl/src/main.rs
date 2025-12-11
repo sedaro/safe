@@ -1,6 +1,3 @@
-use std::thread::sleep;
-use std::time::Duration;
-
 use clap::{CommandFactory, Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -14,8 +11,7 @@ const SOCKET_PATH: &str = "/tmp/safe.sock";
 // TOOD: Reference these from safe-common crate
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Telemetry {
-    pub timestamp: u64,
-    pub proximity_m: i32,
+    pub pointing_error: f64,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct LogsRequest {

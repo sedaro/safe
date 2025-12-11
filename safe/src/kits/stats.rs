@@ -4,6 +4,7 @@ use rand::{self, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
 // TODO: Brad to architect this module
+// https://sedaro.slack.com/archives/D03FLBA7WCT/p1765289350221849
 
 pub trait StatisticalDistribution<T> {
     fn sample(&mut self) -> T;
@@ -74,8 +75,10 @@ impl Display for GuassianSet {
             (Some(mean), Some(std_dev), Some(std_err)) => {
                 write!(
                     f,
-                    "mean: {:.6}, std dev: {:.6}, std err: {:.6}",
-                    mean, std_dev, std_err
+                    // "mean: {:.6}, std dev: {:.6}, std err: {:.6}",
+                    // mean, std_dev, std_err
+                    "mean: {:.6}, std dev: {:.6}",
+                    mean, std_dev
                 )
             }
             _ => write!(f, "Insufficient data to compute statistics."),

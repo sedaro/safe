@@ -2,14 +2,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Telemetry {
-    pub timestamp: u64,
-    pub proximity_m: i32,
+    // pub timestamp: u64,
+    pub pointing_error: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Command {
-    pub commanded_attitude: Vec<u8>,
-    pub thrust: u8,
+    pub set_pid_controller_gains: (f64, f64, f64, f64),
 }
 
 
