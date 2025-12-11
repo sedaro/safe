@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
-use tracing::{Level, debug, info, debug_span, warn, trace};
+use tracing::{debug, info, debug_span, warn};
 use tracing::Instrument;
 
 enum AutonomyModeSignal {
@@ -54,12 +54,12 @@ impl Resolvable for Resolver {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         if let Some(latest_telem) = telem_buffer.front() {
             match var {
-                "proximity_m" => Some(Variable::Float64(Value::Literal(
-                    latest_telem.proximity_m as f64,
+                "pointing_error" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.pointing_error as f64,
                 ))),
-                "timestamp" => Some(Variable::Float64(Value::Literal(
-                    latest_telem.timestamp as f64,
-                ))),
+                // "timestamp" => Some(Variable::Float64(Value::Literal(
+                //     latest_telem.timestamp as f64,
+                // ))),
                 _ => None,
             }
         } else {
@@ -123,7 +123,6 @@ where
         let active = Arc::new(tokio::sync::Mutex::new(false));
         let active_clone = active.clone();
         let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
-        let mode_str = serde_json::to_string_pretty(&mode).unwrap();
         let mode_name_clone = mode_name.clone();
         let handle = tokio::spawn(async move {
             // TODO: Make thread/process
@@ -182,7 +181,7 @@ where
                                   warn!("No active subscribers for telemetry");
                               }
                           }
-                          Err(e) => break, // Connection closed by client
+                          Err(_) => break, // Connection closed by client
                         }
                       }
                     });
@@ -294,12 +293,10 @@ mod tests {
         let resolver = Resolver {
             telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
                 Telemetry {
-                    timestamp: 1000,
-                    proximity_m: 150,
+                    pointing_error: 150.0,
                 },
                 Telemetry {
-                    timestamp: 2000,
-                    proximity_m: 50,
+                    pointing_error: 50.0,
                 },
             ]))),
             vars: HashMap::from_iter([
@@ -345,7 +342,7 @@ mod tests {
         assert_eq!(
             Expr::GreaterThan(
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
                     "a".to_string()
@@ -361,7 +358,7 @@ mod tests {
                     "a".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
             )
             .eval(&resolver)
@@ -427,7 +424,7 @@ mod tests {
                     "b".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
             )
             .eval(&resolver)
