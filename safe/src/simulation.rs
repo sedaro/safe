@@ -28,7 +28,7 @@ impl SedaroSimulator {
         // .env("PYTHONPATH", format!("{}/simulation_python:{}/simulation_buildtime_python:{}/simvm_python:{}", self.path.to_str().unwrap(), self.path.to_str().unwrap(), self.path.to_str().unwrap(), env::var("PYTHONPATH").unwrap_or_default()))
         .env("PATH", format!("/Users/sebastianwelsh/Development/sedaro/scf/.venv/bin:{}", env::var("PATH").unwrap_or_default()))
         // .env("SIM_VM_WORKSPACE", self.path.join("generated").to_str().unwrap())
-        .env("SIM_VM_LOCAL", "1")
+        // .env("SIM_VM_LOCAL", "1")
         .env("LANG", "en_US.UTF-8")
         .env("LC_ALL", "en_US.UTF-8")
         .env("LC_CTYPE", "en_US.UTF-8")

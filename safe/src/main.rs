@@ -201,12 +201,12 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
         let mut y_wheel_inertia = 0.000005;
         let mut z_wheel_inertia = 0.000005;
 
-        let mut inertia_mat_0_0_dist = NormalDistribution::new(inertia_0_0, inertia_0_0 * ((2.5 / 3.0) / 100.0), 10);
-        let mut inertia_mat_1_1_dist = NormalDistribution::new(inertia_1_1, inertia_1_1 * ((2.5 / 3.0) / 100.0), 11);
-        let mut inertia_mat_2_2_dist = NormalDistribution::new(inertia_2_2, inertia_2_2 * ((2.5 / 3.0) / 100.0), 12);
-        let mut x_wheel_inertia_dist = NormalDistribution::new(x_wheel_inertia, x_wheel_inertia * ((2.5 / 3.0) / 100.0), 13);
-        let mut y_wheel_inertia_dist = NormalDistribution::new(y_wheel_inertia, y_wheel_inertia * ((2.5 / 3.0) / 100.0), 14);
-        let mut z_wheel_inertia_dist = NormalDistribution::new(z_wheel_inertia, z_wheel_inertia * ((2.5 / 3.0) / 100.0), 15);
+        let mut inertia_mat_0_0_dist = NormalDistribution::new(inertia_0_0, inertia_0_0 * ((5.0 / 3.0) / 100.0), 10);
+        let mut inertia_mat_1_1_dist = NormalDistribution::new(inertia_1_1, inertia_1_1 * ((5.0 / 3.0) / 100.0), 11);
+        let mut inertia_mat_2_2_dist = NormalDistribution::new(inertia_2_2, inertia_2_2 * ((5.0 / 3.0) / 100.0), 12);
+        let mut x_wheel_inertia_dist = NormalDistribution::new(x_wheel_inertia, x_wheel_inertia * ((5.0 / 3.0) / 100.0), 13);
+        let mut y_wheel_inertia_dist = NormalDistribution::new(y_wheel_inertia, y_wheel_inertia * ((5.0 / 3.0) / 100.0), 14);
+        let mut z_wheel_inertia_dist = NormalDistribution::new(z_wheel_inertia, z_wheel_inertia * ((5.0 / 3.0) / 100.0), 15);
         let max_speed_observations = Arc::new(Mutex::new(GuassianSet::new()));
         let max_pointing_error_observations = Arc::new(Mutex::new(GuassianSet::new()));
 
@@ -235,11 +235,11 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             // - random suffix?
             // - accept file name as input
             let _init_file_guard = init_file_lock_clone.lock().await;
-            let init_type = TR::parse("(gnc: (\"$as_Position.eci_HGDv5HpfFwcMfs3XpDM5Cl7\": {(float, float, float) | #, eci}, \"PTncgtNhFd5whhVCp34ykX.absorptivity\": float, \"PTncgtNhFd5whhVCp34ykX.area\": float, \"PTncgtNhFd5whhVCp34ykX.centroid\": {(float, float, float) | #}, \"PTncgtNhFd5whhVCp34ykX.diffuse_reflectivity\": float, \"PTncgtNhFd5whhVCp34ykX.orientation\": {(float, float, float) | #}, \"PTncgtNhFd5whhVCp34ykX.specular_reflectivity\": float, \"PTncgtNkFCJ3XVXBWtl6Dq.absorptivity\": float, \"PTncgtNkFCJ3XVXBWtl6Dq.area\": float, \"PTncgtNkFCJ3XVXBWtl6Dq.centroid\": {(float, float, float) | #}, \"PTncgtNkFCJ3XVXBWtl6Dq.diffuse_reflectivity\": float, \"PTncgtNkFCJ3XVXBWtl6Dq.orientation\": {(float, float, float) | #}, \"PTncgtNkFCJ3XVXBWtl6Dq.specular_reflectivity\": float, \"PTncgtNmCND8VwFwtF2gfQ.absorptivity\": float, \"PTncgtNmCND8VwFwtF2gfQ.area\": float, \"PTncgtNmCND8VwFwtF2gfQ.centroid\": {(float, float, float) | #}, \"PTncgtNmCND8VwFwtF2gfQ.diffuse_reflectivity\": float, \"PTncgtNmCND8VwFwtF2gfQ.orientation\": {(float, float, float) | #}, \"PTncgtNmCND8VwFwtF2gfQ.specular_reflectivity\": float, \"PTncgtNp9vVdj3mppRd32k.absorptivity\": float, \"PTncgtNp9vVdj3mppRd32k.area\": float, \"PTncgtNp9vVdj3mppRd32k.centroid\": {(float, float, float) | #}, \"PTncgtNp9vVdj3mppRd32k.diffuse_reflectivity\": float, \"PTncgtNp9vVdj3mppRd32k.orientation\": {(float, float, float) | #}, \"PTncgtNp9vVdj3mppRd32k.specular_reflectivity\": float, \"PTncgtNr6jxLJvWNX5MDpv.absorptivity\": float, \"PTncgtNr6jxLJvWNX5MDpv.area\": float, \"PTncgtNr6jxLJvWNX5MDpv.centroid\": {(float, float, float) | #}, \"PTncgtNr6jxLJvWNX5MDpv.diffuse_reflectivity\": float, \"PTncgtNr6jxLJvWNX5MDpv.orientation\": {(float, float, float) | #}, \"PTncgtNr6jxLJvWNX5MDpv.specular_reflectivity\": float, \"PTncgtNt73rhBxzTXGtlXK.absorptivity\": float, \"PTncgtNt73rhBxzTXGtlXK.area\": float, \"PTncgtNt73rhBxzTXGtlXK.centroid\": {(float, float, float) | #}, \"PTncgtNt73rhBxzTXGtlXK.diffuse_reflectivity\": float, \"PTncgtNt73rhBxzTXGtlXK.orientation\": {(float, float, float) | #}, \"PTncgtNt73rhBxzTXGtlXK.specular_reflectivity\": float, \"PTncgtNw9cCwtmPFR8k6fj.id\": u128, \"PTncgtNw9cCwtmPFR8k6fj.inertia\": float, \"PTncgtNw9cCwtmPFR8k6fj.orientation\": {(float, float, float) | #}, \"PTncgtNw9cCwtmPFR8k6fj.rated_momentum\": float, \"PTncgtNw9cCwtmPFR8k6fj.rated_torque\": float, \"PTncgtNw9cCwtmPFR8k6fj.speed\": float, \"PTncgtNw9cCwtmPFR8k6fj.torque\": {(float, float, float) | #}, \"PTncgtNy9WYYK6zL6GKLcG.id\": u128, \"PTncgtNy9WYYK6zL6GKLcG.inertia\": float, \"PTncgtNy9WYYK6zL6GKLcG.orientation\": {(float, float, float) | #}, \"PTncgtNy9WYYK6zL6GKLcG.rated_momentum\": float, \"PTncgtNy9WYYK6zL6GKLcG.rated_torque\": float, \"PTncgtNy9WYYK6zL6GKLcG.speed\": float, \"PTncgtNy9WYYK6zL6GKLcG.torque\": {(float, float, float) | #}, \"PTncgtP28MCmBbCY3SStDQ.id\": u128, \"PTncgtP28MCmBbCY3SStDQ.inertia\": float, \"PTncgtP28MCmBbCY3SStDQ.orientation\": {(float, float, float) | #}, \"PTncgtP28MCmBbCY3SStDQ.rated_momentum\": float, \"PTncgtP28MCmBbCY3SStDQ.rated_torque\": float, \"PTncgtP28MCmBbCY3SStDQ.speed\": float, \"PTncgtP28MCmBbCY3SStDQ.torque\": {(float, float, float) | #}, \"PTncgtP43vT45yhYKVBQzp.commanded_moment\": float, \"PTncgtP43vT45yhYKVBQzp.id\": u128, \"PTncgtP43vT45yhYKVBQzp.orientation\": {(float, float, float) | #}, \"PTncgtP43vT45yhYKVBQzp.rated_magnetic_moment\": float, \"PTncgtP65nt3vBfcxfW3rB.commanded_moment\": float, \"PTncgtP65nt3vBfcxfW3rB.id\": u128, \"PTncgtP65nt3vBfcxfW3rB.orientation\": {(float, float, float) | #}, \"PTncgtP65nt3vBfcxfW3rB.rated_magnetic_moment\": float, \"PTncgtP7zM3lYmRqrNRyrL.commanded_moment\": float, \"PTncgtP7zM3lYmRqrNRyrL.id\": u128, \"PTncgtP7zM3lYmRqrNRyrL.orientation\": {(float, float, float) | #}, \"PTncgtP7zM3lYmRqrNRyrL.rated_magnetic_moment\": float, \"root!.angular_acceleration\": {(float, float, float) | #}, \"root!.angular_velocity\": {(float, float, float) | #}, \"root!.attitude\": {(float, float, float, float) | #}, \"root!.elapsedTime\": day, \"root!.inertia\": {((float, float, float), (float, float, float), (float, float, float)) | #}, \"root!.mass\": float, \"root!.pid_config\": (float, float, float, float), \"root!.position\": {(float, float, float) | #, eci}, \"root!.time\": day, \"root!.timeStep\": day, \"root!.velocity\": {(float, float, float) | #}),)").unwrap();
+            let init_type = TR::parse("(gnc: (\"$as_Position.eci_HGDv5HpfFwcMfs3XpDM5Cl7\": {(float, float, float) | #, eci}, \"PTnxx2jZ8vzTJlRwjxyctn.id\": u128, \"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxx2jZ8vzTJlRwjxyctn.orientation\": {(float, float, float) | #}, \"PTnxx2jZ8vzTJlRwjxyctn.rated_momentum\": float, \"PTnxx2jZ8vzTJlRwjxyctn.rated_torque\": float, \"PTnxx2jZ8vzTJlRwjxyctn.speed\": float, \"PTnxx2jZ8vzTJlRwjxyctn.torque\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.id\": u128, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.orientation\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.rated_momentum\": float, \"PTnxxBv6drdQlzqJlVvvbC.rated_torque\": float, \"PTnxxBv6drdQlzqJlVvvbC.speed\": float, \"PTnxxBv6drdQlzqJlVvvbC.torque\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.id\": u128, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.orientation\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.rated_momentum\": float, \"PTnxxMb7DrlvQKWQsDST4r.rated_torque\": float, \"PTnxxMb7DrlvQKWQsDST4r.speed\": float, \"PTnxxMb7DrlvQKWQsDST4r.torque\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.commanded_moment\": float, \"PTnxxWYyx6GZyvPWwZnmkh.id\": u128, \"PTnxxWYyx6GZyvPWwZnmkh.orientation\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.rated_magnetic_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.commanded_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.id\": u128, \"PTnxxX7KfDFTtZwDWS9L3Z.orientation\": {(float, float, float) | #}, \"PTnxxX7KfDFTtZwDWS9L3Z.rated_magnetic_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.commanded_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.id\": u128, \"PTnxxXTwZYcKSqfzCdNkqc.orientation\": {(float, float, float) | #}, \"PTnxxXTwZYcKSqfzCdNkqc.rated_magnetic_moment\": float, \"PTnxyLN97zsstnd4dVDwcv.absorptivity\": float, \"PTnxyLN97zsstnd4dVDwcv.area\": float, \"PTnxyLN97zsstnd4dVDwcv.centroid\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.diffuse_reflectivity\": float, \"PTnxyLN97zsstnd4dVDwcv.orientation\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.specular_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.absorptivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.area\": float, \"PTnxyLNC6LbltcjyVy7NyW.centroid\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.diffuse_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.orientation\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.specular_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.absorptivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.area\": float, \"PTnxyLNF8gJTrK9VH59Cnw.centroid\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.diffuse_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.orientation\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.specular_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.absorptivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.area\": float, \"PTnxyLNH75rVPjCzhzwYxg.centroid\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.diffuse_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.orientation\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.specular_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.absorptivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.area\": float, \"PTnxyLNK5GqqJtBHHmDhz2.centroid\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.diffuse_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.orientation\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.specular_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.absorptivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.area\": float, \"PTnxyLNM7KjhddLfmsxMNJ.centroid\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.diffuse_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.orientation\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.specular_reflectivity\": float, \"root!.angular_acceleration\": {(float, float, float) | #}, \"root!.angular_velocity\": {(float, float, float) | #}, \"root!.attitude\": {(float, float, float, float) | #}, \"root!.elapsedTime\": day, \"root!.inertia\": {((float, float, float), (float, float, float), (float, float, float)) | #}, \"root!.mass\": float, \"root!.pid_config\": (float, float, float, float), \"root!.position\": {(float, float, float) | #, eci}, \"root!.time\": day, \"root!.timeStep\": day, \"root!.velocity\": {(float, float, float) | #}),)").unwrap();
             // Inertia matrix is 74
-            // Wheel inertial is 38, 45, 52
+            // Wheel inertial is 2, 9, 16
             // PID: 76
-            let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_BXSc5nBDFLXzVVQH3ZyGPqk.bin")?; // FIXME
+            let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin")?; // FIXME
             let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
             // println!("Original simulation input Datum: {:?}", init_val.pretty());
             let gnc = init_val.get(0).unwrap();
@@ -251,9 +251,9 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             pid_config.set(2, Datum::Float(FloatValue::F64(OrderedFloat(pid_controller_gains.2)))).unwrap();
             pid_config.set(3, Datum::Float(FloatValue::F64(OrderedFloat(pid_controller_gains.3)))).unwrap();
             gnc.set(76, pid_config).unwrap();
-            gnc.set(38, Datum::Float(FloatValue::F64(OrderedFloat(x_wheel_inertia)))).unwrap();
-            gnc.set(45, Datum::Float(FloatValue::F64(OrderedFloat(y_wheel_inertia)))).unwrap();
-            gnc.set(52, Datum::Float(FloatValue::F64(OrderedFloat(z_wheel_inertia)))).unwrap();
+            gnc.set(2, Datum::Float(FloatValue::F64(OrderedFloat(x_wheel_inertia)))).unwrap();
+            gnc.set(9, Datum::Float(FloatValue::F64(OrderedFloat(y_wheel_inertia)))).unwrap();
+            gnc.set(16, Datum::Float(FloatValue::F64(OrderedFloat(z_wheel_inertia)))).unwrap();
             let inertia_mat = gnc.get(74).unwrap();
             let mut inertia_mat = inertia_mat.clone();
             let row0 = inertia_mat.get(0).unwrap();
@@ -273,10 +273,14 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             init_val.set(0, gnc).unwrap(); // FIXME: Ugly
             let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
             // debug!("Modified simulation input Datum: {:?}", init_val);
-            std::fs::write("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_BXSc5nBDFLXzVVQH3ZyGPqk.bin", bytes)?; // FIXME
+            std::fs::write("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin", bytes)?; // FIXME
             drop(_init_file_guard);
 
             let results_path = std::path::PathBuf::from(format!("/Users/sebastianwelsh/Development/sedaro/scf/results/uq_run_{}", i));
+            // Clear results
+            if results_path.exists() {
+              tokio::fs::remove_dir_all(&results_path).await.ok();
+            }
             let result = simulator.run(1.0, &results_path).await;
             drop(permit); // Release the permit when done
             match &result {
@@ -288,17 +292,21 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
                   false => {
                     warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
                     *fail_count_clone.lock().await += 1.0;
+                    return result;
                   },
                 }
               },
               Err(e) => {
                 warn!("Simulation failed: {:?}", e);
                 *fail_count_clone.lock().await += 1.0;
+                return result;
               },
             }
 
+            // TODO: Handle there being zero frames
+
             let mut frames: Vec<Datum> = vec![];
-            if let Ok(file) = File::open(results_path.join("PTng49cD7jbNrXZMZQJVmW.gnc.jsonl")).await {
+            if let Ok(file) = File::open(results_path.join("PTnYWzsc2Nhywc8WVS4blm.gnc.jsonl")).await {
               // Seek to end of file
               let mut reader = BufReader::new(file);
               let mut line = String::new();
@@ -331,7 +339,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
             let mut i = 0;
             // (\"PTnYWzsN8kmmrHNtVgCr9G.commanded_torque\": float, \"PTnYWzsN8kmmrHNtVgCr9G.speed\": float, \"PTnYWzsN8kmmrHNtVgCr9G.torque\": {(float, float, float) | #}, \"PTnYWzsQ5nnKDB5NHtWNj3.commanded_torque\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.speed\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.torque\": {(float, float, float) | #}, \"PTnYWzsS6fbQRNkH9rF4r8.commanded_torque\": float, \"PTnYWzsS6fbQRNkH9rF4r8.speed\": float, \"PTnYWzsS6fbQRNkH9rF4r8.torque\": {(float, float, float) | #}, \"PTnYWzsV7sgvClGvcX4WB3.commanded_moment\": float, \"PTnYWzsV7sgvClGvcX4WB3.duty_cycle\": float, \"PTnYWzsV7sgvClGvcX4WB3.torque\": {(float, float, float) | #}, \"PTnYWzsX5DlGhvkFHmPZ9B.commanded_moment\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.duty_cycle\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.torque\": {(float, float, float) | #}, \"PTnYWzsYyXYkNbPWkPPkry.commanded_moment\": float, \"PTnYWzsYyXYkNbPWkPPkry.duty_cycle\": float, \"PTnYWzsYyXYkNbPWkPPkry.torque\": {(float, float, float) | #}, elapsedTime: day, \"root.angular_velocity\": {(float, float, float) | #}, \"root.attitude\": {(float, float, float, float) | #}, \"root.commanded_attitude\": {(float, float, float, float) | #}, \"root.in_shadow\": bool, \"root.magnetic_field\": {(float, float, float) | #}, \"root.pointing_error\": float, \"root.position\": {(float, float, float) | #, eci}, \"root.velocity\": {(float, float, float) | #}, time: day, timeStep: day)
             // speeds: 1, 4, 7
-            // pointing_error: 24
+            // pointing_error: 25
 
             for frame in &frames {
               let speed = match frame.get(1).unwrap().as_float().unwrap() {
@@ -350,7 +358,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
               };
               if max_speed < speed.abs() { max_speed = speed.abs() }
               if i > frames.len()/2 {
-                let pointing_error = match frame.get(24).unwrap().as_float().unwrap() {
+                let pointing_error = match frame.get(25).unwrap().as_float().unwrap() {
                   FloatValue::F64(f) => f,
                   FloatValue::F32(f) => panic!("Got f32 but expected f64"),
                 };
@@ -361,9 +369,10 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
               i += 1;
             }        
             let average_error =pointing_errors.iter().sum::<OrderedFloat<f64>>().0 / (pointing_errors.len() as f64);
-            println!("{} {} {}", frames.len(), max_speed, average_error);
+            // println!("{} {} {}", frames.len(), max_speed, average_error);
+            println!("{} {} {}", frames.len(), max_speed, max_pointing_error);
             max_speed_observations_clone.lock().await.add(max_speed);
-            max_pointing_error_observations_clone.lock().await.add(average_error);
+            max_pointing_error_observations_clone.lock().await.add(max_pointing_error);
             result
           }.in_current_span());
           
