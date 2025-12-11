@@ -75,10 +75,8 @@ impl Display for GuassianSet {
             (Some(mean), Some(std_dev), Some(std_err)) => {
                 write!(
                     f,
-                    // "mean: {:.6}, std dev: {:.6}, std err: {:.6}",
-                    // mean, std_dev, std_err
-                    "mean: {:.6}, std dev: {:.6}",
-                    mean, std_dev
+                    "mean: {:.6}, std dev: {:.6}, std err: {:.6}",
+                    mean, std_dev, std_err
                 )
             }
             _ => write!(f, "Insufficient data to compute statistics."),
