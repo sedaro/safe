@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, debug_span, warn};
+use tracing::Instrument;
 
 enum AutonomyModeSignal {
     // TODO: Warn of getting unscheduled
@@ -53,12 +54,12 @@ impl Resolvable for Resolver {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         if let Some(latest_telem) = telem_buffer.front() {
             match var {
-                "proximity_m" => Some(Variable::Float64(Value::Literal(
-                    latest_telem.proximity_m as f64,
+                "pointing_error" => Some(Variable::Float64(Value::Literal(
+                    latest_telem.pointing_error as f64,
                 ))),
-                "timestamp" => Some(Variable::Float64(Value::Literal(
-                    latest_telem.timestamp as f64,
-                ))),
+                // "timestamp" => Some(Variable::Float64(Value::Literal(
+                //     latest_telem.timestamp as f64,
+                // ))),
                 _ => None,
             }
         } else {
@@ -122,7 +123,7 @@ where
         let active = Arc::new(tokio::sync::Mutex::new(false));
         let active_clone = active.clone();
         let rx_telem_in_mode = self.rx_telem_in_modes.resubscribe();
-        let mode_str = serde_json::to_string_pretty(&mode).unwrap();
+        let mode_name_clone = mode_name.clone();
         let handle = tokio::spawn(async move {
             // TODO: Make thread/process
             if let Err(e) = mode
@@ -131,7 +132,7 @@ where
             {
                 warn!("Autonomy Mode error: {}", e);
             }
-        });
+        }.instrument(debug_span!("run", autonomy_mode = %mode_name_clone)));
         let managed_mode = ManagedAutonomyMode {
             name: mode_name.clone(),
             priority,
@@ -141,7 +142,7 @@ where
         };
         self.autonomy_modes
             .insert(mode_name.clone(), (managed_mode, rx_command_from_modes));
-        println!("Registered Autonomy Mode:\n{}", mode_str);
+        println!("Registered Autonomy Mode: {}", mode_name);
     }
 
     pub async fn run(&mut self, config: &Config) -> Result<()> {
@@ -180,10 +181,7 @@ where
                                   warn!("No active subscribers for telemetry");
                               }
                           }
-                          Err(e) => {
-                              warn!("Error reading from C2 client: {}", e);
-                              break;
-                          }
+                          Err(_) => break, // Connection closed by client
                         }
                       }
                     });
@@ -206,10 +204,16 @@ where
                             reason: None,
                         },
                     );
-                    for write_half in client_stream_write_halves.iter_mut() {
-                        if let Err(e) = write_half.write(command.clone()).await {
-                            warn!("Error writing command to C2: {}", e);
+                    let mut idx_to_remove = vec![];
+                    for (idx, write_half) in client_stream_write_halves.iter_mut().enumerate() {
+                        if let Err(_) = write_half.write(command.clone()).await {
+                            // Connection closed by client so clean up
+                            // Reverse order to not mess up indices when removing
+                            idx_to_remove.insert(0, idx);
                         }
+                    }
+                    for idx in idx_to_remove {
+                        client_stream_write_halves.remove(idx);
                     }
                 }
 
@@ -269,9 +273,6 @@ where
                         *active = true;
                       }
                       self.selected_mode = Some(highest_priority_mode.clone());
-
-                    } else {
-                      debug!("Staying in mode: {}", highest_priority_mode);
                     }
                   }
                 }
@@ -292,12 +293,10 @@ mod tests {
         let resolver = Resolver {
             telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
                 Telemetry {
-                    timestamp: 1000,
-                    proximity_m: 150,
+                    pointing_error: 150.0,
                 },
                 Telemetry {
-                    timestamp: 2000,
-                    proximity_m: 50,
+                    pointing_error: 50.0,
                 },
             ]))),
             vars: HashMap::from_iter([
@@ -343,7 +342,7 @@ mod tests {
         assert_eq!(
             Expr::GreaterThan(
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::VariableRef(
                     "a".to_string()
@@ -359,7 +358,7 @@ mod tests {
                     "a".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
             )
             .eval(&resolver)
@@ -425,7 +424,7 @@ mod tests {
                     "b".to_string()
                 )))),
                 Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string()
+                    "pointing_error".to_string()
                 )))),
             )
             .eval(&resolver)

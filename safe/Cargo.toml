@@ -25,3 +25,7 @@ tracing-appender = "0.2"
 redb = "2"
 figment = { version = "0.10", features = ["yaml", "env"] }
 sysinfo = "0.30"
+simvm = { path = "/Users/sebastianwelsh/Development/sedaro/simulation/simvm" } # FIXME
+ordered-float = "5.1.0"
+time = "0.3"
+base64 = "0.22.1"

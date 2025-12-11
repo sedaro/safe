@@ -8,18 +8,26 @@ use tokio_util::codec::LengthDelimitedCodec;
 
 const SOCKET_PATH: &str = "/tmp/safe.sock";
 
+// TOOD: Reference these from safe-common crate
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Telemetry {
-    pub timestamp: u64,
-    pub proximity_m: i32,
+    pub pointing_error: f64,
 }
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct LogsRequest {
+    pub mode: Option<String>,
+    pub level: Option<String>,
+    pub follow: bool,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CommandsRequest {}
 
 /*
 CLI
 - get mode(s) <mode> -o
 - describe mode(s) <mode> <mode>
 - get router -o
-- logs -m <mode> | -r, --tail, -f, --since, --before, --filter
+- logs -m <mode> | -r, --tail, -f, --since, --before, --filter, --level
 - top
 - tx
 - rx
@@ -94,9 +102,9 @@ enum Commands {
     },
     /// Get logs
     Logs {
-        /// Get all Autonomy Modes
-        #[arg(short = 'A', long)]
-        all: bool,
+        /// Get specific Autonomy Mode
+        #[arg(short, long)]
+        mode: Option<String>,
 
         /// Tail the last N lines
         #[arg(short, long)]
@@ -114,6 +122,11 @@ enum Commands {
 
         /// Filter returned logs (TODO)
         filter: Option<String>,
+
+        /// Minimum log level
+        /// e.g., debug, info, warning, error
+        #[arg(short, long)]
+        level: Option<String>,
     },
     /// Transmit over C2
     #[command(alias = "tx")]
@@ -151,19 +164,46 @@ async fn main() -> std::io::Result<()> {
             None => Cli::command().print_help().unwrap(),
         },
         Some(Commands::Logs {
-            all,
+            mode,
             tail,
             follow,
             since,
             before,
             filter,
+            level,
         }) => {
-            println!("{:?} {:?}", all, tail);
+            if tail.is_some() { println!("WARNING: --tail is not yet implemented") }
+            if follow.unwrap_or(false) { println!("WARNING: --follow is not yet implemented") }
+            if since.is_some() { println!("WARNING: --since is not yet implemented") }
+            if before.is_some() { println!("WARNING: --before is not yet implemented") }
+            if filter.is_some() { println!("WARNING: --filter is not yet implemented") }
+            
+            let stream = TcpStream::connect("127.0.0.1:8001").await?;
+            // println!("Connected");
+            let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
+            let request = LogsRequest {
+                mode: mode.clone(),
+                level: level.clone(),
+                follow: follow.unwrap_or(false),
+            };
+            let msg = serde_json::to_string(&request).unwrap();
+            let msg = bincode::serialize(&msg).unwrap();
+            framed_stream.send(msg.into()).await?;
+            loop {
+                let bytes = framed_stream
+                    .next()
+                    .await
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+                    })??;
+                let msg: String = bincode::deserialize(&bytes).unwrap();
+                println!("{}", msg);
+            }
         }
         Some(Commands::Transmit { json }) => {
             // let stream = UnixStream::connect(SOCKET_PATH).await?;
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
-            println!("Connected");
+            // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
 
             let telemetry: Telemetry =
@@ -175,17 +215,21 @@ async fn main() -> std::io::Result<()> {
         Some(Commands::Receive {}) => {
             // let stream = UnixStream::connect(SOCKET_PATH).await?;
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
-            println!("Connected");
+            // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
+            let request = CommandsRequest {};
+            let msg = serde_json::to_string(&request).unwrap();
+            let msg = bincode::serialize(&msg).unwrap();
+            framed_stream.send(msg.into()).await?;
             loop {
-                let msg = framed_stream
+                let bytes = framed_stream
                     .next()
                     .await
                     .ok_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
-                    })?
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())?;
-                println!("Received: {}", msg);
+                    })??;
+                let msg: String = bincode::deserialize(&bytes).unwrap();
+                println!("{}", msg);
             }
         }
         None => Cli::command().print_help().unwrap(),
