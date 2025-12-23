@@ -368,7 +368,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
               // println!("{}", frame.pretty());
               i += 1;
             }        
-            let average_error =pointing_errors.iter().sum::<OrderedFloat<f64>>().0 / (pointing_errors.len() as f64);
+            let average_error = pointing_errors.iter().sum::<OrderedFloat<f64>>().0 / (pointing_errors.len() as f64);
             // println!("{} {} {}", frames.len(), max_speed, average_error);
             println!("{} {} {}", frames.len(), max_speed, max_pointing_error);
             max_speed_observations_clone.lock().await.add(max_speed);
@@ -618,9 +618,7 @@ async fn main() -> Result<()> {
         concurrency: 12,
         simulator: SedaroSimulator::new(
           std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
-          "./target/release/main",
-          None,
-        ),
+        ).timeout(Duration::from_secs_f64(20.0)),
     };
     router.register_autonomy_mode(mode, &config);
 
@@ -671,13 +669,12 @@ Config changes
 
 /*
 - Have a rust-native autonomy mode or two
-- Timeouts on EDSs that are taking too long
 - Implement a way to have background modes which are alerted when they are activated/deactivated
 - Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
+- Support background running modes and foreground
 - Mode transition command purging
 - Try to compile it for Raspberry PI and STM MCU
 - Focus on the EDS integration piece
-- CLI to issue commands over unix socket to Config and C2 interfaces
 - Integrate redb
 - Is it important to guarantee that Modes can't issue commands when Router logic would deactivate them?  Do we need to work out the races here or is this acceptable?
 - Add resiliency and reconnect to Transports which can theoretically drop connections (TCP, Unix sockets, etc.)
