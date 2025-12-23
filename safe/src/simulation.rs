@@ -1,7 +1,7 @@
-use std::env;
+use std::{env, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
+use tokio::{process::Command as TokioCommand, time::timeout};
 use anyhow::Result;
 
 #[derive(Debug, Serialize, Clone)]
@@ -9,32 +9,50 @@ pub struct SedaroSimulator {
   path: std::path::PathBuf,
   command: String,
   args: Vec<String>,
+  timeout: Duration,
 }
 
 impl SedaroSimulator {
-  pub fn new(path: std::path::PathBuf, command: &str, args: Option<Vec<&str>>) -> Self {
+  pub fn new(path: std::path::PathBuf) -> Self {
     SedaroSimulator { 
-      path, 
-      command: command.to_string(), 
-      args: args.unwrap_or_default().into_iter().map(|s| s.to_string()).collect() 
+      path,
+      command: "./target/release/main".to_string(),
+      args: Vec::new(),
+      timeout: Duration::MAX,
     }
   }
+  pub fn command(mut self, command: String) -> Self {
+    self.command = command;
+    self
+  }
+  pub fn args(mut self, args: Vec<String>) -> Self {
+    self.args.extend(args.iter().cloned());
+    self
+  }
+  pub fn timeout(mut self, timeout: Duration) -> Self {
+    self.timeout = timeout;
+    self
+  }
   pub async fn run(&self, duration_days: f64, target_path: &std::path::PathBuf) -> Result<std::process::Output> {
-    let output = TokioCommand::new(&self.command)
-        .args(vec!["--duration", &(duration_days).to_string(), "--target-config", target_path.to_str().unwrap()]) 
-        .args(&self.args)
-        .current_dir(&self.path)
-        // .env("SIMULATION_PATH", self.path.to_str().unwrap())
-        // .env("PYTHONPATH", format!("{}/simulation_python:{}/simulation_buildtime_python:{}/simvm_python:{}", self.path.to_str().unwrap(), self.path.to_str().unwrap(), self.path.to_str().unwrap(), env::var("PYTHONPATH").unwrap_or_default()))
-        .env("PATH", format!("/Users/sebastianwelsh/Development/sedaro/scf/.venv/bin:{}", env::var("PATH").unwrap_or_default()))
-        // .env("SIM_VM_WORKSPACE", self.path.join("generated").to_str().unwrap())
-        // .env("SIM_VM_LOCAL", "1")
-        .env("LANG", "en_US.UTF-8")
-        .env("LC_ALL", "en_US.UTF-8")
-        .env("LC_CTYPE", "en_US.UTF-8")
-        .output()
-        .await?;
-    Ok(output)
+    match timeout(
+        self.timeout.clone(),
+        TokioCommand::new(&self.command)
+          .args(vec!["--duration", &(duration_days).to_string(), "--target-config", target_path.to_str().unwrap()]) 
+          .args(self.args.clone())
+          .current_dir(&self.path)
+          // .env("SIMULATION_PATH", self.path.to_str().unwrap())
+          // .env("PYTHONPATH", format!("{}/simulation_python:{}/simulation_buildtime_python:{}/simvm_python:{}", self.path.to_str().unwrap(), self.path.to_str().unwrap(), self.path.to_str().unwrap(), env::var("PYTHONPATH").unwrap_or_default()))
+          .env("PATH", format!("/Users/sebastianwelsh/Development/sedaro/scf/.venv/bin:{}", env::var("PATH").unwrap_or_default()))
+          // .env("SIM_VM_WORKSPACE", self.path.join("generated").to_str().unwrap())
+          // .env("SIM_VM_LOCAL", "1")
+          .env("LANG", "en_US.UTF-8")
+          .env("LC_ALL", "en_US.UTF-8")
+          .env("LC_CTYPE", "en_US.UTF-8")
+          .output(),
+    ).await {
+      Err(_) => Err(anyhow::anyhow!("Simulation timed out after {:?} seconds", self.timeout.as_secs())),
+      Ok(output) => Ok(output?),
+    }
   }
 }
 
