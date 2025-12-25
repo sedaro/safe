@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 #[derive(Debug)]
 pub enum Error {
@@ -28,7 +28,9 @@ pub struct VariableDefinition<T> {
 
 pub trait Resolvable {
     fn get_variable(&self, name: &str) -> Option<Variable>;
-    fn get_telemetry(&self, name: &str) -> Option<Variable>;
+    fn get_telemetry_point(&self, name: &str) -> Option<Variable>;
+    fn get_telemetry_points(&self, name: &str, points: usize) -> Vec<Variable>;
+    // fn get_telemetry_points_since(&self, name: &str, points: i32) -> Option<<Variable>>;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
@@ -36,6 +38,8 @@ pub enum Value<V> {
     Literal(V),
     VariableRef(String),
     TelemetryRef(String),
+    AverageTelemetryRef{ name: String, points: usize, },
+    // AverageSinceTelemetryRef{ name: String, todo: f64, },
 }
 impl Value<String> {
     fn resolve_string(&self, ctx: &impl Resolvable) -> Result<String, Error> {
@@ -46,10 +50,17 @@ impl Value<String> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedVariable(name.clone())),
             },
-            Value::TelemetryRef(name) => match ctx.get_telemetry(name) {
+            Value::TelemetryRef(name) => match ctx.get_telemetry_point(name) {
                 Some(Variable::String(v)) => v.resolve_string(ctx),
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
+            },
+            Value::AverageTelemetryRef{name, points} => {
+                let points = ctx.get_telemetry_points(name, *points);
+                if points.is_empty() {
+                  return Err(Error::UndefinedTelemetry(name.clone()));
+                }
+                unimplemented!()
             },
         }
     }
@@ -63,10 +74,26 @@ impl Value<f64> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedVariable(name.clone())),
             },
-            Value::TelemetryRef(name) => match ctx.get_telemetry(name) {
+            Value::TelemetryRef(name) => match ctx.get_telemetry_point(name) {
                 Some(Variable::Float64(v)) => v.resolve_f64(ctx),
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
+            },
+            Value::AverageTelemetryRef{name, points} => {
+                let points = ctx.get_telemetry_points(name, *points);
+                if points.is_empty() {
+                  return Err(Error::UndefinedTelemetry(name.clone()));
+                }
+                let mut sum = 0.0;
+                for point in &points {
+                  match point {
+                    Variable::Float64(v) => {
+                      sum += v.resolve_f64(ctx)?;
+                    },
+                    _ => return Err(Error::TypeMismatch),
+                  }
+                }
+                Ok(sum / (points.len() as f64))
             },
         }
     }
@@ -80,10 +107,26 @@ impl Value<bool> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedVariable(name.clone())),
             },
-            Value::TelemetryRef(name) => match ctx.get_telemetry(name) {
+            Value::TelemetryRef(name) => match ctx.get_telemetry_point(name) {
                 Some(Variable::Bool(v)) => v.resolve_bool(ctx),
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
+            },
+            Value::AverageTelemetryRef{name, points} => {
+                let points = ctx.get_telemetry_points(name, *points);
+                if points.is_empty() {
+                  return Err(Error::UndefinedTelemetry(name.clone()));
+                }
+                let mut sum = 0.0;
+                for point in &points {
+                  match point {
+                    Variable::Bool(v) => {
+                      sum += if v.resolve_bool(ctx)? { 1.0 } else { 0.0 };
+                    },
+                    _ => return Err(Error::TypeMismatch),
+                  }
+                }
+                Ok((sum / (points.len() as f64)) >= 0.5)
             },
         }
     }
@@ -134,6 +177,7 @@ pub enum Expr {
     GreaterThan(Box<Expr>, Box<Expr>),
     LessThan(Box<Expr>, Box<Expr>),
     Equal(Box<Expr>, Box<Expr>),
+
 }
 impl Expr {
     // TODO: Write comprehensive unit tests
