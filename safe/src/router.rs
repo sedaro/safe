@@ -50,7 +50,7 @@ pub struct Resolver {
     vars: HashMap<String, Variable>,
 }
 impl Resolvable for Resolver {
-    fn get_telemetry(&self, var: &str) -> Option<Variable> {
+    fn get_telemetry_point(&self, var: &str) -> Option<Variable> {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         if let Some(latest_telem) = telem_buffer.front() {
             match var {
@@ -65,6 +65,25 @@ impl Resolvable for Resolver {
         } else {
             None
         }
+    }
+    fn get_telemetry_points(&self, var: &str, points: usize) -> Vec<Variable> {
+        let telem_buffer = self.telem_buffer.lock().unwrap();
+        let mut result = Vec::new();
+        for telem_point in telem_buffer.range(..points) {
+          match var {
+                "pointing_error" => result.push(Variable::Float64(Value::Literal(
+                    telem_point.pointing_error as f64,
+                ))),
+                "in_sunlight" => result.push(Variable::Bool(Value::Literal(
+                    telem_point.in_sunlight as bool,
+                ))),
+                // "timestamp" => Some(Variable::Float64(Value::Literal(
+                //     latest_telem.timestamp as f64,
+                // ))),
+                _ => (),
+            }
+        }
+        result
     }
     fn get_variable(&self, var: &str) -> Option<Variable> {
         self.vars.get(var).cloned()
@@ -293,15 +312,29 @@ mod tests {
         let resolver = Resolver {
             telem_buffer: Arc::new(Mutex::new(VecDeque::from(vec![
                 Telemetry {
-                    pointing_error: 150.0,
+                  pointing_error: 1.0,
+                  in_sunlight: true,
                 },
                 Telemetry {
-                    pointing_error: 50.0,
+                  pointing_error: 2.0,
+                  in_sunlight: true,
+                },
+                Telemetry {
+                  pointing_error: 3.0,
+                  in_sunlight: false,
+                },
+                Telemetry {
+                  pointing_error: 3.0,
+                  in_sunlight: false,
+                },
+                Telemetry {
+                  pointing_error: 3.0,
+                  in_sunlight: false,
                 },
             ]))),
             vars: HashMap::from_iter([
-                ("a".into(), Variable::Float64(Value::Literal(49.0))),
-                ("b".into(), Variable::Bool(Value::Literal(true))),
+                ("a".into(), Variable::Float64(Value::Literal(0.9))),
+                ("b".into(), Variable::Bool(Value::Literal(false))),
                 (
                     "c".into(),
                     Variable::String(Value::Literal("test".to_string())),
@@ -309,6 +342,12 @@ mod tests {
             ]),
         };
 
+        // Assert understanding of VecDeque
+        assert_eq!(
+          resolver.get_telemetry_point("pointing_error"),
+          Some(Variable::Float64(Value::Literal(1.0)))
+        );
+
         assert_eq!(
             Expr::GreaterThan(
                 Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
@@ -364,6 +403,49 @@ mod tests {
             .eval(&resolver)
             .unwrap(),
             false
+        );
+        
+        assert_eq!(
+            Expr::Equal(
+                Box::new(Expr::Term(Variable::Float64(Value::Literal(
+                    1.5
+                )))),
+                Box::new(Expr::Term(Variable::Float64(Value::AverageTelemetryRef{
+                    name: "pointing_error".to_string(),
+                    points: 2,
+                }))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Equal(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(
+                    true
+                )))),
+                Box::new(Expr::Term(Variable::Bool(Value::AverageTelemetryRef{
+                    name: "in_sunlight".to_string(),
+                    points: 3,
+                }))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Equal(
+                Box::new(Expr::Term(Variable::Bool(Value::Literal(
+                    false
+                )))),
+                Box::new(Expr::Term(Variable::Bool(Value::AverageTelemetryRef{
+                    name: "in_sunlight".to_string(),
+                    points: 5,
+                }))),
+            )
+            .eval(&resolver)
+            .unwrap(),
+            true
         );
 
         assert_eq!(
@@ -406,6 +488,13 @@ mod tests {
             Expr::Term(Variable::Float64(Value::Literal(1.0)))
                 .eval(&resolver)
                 .unwrap(),
+            true
+        );
+        assert_eq!(
+            Expr::Term(Variable::Bool(Value::AverageTelemetryRef{
+                name: "in_sunlight".to_string(),
+                points: 3,
+            })).eval(&resolver).unwrap(),
             true
         );
 

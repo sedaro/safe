@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct Telemetry {
     // pub timestamp: u64,
     pub pointing_error: f64,
+    pub in_sunlight: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
