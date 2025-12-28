@@ -5,7 +5,7 @@ use futures::{
     SinkExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, fmt::Display, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -47,7 +47,7 @@ where
 }
 
 #[async_trait]
-pub trait Transport<R, T>: Send + Sync
+pub trait Transport<R, T>: Send + Sync + Display
 where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
@@ -236,6 +236,16 @@ where
     }
 }
 
+impl<R, T> Display for UnixTransport<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Unix Socket {}", self.path.as_str())
+    }
+}
+
 // ============================================================================
 // TCP Socket
 // ============================================================================
@@ -352,7 +362,7 @@ pub struct TcpTransport<R, T> {
 }
 
 impl<R, T> TcpTransport<R, T> {
-    pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
+    pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> { // TODO: Rename to try_new for all transports which return Result
         let full_address = format!("{address}:{port}");
         let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
         let s = Self {
@@ -398,6 +408,16 @@ where
             _r: std::marker::PhantomData,
             _t: std::marker::PhantomData,
         }
+    }
+}
+
+impl<R, T> Display for TcpTransport<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TCP Socket {}:{}", self.address, self.port)
     }
 }
 
@@ -536,7 +556,176 @@ where
     }
 }
 
+impl<R, T> Display for MpscTransport<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MPSC Channel")
+    }
+}
+
+// ============================================================================
+// Test Transport (for unit testing only) - implemented on top of MpscTransport
+// ============================================================================
+
+pub struct TestReadHalf<R> {
+    wrapped: Box<dyn ReadHalf<R>>,
+    queue: Arc<Mutex<VecDeque<R>>>,
+}
+#[async_trait]
+impl<R> ReadHalf<R> for TestReadHalf<R>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+{
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let value = self.wrapped.read().await;
+        if let Ok(ref value) = value {
+          let mut q = self.queue.lock().await;
+          q.push_back(value.clone());
+        }
+        value
+    }
+}
+pub struct TestWriteHalf<T> {
+    wrapped: Box<dyn WriteHalf<T>>,
+    queue: Arc<Mutex<VecDeque<T>>>,
+}
+#[async_trait]
+impl<T> WriteHalf<T> for TestWriteHalf<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+{
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        {
+            let mut q = self.queue.lock().await;
+            q.push_back(msg.clone());
+        }
+        self.wrapped.write(msg).await
+    }
+}
+
+pub struct TestStream<R, T> {
+    wrapped: MpscStream<R, T>,
+    rx_queue: Arc<Mutex<VecDeque<R>>>,
+    tx_queue: Arc<Mutex<VecDeque<T>>>,
+}
+
+#[async_trait]
+impl<R, T> Stream<R, T> for TestStream<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+{
+    async fn read(&mut self) -> Result<R, std::io::Error> {
+        let value = self.wrapped.read().await;
+        if let Ok(ref value) = value {
+          let mut q = self.rx_queue.lock().await;
+          q.push_back(value.clone());
+        }
+        value
+    }
+
+    async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
+        {
+            let mut q = self.tx_queue.lock().await;
+            q.push_back(msg.clone());
+        }
+        self.wrapped.write(msg).await
+    }
+    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+        let (rx_wrapped, tx_wrapped) = self.wrapped.split();
+        (
+          TestReadHalf { wrapped: Box::new(rx_wrapped), queue: self.rx_queue.clone() }, 
+          TestWriteHalf { wrapped: Box::new(tx_wrapped), queue: self.tx_queue.clone() }
+        )
+    }
+}
+
+pub struct TestTransportHandle<R, T> {
+    wrapped: MpscTransportHandle<R, T>,
+}
+#[async_trait]
+impl<R, T> TransportHandle<R, T> for TestTransportHandle<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+{
+    type ClientStreamType = TestStream<T, R>;
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        self.wrapped.connect().await.map(|wrapped_stream| TestStream {
+            wrapped: wrapped_stream,
+            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+}
+
+pub struct TestTransport<R, T> {
+    wrapped: MpscTransport<R, T>, // TODO: Make generic to wrap any other transport type
+    tx_queue: Arc<Mutex<VecDeque<T>>>,
+    rx_queue: Arc<Mutex<VecDeque<R>>>,
+}
+
+impl<R, T> TestTransport<R, T>
+where
+    R: Clone,
+    T: Clone,
+{
+    pub fn new(buffer: usize) -> Self {
+        Self {
+            wrapped: MpscTransport::new(buffer),
+            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl<R, T> Transport<R, T> for TestTransport<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
+{
+    type ServerStreamType = TestStream<R, T>;
+    type ClientStreamType = TestStream<T, R>;
+    type TransportHandleType = TestTransportHandle<R, T>;
+    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+        self.wrapped.accept().await.map(|wrapped_stream| TestStream {
+            wrapped: wrapped_stream,
+            rx_queue: self.rx_queue.clone(),
+            tx_queue: self.tx_queue.clone(),
+        })
+    }
+    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+        self.wrapped.connect().await.map(|wrapped_stream| TestStream {
+            wrapped: wrapped_stream,
+            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+    fn handle(&self) -> Self::TransportHandleType {
+        let wrapped = self.wrapped.handle();
+        TestTransportHandle {
+            wrapped,
+        }
+    }
+}
+
+impl<R, T> Display for TestTransport<R, T>
+where
+    R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+    T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TestTransport({})", self.wrapped)
+    }
+}
+
 mod tests {
+    use std::collections::vec_deque;
+
     use super::*;
     use futures::lock;
     use serde::{Deserialize, Serialize};
@@ -796,6 +985,45 @@ mod tests {
             .await
             .unwrap();
         assert!(assert_perf(transport).await < 60.0); // Expect under 60 µs RTT
+    }
+
+    #[tokio::test]
+    async fn test_test_transport() {
+        let mut server = TestTransport::<RxMsg, TxMsg>::new(1024);
+        let handle = server.handle();
+        let server_rx_queue = server.rx_queue.clone();
+        let server_tx_queue = server.tx_queue.clone();
+        let mut client_stream = handle.connect().await.unwrap();
+        let client_rx_queue = client_stream.rx_queue.clone();
+        let client_tx_queue = client_stream.tx_queue.clone();
+        let mut server_stream = server.accept().await.unwrap();
+
+        client_stream.write(RxMsg { value: 7 }).await.unwrap();
+        server_stream.write(TxMsg { value: 70 }).await.unwrap();
+        client_stream.write(RxMsg { value: 8 }).await.unwrap();
+        server_stream.write(TxMsg { value: 80 }).await.unwrap();
+        assert_eq!(server_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
+        assert_eq!(client_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
+        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![]); // queue empty until message read, which is good
+        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![]); // queue empty until message read, which is good
+        
+        // Test server reads
+        server_stream.read().await.unwrap();
+        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }]);
+        server_stream.read().await.unwrap();
+        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
+        
+        // Test client reads
+        client_stream.read().await.unwrap();
+        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }]);
+        client_stream.read().await.unwrap();
+        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
+        
+        // Assert final state of queues is as expected
+        assert_eq!(client_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
+        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
+        assert_eq!(server_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
+        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
     }
 }
 

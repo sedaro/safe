@@ -132,6 +132,10 @@ where
             },
         }
     }
+    pub fn c2_transport(mut self, transport: TR) -> Self {
+      self.transport = transport;
+      self
+    }
 
     pub fn register_autonomy_mode<M: AutonomyMode>(&mut self, mut mode: M, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) =
