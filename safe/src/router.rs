@@ -90,12 +90,9 @@ impl Resolvable for Resolver {
     }
 }
 
-pub struct Router<TR>
-where
-    TR: Transport<Telemetry, Command>,
-{
+pub struct Router {
     engagement_mode: EngagementMode,
-    transport: TR,
+    transport: Box<dyn Transport<Telemetry, Command>>,
     tx_telem_to_modes: broadcast::Sender<Telemetry>,
     rx_telem_in_modes: broadcast::Receiver<Telemetry>,
     observability: Arc<obs::ObservabilitySubsystem>,
@@ -104,12 +101,9 @@ where
     resolver: Resolver,
 }
 
-impl<TR> Router<TR>
-where
-    TR: Transport<Telemetry, Command>,
-{
+impl Router {
     pub fn new(
-        transport: TR,
+        transport: Box<dyn Transport<Telemetry, Command>>,
         observability: Arc<obs::ObservabilitySubsystem>,
         config: &Config,
     ) -> Self {
@@ -132,8 +126,8 @@ where
             },
         }
     }
-    pub fn c2_transport(mut self, transport: TR) -> Self {
-      self.transport = transport;
+    pub fn c2_transport(mut self, transport: impl Transport<Telemetry, Command> + 'static) -> Self {
+      self.transport = Box::new(transport);
       self
     }
 
@@ -179,7 +173,7 @@ where
                 Ok(stream) = self.transport.accept() => {
                     info!("C2 connected to Router");
                     let (mut read_half, write_half) = stream.split();
-                    client_stream_write_halves.push(Box::new(write_half));
+                    client_stream_write_halves.push(write_half);
 
                     // Spawn read handler
                     let observability = self.observability.clone();

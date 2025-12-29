@@ -5,7 +5,7 @@ use futures::{
     SinkExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fmt::Display, sync::Arc};
+use std::{any::Any, collections::VecDeque, fmt::Display, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -26,14 +26,14 @@ where
 }
 
 #[async_trait]
-pub trait Stream<R, T>: Send + Sync + 'static
+pub trait Stream<R, T>: Send + Sync + 'static + Any
 where
     R: for<'de> Deserialize<'de> + Send + 'static,
     T: Serialize + Send + 'static,
 {
     async fn read(&mut self) -> Result<R, std::io::Error>;
     async fn write(&mut self, msg: T) -> Result<(), std::io::Error>;
-    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>);
+    fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>);
 }
 
 #[async_trait]
@@ -42,8 +42,7 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
-    type ClientStreamType: Stream<T, R> + Send;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error>;
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error>;
 }
 
 #[async_trait]
@@ -52,19 +51,16 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
-    type ServerStreamType: Stream<R, T> + Send;
-    type ClientStreamType: Stream<T, R> + Send;
-    type TransportHandleType: TransportHandle<R, T> + Send;
-    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error>;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error>;
+    async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error>;
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error>;
     async fn channel(
         &mut self,
-    ) -> Result<(Self::ClientStreamType, Self::ServerStreamType), std::io::Error> {
+    ) -> Result<(Box<dyn Stream<T, R>>, Box<dyn Stream<R, T>>), std::io::Error> {
         let client_stream = self.connect().await?; // Initiate client connection
         let server_stream = self.accept().await?; // Accept client connection
         Ok((client_stream, server_stream))
     }
-    fn handle(&self) -> Self::TransportHandleType;
+    fn handle(&self) -> Box<dyn TransportHandle<R, T>>;
 }
 
 // ============================================================================
@@ -129,17 +125,17 @@ where
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.framed_stream.send(bytes.into()).await
     }
-    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+    fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
         let (write, read) = self.framed_stream.split();
         (
-            UnixReadHalf {
+            Box::new(UnixReadHalf {
                 inner: read,
                 _r: std::marker::PhantomData,
-            },
-            UnixWriteHalf {
+            }),
+            Box::new(UnixWriteHalf {
                 inner: write,
                 _t: std::marker::PhantomData,
-            },
+            }),
         )
     }
 }
@@ -156,14 +152,13 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ClientStreamType = UnixStream<T, R>;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         match tokio::net::UnixStream::connect(self.path.clone()).await {
-            Ok(stream) => Ok(UnixStream {
+            Ok(stream) => Ok(Box::new(UnixStream {
                 framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
                 _r: std::marker::PhantomData,
                 _t: std::marker::PhantomData,
-            }),
+            })),
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 Err(e)
@@ -208,31 +203,28 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ServerStreamType = UnixStream<R, T>;
-    type ClientStreamType = UnixStream<T, R>;
-    type TransportHandleType = UnixTransportHandle<R, T>;
-    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+    async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error> {
         match self.listener.accept().await {
-            Ok((stream, _)) => Ok(UnixStream {
+            Ok((stream, _)) => Ok(Box::new(UnixStream {
                 framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
                 _r: std::marker::PhantomData,
                 _t: std::marker::PhantomData,
-            }),
+            })),
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 Err(e)
             }
         }
     }
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         self.handle().connect().await
     }
-    fn handle(&self) -> Self::TransportHandleType {
-        UnixTransportHandle {
+    fn handle(&self) -> Box<dyn TransportHandle<R, T>> {
+        Box::new(UnixTransportHandle {
             path: self.path.clone(),
             _r: std::marker::PhantomData,
             _t: std::marker::PhantomData,
-        }
+        })
     }
 }
 
@@ -309,17 +301,17 @@ where
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.framed_stream.send(bytes.into()).await
     }
-    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+    fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
         let (write, read) = self.framed_stream.split();
         (
-            TcpReadHalf {
+            Box::new(TcpReadHalf {
                 inner: read,
                 _r: std::marker::PhantomData,
-            },
-            TcpWriteHalf {
+            }),
+            Box::new(TcpWriteHalf {
                 inner: write,
                 _t: std::marker::PhantomData,
-            },
+            }),
         )
     }
 }
@@ -336,15 +328,14 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ClientStreamType = TcpStream<T, R>;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         let full_address = format!("{}:{}", self.address, self.port);
         match tokio::net::TcpStream::connect(full_address.clone()).await {
-            Ok(stream) => Ok(TcpStream {
+            Ok(stream) => Ok(Box::new(TcpStream {
                 framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
                 _r: std::marker::PhantomData,
                 _t: std::marker::PhantomData,
-            }),
+            })),
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 Err(e)
@@ -382,32 +373,29 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ServerStreamType = TcpStream<R, T>;
-    type ClientStreamType = TcpStream<T, R>;
-    type TransportHandleType = TcpTransportHandle<R, T>;
-    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+    async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error> {
         match self.listener.accept().await {
-            Ok((stream, _)) => Ok(TcpStream {
+            Ok((stream, _)) => Ok(Box::new(TcpStream {
                 framed_stream: Framed::new(stream, LengthDelimitedCodec::new()),
                 _r: std::marker::PhantomData,
                 _t: std::marker::PhantomData,
-            }),
+            })),
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 Err(e)
             }
         }
     }
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         self.handle().connect().await
     }
-    fn handle(&self) -> Self::TransportHandleType {
-        TcpTransportHandle {
+    fn handle(&self) -> Box<dyn TransportHandle<R, T>> {
+        Box::new(TcpTransportHandle {
             address: self.address.clone(),
             port: self.port,
             _r: std::marker::PhantomData,
             _t: std::marker::PhantomData,
-        }
+        })
     }
 }
 
@@ -480,8 +468,8 @@ where
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))
     }
-    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
-        (MpscReadHalf { rx: self.rx }, MpscWriteHalf { tx: self.tx })
+    fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
+        (Box::new(MpscReadHalf { rx: self.rx }), Box::new(MpscWriteHalf { tx: self.tx }))
     }
 }
 
@@ -495,16 +483,15 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ClientStreamType = MpscStream<T, R>;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         let (tx_to_client, rx_in_client) = tokio::sync::mpsc::channel::<T>(self.buffer);
         let (tx_from_client, rx_from_client) = tokio::sync::mpsc::channel::<R>(self.buffer);
         let mut pending = self.pending.lock().await;
         pending.push_back((tx_to_client, rx_from_client));
-        Ok(MpscStream {
+        Ok(Box::new(MpscStream {
             rx: rx_in_client,
             tx: tx_from_client,
-        })
+        }))
     }
 }
 
@@ -528,10 +515,7 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync,
 {
-    type ServerStreamType = MpscStream<R, T>;
-    type ClientStreamType = MpscStream<T, R>;
-    type TransportHandleType = MpscTransportHandle<R, T>;
-    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
+    async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error> {
         let (tx_to_client, rx_from_client) = loop {
             let mut pending = self.pending.lock().await;
             if let Some(conn) = pending.pop_front() {
@@ -540,19 +524,19 @@ where
             drop(pending);
             tokio::task::yield_now().await;
         };
-        Ok(MpscStream {
+        Ok(Box::new(MpscStream {
             rx: rx_from_client,
             tx: tx_to_client,
-        })
+        }))
     }
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
         self.handle().connect().await
     }
-    fn handle(&self) -> Self::TransportHandleType {
-        MpscTransportHandle {
+    fn handle(&self) -> Box<dyn TransportHandle<R, T>> {
+        Box::new(MpscTransportHandle {
             buffer: self.buffer,
             pending: self.pending.clone(),
-        }
+        })
     }
 }
 
@@ -607,7 +591,7 @@ where
 }
 
 pub struct TestStream<R, T> {
-    wrapped: MpscStream<R, T>,
+    wrapped: Box<dyn Stream<R, T>>,
     rx_queue: Arc<Mutex<VecDeque<R>>>,
     tx_queue: Arc<Mutex<VecDeque<T>>>,
 }
@@ -634,17 +618,17 @@ where
         }
         self.wrapped.write(msg).await
     }
-    fn split(self) -> (impl ReadHalf<R>, impl WriteHalf<T>) {
+    fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
         let (rx_wrapped, tx_wrapped) = self.wrapped.split();
         (
-          TestReadHalf { wrapped: Box::new(rx_wrapped), queue: self.rx_queue.clone() }, 
-          TestWriteHalf { wrapped: Box::new(tx_wrapped), queue: self.tx_queue.clone() }
+          Box::new(TestReadHalf { wrapped: rx_wrapped, queue: self.rx_queue.clone() }), 
+          Box::new(TestWriteHalf { wrapped: tx_wrapped, queue: self.tx_queue.clone() })
         )
     }
 }
 
 pub struct TestTransportHandle<R, T> {
-    wrapped: MpscTransportHandle<R, T>,
+    wrapped: Box<dyn TransportHandle<R, T>>,
 }
 #[async_trait]
 impl<R, T> TransportHandle<R, T> for TestTransportHandle<R, T>
@@ -652,13 +636,12 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
 {
-    type ClientStreamType = TestStream<T, R>;
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-        self.wrapped.connect().await.map(|wrapped_stream| TestStream {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
+        self.wrapped.connect().await.map(|wrapped_stream| Box::new(TestStream {
             wrapped: wrapped_stream,
             rx_queue: Arc::new(Mutex::new(VecDeque::new())),
             tx_queue: Arc::new(Mutex::new(VecDeque::new())),
-        })
+        }) as Box<dyn Stream<T, R>>)
     }
 }
 
@@ -688,28 +671,25 @@ where
     R: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
 {
-    type ServerStreamType = TestStream<R, T>;
-    type ClientStreamType = TestStream<T, R>;
-    type TransportHandleType = TestTransportHandle<R, T>;
-    async fn accept(&mut self) -> Result<Self::ServerStreamType, std::io::Error> {
-        self.wrapped.accept().await.map(|wrapped_stream| TestStream {
+    async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error> {
+        self.wrapped.accept().await.map(|wrapped_stream| Box::new(TestStream {
             wrapped: wrapped_stream,
             rx_queue: self.rx_queue.clone(),
             tx_queue: self.tx_queue.clone(),
-        })
+        }) as Box<dyn Stream<R, T>>)
     }
-    async fn connect(&self) -> Result<Self::ClientStreamType, std::io::Error> {
-        self.wrapped.connect().await.map(|wrapped_stream| TestStream {
+    async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
+        self.wrapped.connect().await.map(|wrapped_stream| Box::new(TestStream {
             wrapped: wrapped_stream,
             rx_queue: Arc::new(Mutex::new(VecDeque::new())),
             tx_queue: Arc::new(Mutex::new(VecDeque::new())),
-        })
+        }) as Box<dyn Stream<T, R>>)
     }
-    fn handle(&self) -> Self::TransportHandleType {
+    fn handle(&self) -> Box<dyn TransportHandle<R, T>> {
         let wrapped = self.wrapped.handle();
-        TestTransportHandle {
+        Box::new(TestTransportHandle {
             wrapped,
-        }
+        })
     }
 }
 
@@ -724,7 +704,7 @@ where
 }
 
 mod tests {
-    use std::collections::vec_deque;
+    use std::{any::Any, collections::vec_deque};
 
     use super::*;
     use futures::lock;
@@ -994,8 +974,9 @@ mod tests {
         let server_rx_queue = server.rx_queue.clone();
         let server_tx_queue = server.tx_queue.clone();
         let mut client_stream = handle.connect().await.unwrap();
-        let client_rx_queue = client_stream.rx_queue.clone();
-        let client_tx_queue = client_stream.tx_queue.clone();
+        let downcasted_client_stream = (&*client_stream as &dyn Any).downcast_ref::<TestStream<TxMsg, RxMsg>>().unwrap();
+        let client_rx_queue = downcasted_client_stream.rx_queue.clone();
+        let client_tx_queue = downcasted_client_stream.tx_queue.clone();
         let mut server_stream = server.accept().await.unwrap();
 
         client_stream.write(RxMsg { value: 7 }).await.unwrap();
