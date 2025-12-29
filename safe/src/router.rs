@@ -10,7 +10,7 @@ use crate::transports::WriteHalf;
 use anyhow::Result;
 use async_trait::async_trait;
 use core::panic;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -25,14 +25,18 @@ enum AutonomyModeSignal {
 }
 
 #[async_trait]
-pub trait AutonomyMode: Send + Sync + Serialize + 'static {
+pub trait AutonomyMode<T, C>: Send + Sync + Serialize + 'static
+where
+  T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static,
+{
     fn name(&self) -> String;
     fn activation(&self) -> Option<Activation>;
     fn priority(&self) -> u8;
     async fn run(
         &mut self,
-        mut rx_telem: broadcast::Receiver<Telemetry>,
-        tx_command: mpsc::Sender<Command>,
+        mut rx_telem: broadcast::Receiver<T>,
+        tx_command: mpsc::Sender<C>,
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()>;
 }
@@ -45,21 +49,23 @@ pub struct ManagedAutonomyMode {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
-pub struct Resolver {
-    telem_buffer: Arc<Mutex<VecDeque<Telemetry>>>,
+pub struct Resolver<T> {
+    telem_buffer: Arc<Mutex<VecDeque<T>>>,
     vars: HashMap<String, Variable>,
 }
-impl Resolvable for Resolver {
+impl<T> Resolvable for Resolver<T> 
+where 
+  T: Serialize,
+{
     fn get_telemetry_point(&self, var: &str) -> Option<Variable> {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         if let Some(latest_telem) = telem_buffer.front() {
-            match var {
-                "pointing_error" => Some(Variable::Float64(Value::Literal(
-                    latest_telem.pointing_error as f64,
-                ))),
-                // "timestamp" => Some(Variable::Float64(Value::Literal(
-                //     latest_telem.timestamp as f64,
-                // ))),
+            let map = serde_json::to_value(latest_telem).ok()?; // TODO: Figure out a better way
+            match map.get(var).cloned() {
+                Some(serde_json::Value::Number(n)) => n.as_f64().map(|v| Variable::Float64(Value::Literal(v))),
+                Some(serde_json::Value::Bool(b)) => Some(Variable::Bool(Value::Literal(b))),
+                Some(serde_json::Value::String(s)) => Some(Variable::String(Value::Literal(s))),
+                None => None,
                 _ => None,
             }
         } else {
@@ -70,17 +76,21 @@ impl Resolvable for Resolver {
         let telem_buffer = self.telem_buffer.lock().unwrap();
         let mut result = Vec::new();
         for telem_point in telem_buffer.range(..points) {
-          match var {
-                "pointing_error" => result.push(Variable::Float64(Value::Literal(
-                    telem_point.pointing_error as f64,
-                ))),
-                "in_sunlight" => result.push(Variable::Bool(Value::Literal(
-                    telem_point.in_sunlight as bool,
-                ))),
-                // "timestamp" => Some(Variable::Float64(Value::Literal(
-                //     latest_telem.timestamp as f64,
-                // ))),
-                _ => (),
+            let map = serde_json::to_value(telem_point).unwrap(); // TODO: Figure out a better way
+            match map.get(var).cloned() {
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(v) = n.as_f64() {
+                        result.push(Variable::Float64(Value::Literal(v)));
+                    }
+                }
+                Some(serde_json::Value::Bool(b)) => {
+                    result.push(Variable::Bool(Value::Literal(b)));
+                }
+                Some(serde_json::Value::String(s)) => {
+                    result.push(Variable::String(Value::Literal(s)));
+                }
+                None => {}
+                _ => {}
             }
         }
         result
@@ -90,21 +100,25 @@ impl Resolvable for Resolver {
     }
 }
 
-pub struct Router {
+pub struct Router<T, C> {
     engagement_mode: EngagementMode,
-    transport: Box<dyn Transport<Telemetry, Command>>,
-    tx_telem_to_modes: broadcast::Sender<Telemetry>,
-    rx_telem_in_modes: broadcast::Receiver<Telemetry>,
-    observability: Arc<obs::ObservabilitySubsystem>,
+    transport: Box<dyn Transport<T, C>>,
+    tx_telem_to_modes: broadcast::Sender<T>,
+    rx_telem_in_modes: broadcast::Receiver<T>,
+    observability: Arc<obs::ObservabilitySubsystem<T, C>>,
     selected_mode: Option<String>,
-    autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<Command>)>,
-    resolver: Resolver,
+    autonomy_modes: HashMap<String, (ManagedAutonomyMode, mpsc::Receiver<C>)>,
+    resolver: Resolver<T>,
 }
 
-impl Router {
+impl<T, C> Router<T, C> 
+where
+  T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + std::marker::Sync,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + std::marker::Sync,
+{
     pub fn new(
-        transport: Box<dyn Transport<Telemetry, Command>>,
-        observability: Arc<obs::ObservabilitySubsystem>,
+        transport: Box<dyn Transport<T, C>>,
+        observability: Arc<obs::ObservabilitySubsystem<T, C>>,
         config: &Config,
     ) -> Self {
         debug!("Initializing Router with config: {:?}", config.router);
@@ -126,14 +140,14 @@ impl Router {
             },
         }
     }
-    pub fn c2_transport(mut self, transport: impl Transport<Telemetry, Command> + 'static) -> Self {
+    pub fn c2_transport(mut self, transport: impl Transport<T, C> + 'static) -> Self {
       self.transport = Box::new(transport);
       self
     }
 
-    pub fn register_autonomy_mode<M: AutonomyMode>(&mut self, mut mode: M, config: &Config) {
+    pub fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mut mode: M, config: &Config) {
         let (tx_command_to_router, rx_command_from_modes) =
-            mpsc::channel::<Command>(config.router.command_channel_buffer_size);
+            mpsc::channel::<C>(config.router.command_channel_buffer_size);
         let mode_name = mode.name().clone();
         let priority = mode.priority().clone();
         let activation = mode.activation().clone();
@@ -166,7 +180,7 @@ impl Router {
         info!("Router is starting");
         let mut routing_interval =
             time::interval(std::time::Duration::from_secs(config.router.period_seconds));
-        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<Command> + Send>>::new();
+        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<C> + Send>>::new();
         loop {
             tokio::select! {
                 // Accept new connections from C2
