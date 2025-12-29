@@ -18,7 +18,7 @@ use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
 use observability as obs;
 use router::{AutonomyMode, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use simvm::sv::data::{Data, FloatValue};
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use tracing_subscriber::EnvFilter;
@@ -54,7 +54,7 @@ struct CollisionAvoidanceAutonomyMode {
     activation: Option<Activation>,
 }
 #[async_trait]
-impl AutonomyMode for CollisionAvoidanceAutonomyMode {
+impl AutonomyMode<Telemetry, Command> for CollisionAvoidanceAutonomyMode {
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -98,7 +98,7 @@ struct NominalOperationsAutonomyMode {
     activation: Option<Activation>,
 }
 #[async_trait]
-impl AutonomyMode for NominalOperationsAutonomyMode {
+impl AutonomyMode<Telemetry, Command> for NominalOperationsAutonomyMode {
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -150,7 +150,7 @@ struct GenericUncertaintyQuantificationAutonomyMode {
     simulator: SedaroSimulator,
 }
 #[async_trait]
-impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
+impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutonomyMode {
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -436,7 +436,7 @@ impl AutonomyMode for GenericUncertaintyQuantificationAutonomyMode {
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    let mut flight = Flight::new().await
+    let mut flight: Flight<Telemetry, Command> = Flight::new().await
       .client_to_c2_transport(
         TcpTransport::new("127.0.0.1", 8001).await.unwrap_or_else(|e| {
           panic!("Unable to initialized TCP transport: {}", e);
@@ -535,96 +535,100 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// mod tests {
-//     use std::sync::Arc;
+mod tests {
+    use std::sync::Arc;
 
-//     use async_trait::async_trait;
-//     use serde::{Deserialize, Serialize};
-//     use tokio::sync::{broadcast, mpsc};
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::{broadcast, mpsc};
+    use anyhow::Result;
 
-//     use crate::{definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{TestTransport, Transport}};
+    use crate::{definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{TestTransport, Transport}};
 
-//     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-//     struct TestCommand {
-//         value: String,
-//     }
-//     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-//     struct TestTelemetry {
-//         value: String,
-//     }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct TestCommand {
+        value: String,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct TestTelemetry {
+        value: String,
+    }
 
-//     #[derive(Debug, Serialize)]
-//     struct TestAutonomyMode {
-//         name: String,
-//         priority: u8,
-//         activation: Option<Activation>,
-//     }
-//     #[async_trait]
-//     impl AutonomyMode for TestAutonomyMode {
-//         fn name(&self) -> String {
-//             self.name.clone()
-//         }
-//         fn priority(&self) -> u8 {
-//             self.priority
-//         }
-//         fn activation(&self) -> Option<Activation> {
-//             self.activation.clone()
-//         }
-//         async fn run(
-//             &mut self,
-//             mut rx_telem: broadcast::Receiver<TestTelemetry>,
-//             tx_command: mpsc::Sender<TestCommand>,
-//             active: Arc<tokio::sync::Mutex<bool>>,
-//         ) -> Result<()> {
-//             loop {
-//                 if let Ok(telemetry) = rx_telem.recv().await {
-//                   tx_command
-//                       .send(TestCommand {
-//                           value: format!("{} received {}", self.name(), telemetry.value),
-//                       })
-//                       .await?;
-//                 }
-//             }
-//         }
-//     }
+    #[derive(Debug, Serialize)]
+    struct TestAutonomyMode {
+        name: String,
+        priority: u8,
+        activation: Option<Activation>,
+    }
+    #[async_trait]
+    impl AutonomyMode<TestTelemetry, TestCommand> for TestAutonomyMode {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn priority(&self) -> u8 {
+            self.priority
+        }
+        fn activation(&self) -> Option<Activation> {
+            self.activation.clone()
+        }
+        async fn run(
+            &mut self,
+            mut rx_telem: broadcast::Receiver<TestTelemetry>,
+            tx_command: mpsc::Sender<TestCommand>,
+            active: Arc<tokio::sync::Mutex<bool>>,
+        ) -> Result<()> {
+            loop {
+                if let Ok(telemetry) = rx_telem.recv().await {
+                  tx_command
+                      .send(TestCommand {
+                          value: format!("{} received {}", self.name(), telemetry.value),
+                      })
+                      .await?;
+                }
+            }
+        }
+    }
 
-//     #[tokio::test]
-//     async fn test_flight_basic() {
-//         let client_transport: TestTransport<String, String> = TestTransport::new(1024);
-//         let client_transport_handle = client_transport.handle();
-//         let mut flight = Flight::new().await.client_to_c2_transport(client_transport);
+    #[tokio::test]
+    async fn test_flight_basic() {
+        let client_transport: TestTransport<String, String> = TestTransport::new(1024);
+        let client_transport_handle = client_transport.handle();
+        let router_to_modes_transport: TestTransport<TestTelemetry, TestCommand> = TestTransport::new(1024);
+        let router_to_modes_transport_handle = router_to_modes_transport.handle();
+        let mut flight = Flight::new().await.client_to_c2_transport(client_transport)
+          .c2_to_router_transport(router_to_modes_transport);
 
-//         let mode = TestAutonomyMode {
-//             name: "Mode A".to_string(),
-//             priority: 0,
-//             activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
-//                 Value::Literal(true),
-//             )))),
-//         };
-//         flight.register_autonomy_mode(mode);
+        let mode = TestAutonomyMode {
+            name: "Mode A".to_string(),
+            priority: 0,
+            activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
+                Value::Literal(true),
+            )))),
+        };
+        flight.register_autonomy_mode(mode);
 
-//         let mode = TestAutonomyMode {
-//             name: "Mode B".to_string(),
-//             priority: 1,
-//             activation: Some(Activation::Hysteretic {
-//                 enter: Expr::Not(Box::new(Expr::GreaterThan(
-//                     Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-//                         "proximity_m".to_string(),
-//                     )))),
-//                     Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-//                 ))),
-//                 exit: Expr::GreaterThan(
-//                     Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-//                         "proximity_m".to_string(),
-//                     )))),
-//                     Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
-//                 ),
-//             }),
-//         };
-//         flight.register_autonomy_mode(mode);
-//         flight.run();
-//     }
-// }
+        let mode = TestAutonomyMode {
+            name: "Mode B".to_string(),
+            priority: 1,
+            activation: Some(Activation::Hysteretic {
+                enter: Expr::Not(Box::new(Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                        "proximity_m".to_string(),
+                    )))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
+                ))),
+                exit: Expr::GreaterThan(
+                    Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+                        "proximity_m".to_string(),
+                    )))),
+                    Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
+                ),
+            }),
+        };
+        flight.register_autonomy_mode(mode);
+        flight.run();
+    }
+}
 
 /*
 On deck:
