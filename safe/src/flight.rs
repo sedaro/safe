@@ -50,13 +50,13 @@ use std::time::Duration;
 // {
 pub struct Flight {
   config: Config,
-  router: Router<MpscTransport<Telemetry, Command>>, // TODO: Make generic
+  router: Router,
   // router: Arc<Mutex<Router<MpscTransport<Telemetry, Command>>>>, // TODO: Make generic
   tracing_layers: Vec<tracing_subscriber::fmt::Layer<Registry, JsonFields, tracing_subscriber::fmt::format::Format<Json>, NonBlocking>>,
   // tracing_layers: Vec<tracing_subscriber::fmt::Layer<Registry>>,
   tracing_guards: HashMap<String, WorkerGuard>,
-  c2_to_router_transport_handle: MpscTransportHandle<Telemetry, Command>, // TODO: Make generic
-  client_to_c2_transport: Option<TcpTransport<String, String>>, // TODO: Make generic
+  c2_to_router_transport_handle: Box<dyn TransportHandle<Telemetry, Command>>,
+  client_to_c2_transport: Option<Box<dyn Transport<String, String>>>,
   // client_to_c2_transport: Option<Arc<Mutex<TcpTransport<String, String>>>>, // TODO: Make generic
 }
 
@@ -108,7 +108,7 @@ impl Flight {
         // });
         let c2_to_router_transport_handle = c2_to_router_transport.handle();
         let router = Router::new( // TODO: Consider just making this part of Flight
-            c2_to_router_transport,
+            Box::new(c2_to_router_transport),
             observability.clone(),
             &config,
         );
@@ -127,16 +127,14 @@ impl Flight {
           client_to_c2_transport: None,
         }
     }
-    // pub fn c2_to_router_transport(mut self, transport: impl Transport<Telemetry, Command>) -> Self {
-    pub fn c2_to_router_transport(mut self, transport: MpscTransport<Telemetry, Command>) -> Self { // TODO: Make generic
+    pub fn c2_to_router_transport(mut self, transport: impl Transport<Telemetry, Command> + 'static) -> Self {
       self.c2_to_router_transport_handle = transport.handle();
       self.router = self.router.c2_transport(transport); // TODO: Improper use of builder pattern?
       // unimplemented!();
       self
     }
-    // pub fn client_to_c2_transport(mut self, transport: impl Transport<String, String>) -> Self {
-    pub fn client_to_c2_transport(mut self, transport: TcpTransport<String, String>) -> Self { // TODO: Make generic
-      self.client_to_c2_transport = Some(transport);
+    pub fn client_to_c2_transport(mut self, transport: impl Transport<String, String> + 'static) -> Self {
+      self.client_to_c2_transport = Some(Box::new(transport));
       self
     }
     
@@ -181,7 +179,7 @@ impl Flight {
         println!("SAFE C2 listening on {}", client_transport);
         tokio::spawn(async move {
             loop {
-                match client_transport.accept().await {
+                match (*client_transport).accept().await {
                     Ok(stream) => {
                         let c2_telem_stream = handle.connect().await.unwrap();
                         tokio::spawn(async move {
@@ -206,8 +204,8 @@ impl Flight {
 
 // TODO: Overhaul this handler and the overall Client<>SAFE interface
 async fn handle_c2_connection(
-    mut stream: impl Stream<String, String>,
-    mut router_stream: impl Stream<Command, Telemetry>,
+    mut stream: Box<dyn Stream<String, String>>,
+    mut router_stream: Box<dyn Stream<Command, Telemetry>>,
 ) {
     if let Ok(msg) = stream.read().await {
         if let Ok(logs_request) = serde_json::from_str::<LogsRequest>(&msg) { // TODO: Rewrite this once tested and more tightly couple to observability system
