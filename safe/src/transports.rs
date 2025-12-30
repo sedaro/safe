@@ -295,7 +295,6 @@ where
         bincode::deserialize(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
-
     async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
         let bytes = bincode::serialize(&msg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
