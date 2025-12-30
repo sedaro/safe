@@ -43,12 +43,12 @@ use std::time::Duration;
 
 // Cute form of "Flight Director"
 // TODO: Consider alternative name later
-// pub struct Flight<RTR, CTR>
-// where
-//     RTR: Transport<Telemetry, Command>,
-//     CTR: Transport<Telemetry, Command>,
-// {
-pub struct Flight<T, C> {
+
+pub struct Build;
+pub struct Run;
+
+pub struct Flight<T, C, State = Build> {
+  _state: std::marker::PhantomData<State>,
   config: Config,
   router: Router<T, C>,
   // router: Arc<Mutex<Router<MpscTransport<Telemetry, Command>>>>, // TODO: Make generic
@@ -60,12 +60,8 @@ pub struct Flight<T, C> {
   // client_to_c2_transport: Option<Arc<Mutex<TcpTransport<String, String>>>>, // TODO: Make generic
 }
 
-// impl<RTR, CTR> Flight<RTR, CTR>
-// where
-//     RTR: Transport<Telemetry, Command>,
-//     CTR: Transport<Telemetry, Command>,
-// {
-impl<T, C> Flight<T, C>
+
+impl<T, C> Flight<T, C, Build>
 where
   T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
   C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
@@ -123,6 +119,7 @@ where
         // });
         
         Flight {
+          _state: std::marker::PhantomData,
           config,
           router,
           tracing_layers: vec![root_tracing_layer],
@@ -133,16 +130,52 @@ where
     }
     pub fn c2_to_router_transport(mut self, transport: impl Transport<T, C> + 'static) -> Self {
       self.c2_to_router_transport_handle = transport.handle();
-      self.router = self.router.c2_transport(transport); // TODO: Improper use of builder pattern?
-      // unimplemented!();
+      self.router = self.router.c2_transport(transport);
       self
     }
     pub fn client_to_c2_transport(mut self, transport: impl Transport<String, String> + 'static) -> Self {
       self.client_to_c2_transport = Some(Box::new(transport));
       self
     }
-    
-    pub fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mode: M) { // TODO: Implement dynamic registration
+    // TODO: Build out rest of configurability here as continuous of builder pattern rather than constructor params
+
+    pub fn run(mut self) -> () {
+      // Start client handler (if transport is set)
+      if let Some(mut client_transport) = self.client_to_c2_transport {
+        let handle = self.c2_to_router_transport_handle;
+        println!("SAFE C2 listening on {}", client_transport);
+        tokio::spawn(async move {
+            loop {
+                match (*client_transport).accept().await {
+                    Ok(stream) => {
+                        let c2_telem_stream = handle.connect().await.unwrap();
+                        tokio::spawn(async move {
+                            Flight::handle_c2_connection(stream, c2_telem_stream).await;
+                        });
+                    }
+                    Err(e) => eprintln!("Connection error: {}", e),
+                }
+            }
+        });
+      }
+
+      // Start Router
+      let config_clone = self.config.clone();
+      tokio::spawn(async move {
+          if let Err(e) = self.router.run(&config_clone).await {
+              warn!("Router error: {}", e); // TODO: This needs to be more than a warning
+          }
+      });
+    }
+}
+
+impl <T, C> Flight<T, C>
+where
+  T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
+{
+    // TODO: Support registering and deregistering modes while running
+    pub async fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mode: M) -> Result<()> { // TODO: Implement dynamic registration
       let (non_blocking, guard) =
           tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", format!("{}.log", mode.name().clone())));
       // let tracing_registry = &self.tracing_registry;
@@ -156,13 +189,20 @@ where
         .json()
         .with_filter(EnvFilter::new(format!("[{{autonomy_mode={}}}]=trace", mode.name().clone())))
       );
-      self.router.register_autonomy_mode(mode, &self.config);
+      self.router.register_autonomy_mode(mode).await?;
+      Ok(())
     }
     pub fn unregister_autonomy_mode(&mut self, name: &str) {
       self.tracing_guards.remove(name);
       unimplemented!();
     }
+}
 
+impl <T, C> Flight<T, C, Run>
+where
+  T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
+{ 
     // TODO: Overhaul this handler and the overall Client<>SAFE interface
     async fn handle_c2_connection(
         mut stream: Box<dyn Stream<String, String>>,
@@ -238,47 +278,5 @@ where
             }
             
         }
-    }
-
-    pub fn run(mut self) {
-      // // Start logging // TODO: find better way?
-      // let mut tracing_registry = tracing_subscriber::registry();
-
-      // self.tracing_layers.iter().reduce(|layer| {
-        
-      // })
-
-      // for layer in self.tracing_layers {
-      //   tracing_registry.with
-      //   let thing: Layered<tracing_subscriber::fmt::Layer<Registry, JsonFields, tracing_subscriber::fmt::format::Format<Json>, NonBlocking>, Registry> = tracing_registry.with(layer);
-      // }
-      // tracing_registry.init();
-
-      // Start client handler (if transport is set)
-      if let Some(mut client_transport) = self.client_to_c2_transport {
-        let handle = self.c2_to_router_transport_handle;
-        println!("SAFE C2 listening on {}", client_transport);
-        tokio::spawn(async move {
-            loop {
-                match (*client_transport).accept().await {
-                    Ok(stream) => {
-                        let c2_telem_stream = handle.connect().await.unwrap();
-                        tokio::spawn(async move {
-                            Flight::handle_c2_connection(stream, c2_telem_stream).await;
-                        });
-                    }
-                    Err(e) => eprintln!("Connection error: {}", e),
-                }
-            }
-        });
-      }
-
-      // Start Router
-      let config_clone = self.config.clone();
-      tokio::spawn(async move {
-          if let Err(e) = self.router.run(&config_clone).await {
-              warn!("Router error: {}", e); // TODO: This needs to be more than a warning
-          }
-      });
     }
 }

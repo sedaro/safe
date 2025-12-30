@@ -66,8 +66,7 @@ impl AutonomyMode<Telemetry, Command> for CollisionAvoidanceAutonomyMode {
     }
     async fn run(
         &mut self,
-        mut rx_telem: broadcast::Receiver<Telemetry>,
-        tx_command: mpsc::Sender<Command>,
+        stream: Box<dyn Stream<Telemetry, Command>>,
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()> {
         loop {
@@ -110,8 +109,7 @@ impl AutonomyMode<Telemetry, Command> for NominalOperationsAutonomyMode {
     }
     async fn run(
         &mut self,
-        mut rx_telem: broadcast::Receiver<Telemetry>,
-        tx_command: mpsc::Sender<Command>,
+        stream: Box<dyn Stream<Telemetry, Command>>,
         active: Arc<tokio::sync::Mutex<bool>>,
     ) -> Result<()> {
         loop {
@@ -162,8 +160,7 @@ impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutono
     }
     async fn run(
         &mut self,
-        mut rx_telem: broadcast::Receiver<Telemetry>,
-        tx_command: mpsc::Sender<Command>,
+        mut stream: Box<dyn Stream<Telemetry, Command>>,
         active: Arc<tokio::sync::Mutex<bool>>, // TODO: Make this an Event that can be efficiently waited on
     ) -> Result<()> {
       
@@ -419,8 +416,8 @@ impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutono
                 let max_pointing_error = pmean + 3.0 * pstd_err;
                 if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
                   info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
-                  tx_command
-                    .send(Command {
+                  stream
+                    .write(Command {
                         set_pid_controller_gains: pid_controller_gains,
                     })
                     .await?;
@@ -484,7 +481,7 @@ async fn main() -> Result<()> {
           std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
         ).timeout(Duration::from_secs_f64(20.0)),
     };
-    flight.register_autonomy_mode(mode);
+    flight.register_autonomy_mode(mode).await?;
 
     let mode = NominalOperationsAutonomyMode {
         name: "NominalOps".to_string(),
@@ -493,8 +490,9 @@ async fn main() -> Result<()> {
             Value::Literal(true),
         )))),
     };
-    flight.register_autonomy_mode(mode);
+    flight.register_autonomy_mode(mode).await?;
 
+    // TODO: Move this into flight!!!
     let (non_blocking, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "safe.log"));
     let (non_blocking_a, _guard_a) =
@@ -543,13 +541,13 @@ mod tests {
     use tokio::sync::{broadcast, mpsc};
     use anyhow::Result;
 
-    use crate::{definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{TestTransport, Transport}};
+    use crate::{definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, Transport, TransportHandle}};
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestCommand {
         value: String,
     }
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestTelemetry {
         value: String,
     }
@@ -573,14 +571,13 @@ mod tests {
         }
         async fn run(
             &mut self,
-            mut rx_telem: broadcast::Receiver<TestTelemetry>,
-            tx_command: mpsc::Sender<TestCommand>,
+            mut stream: Box<dyn Stream<TestTelemetry, TestCommand>>,
             active: Arc<tokio::sync::Mutex<bool>>,
         ) -> Result<()> {
             loop {
-                if let Ok(telemetry) = rx_telem.recv().await {
-                  tx_command
-                      .send(TestCommand {
+                if let Ok(telemetry) = stream.read().await {
+                  stream
+                      .write(TestCommand {
                           value: format!("{} received {}", self.name(), telemetry.value),
                       })
                       .await?;
@@ -637,10 +634,15 @@ Config changes
  */
 
 /*
+- The Transport interface should likely implement a means of ackowledging what has been received
+  - This gets more difficult with split streams though
+  - Is TCP ack enough?  What about UDP?
 - Make unit-testable and more of a framework
   - Rewrite parts after testable
 - Implement current Transport trait for Router -> AM interface?
 - Documentation, in not sensitive?
+- Implement autonomy mode transport fault recovery (i.e. reconnect)
+  - Unless we come up with somethign more clever, this will require that we implement a handshake to identify the Mode on connect.  This could probably be handle by some connection factory.
 - Allow for different SAFE instances to "collaborate" via dedicated interface
 - Have a rust-native autonomy mode or two
 - Implement a way to have background modes which are alerted when they are activated/deactivated
