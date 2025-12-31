@@ -12,6 +12,7 @@ const SOCKET_PATH: &str = "/tmp/safe.sock";
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Telemetry {
     pub pointing_error: f64,
+    pub in_sunlight: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct LogsRequest {

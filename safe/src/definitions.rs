@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashMap};
+use std::cmp::Ordering;
 
 #[derive(Debug)]
 pub enum Error {
@@ -9,9 +9,6 @@ pub enum Error {
     NotComparable,
     UnresolvedVariable,
 }
-
-// TODO: Get feedback from Team on all of this Ontology!
-// TODO: SedaroTS here instead?  QK awareness would be awesome for telem
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AutonomyModeDefinition {
@@ -177,9 +174,27 @@ pub enum Expr {
     GreaterThan(Box<Expr>, Box<Expr>),
     LessThan(Box<Expr>, Box<Expr>),
     Equal(Box<Expr>, Box<Expr>),
-
 }
 impl Expr {
+    pub fn and(exprs: Vec<Expr>) -> Self {
+        Expr::And(exprs)
+    }
+    pub fn or(exprs: Vec<Expr>) -> Self {
+        Expr::Or(exprs)
+    }
+    pub fn not(expr: Expr) -> Self {
+        Expr::Not(Box::new(expr))
+    }
+    pub fn greater_than(left: Expr, right: Expr) -> Self {
+        Expr::GreaterThan(Box::new(left), Box::new(right))
+    }
+    pub fn less_than(left: Expr, right: Expr) -> Self {
+        Expr::LessThan(Box::new(left), Box::new(right))
+    }
+    pub fn equal(left: Expr, right: Expr) -> Self {
+        Expr::Equal(Box::new(left), Box::new(right))
+    }
+
     // TODO: Write comprehensive unit tests
     // TODO: Make this not panic
     pub fn eval(&self, ctx: &impl Resolvable) -> Result<bool, Error> {
