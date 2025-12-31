@@ -2,7 +2,7 @@ use crate::c2::{AutonomyModeMessage, RouterMessage};
 use crate::config::{Config, EngagementMode};
 use crate::definitions::Variable;
 use crate::definitions::{Activation, Resolvable, Value};
-use crate::{observability as obs, utils};
+use crate::observability as obs;
 use crate::transports::{MpscTransport, ReadHalf};
 use crate::transports::Stream;
 use crate::transports::Transport;
