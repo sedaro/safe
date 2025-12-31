@@ -663,27 +663,22 @@ Config changes
   - This gets more difficult with split streams though
   - Is TCP ack enough?  What about UDP?
 - Make unit-testable and more of a framework
-  - Rewrite parts after testable
-- Implement current Transport trait for Router -> AM interface?
+- Support background running modes and foreground
+  - Implement a way to have background modes which are alerted when they are activated/deactivated
 - Documentation, in not sensitive?
+  - It is important to guarantee that Modes can't issue commands when Router logic would deactivate them
 - Implement autonomy mode transport fault recovery (i.e. reconnect)
   - Unless we come up with somethign more clever, this will require that we implement a handshake to identify the Mode on connect.  This could probably be handle by some connection factory.
-- Allow for different SAFE instances to "collaborate" via dedicated interface
 - Have a rust-native autonomy mode or two
-- Implement a way to have background modes which are alerted when they are activated/deactivated
-- Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
-- Support background running modes and foreground
-- Mode transition command purging
+- (WIP) Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
+- Allow for different SAFE instances to "collaborate" via dedicated interface
 - Try to compile it for Raspberry PI and STM MCU
 - Focus on the EDS integration piece
 - Integrate redb
-- Is it important to guarantee that Modes can't issue commands when Router logic would deactivate them?  Do we need to work out the races here or is this acceptable?
-- Add resiliency and reconnect to Transports which can theoretically drop connections (TCP, Unix sockets, etc.)
  */
 
 /*
 Known issues:
-- Can start the Mode and also hold it as mutable because the run awaits indefinitely
 - Need to better Activation interpreter
  */
 
@@ -691,10 +686,6 @@ Known issues:
 Define ontology
 Ontology should be fully persisted in redb
 Ontology should support variables which can be updated via config interface
- */
-
-/*
-Think hard about how SAFE comes up if state already exists!!!
  */
 
 /*

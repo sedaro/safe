@@ -86,21 +86,12 @@ where
         });
 
         let c2_to_router_transport: MpscTransport<T, C> = MpscTransport::new(config.router.telem_channel_buffer_size);
-        // let c2_to_router_transport: TcpTransport<Telemetry, Command> = TcpTransport::new("127.0.0.1", 8000).await?;
-        // let c2_to_router_transport = UnixTransport::new("/tmp/safe.sock").await.unwrap_or_else(|e| {
-        //   panic!("Unable to initialize unix transport: {}", e);
-        // });
         let c2_to_router_transport_handle = c2_to_router_transport.handle();
         let router = Router::new( // TODO: Consider just making this part of Flight
             Box::new(c2_to_router_transport),
             observability.clone(),
             &config,
         );
-
-        // let mut transport: UnixTransport<String, String> = UnixTransport::new("/tmp/safe.sock").await?;
-        // let mut client_to_c2_transport: TcpTransport<String, String> = TcpTransport::new("127.0.0.1", 8001).await.unwrap_or_else(|e| {
-        //   panic!("Unable to initialized TCP transport: {}", e);
-        // });
         
         Flight {
           _state: std::marker::PhantomData,
@@ -121,7 +112,7 @@ where
       self.client_to_c2_transport = Some(Box::new(transport));
       self
     }
-    // TODO: Build out rest of configurability here as continuous of builder pattern rather than constructor params
+    // TODO: Build out rest of configurability here as continuation of builder pattern rather than constructor params
 
     pub fn run(self) {
       // Start client handler (if transport is set)
@@ -160,11 +151,9 @@ where
 {
     // TODO: Support registering and deregistering modes while running
     pub async fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mode: M) -> Result<()> { // TODO: Implement dynamic registration
+      // FIXME: This block doesn't work currently
       let (non_blocking, guard) =
-          tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", format!("{}.log", mode.name().clone())));
-      // let tracing_registry = &self.tracing_registry;
-      self.tracing_guards.insert(mode.name(), guard);
-
+      tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", format!("{}.log", mode.name().clone())));
       tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -173,6 +162,8 @@ where
         .json()
         .with_filter(EnvFilter::new(format!("[{{autonomy_mode={}}}]=trace", mode.name().clone())))
       );
+      // </end>
+      self.tracing_guards.insert(mode.name(), guard);
       self.router.register_autonomy_mode(mode).await?;
       Ok(())
     }
@@ -262,7 +253,6 @@ where
                   println!("Unknown client message: {}", msg);
                   error!("Unknown client message: {}", msg);
               }
-              
           }
           Err(e) => {
               println!("C2 client connection error: {}", e);
