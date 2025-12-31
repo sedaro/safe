@@ -13,7 +13,6 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use base64::Engine;
 
-use crate::c2::Timestamped;
 use crate::config::Config;
 use crate::observability as obs;
 use crate::router::{AutonomyMode, Router};
@@ -48,7 +47,7 @@ pub struct Flight<T, C, State = Build> {
 impl<T, C> Flight<T, C, Build>
 where
   T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
-  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync + Timestamped,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
 {
     pub async fn new() -> Self {
 
