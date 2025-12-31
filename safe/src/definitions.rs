@@ -10,9 +10,6 @@ pub enum Error {
     UnresolvedVariable,
 }
 
-// TODO: Get feedback from Team on all of this Ontology!
-// TODO: SedaroTS here instead?  QK awareness would be awesome for telem
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AutonomyModeDefinition {
     pub name: String,

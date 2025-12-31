@@ -3,9 +3,6 @@ use std::fmt::Display;
 use rand::{self, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
-// TODO: Brad to architect this module
-// https://sedaro.slack.com/archives/D03FLBA7WCT/p1765289350221849
-
 pub trait StatisticalDistribution<T> {
     fn sample(&mut self) -> T;
 }
