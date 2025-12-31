@@ -654,14 +654,10 @@ mod tests {
         
         let mut client_stream = client_transport_handle.connect().await.unwrap();
         client_stream.write(serde_json::to_string(&CommandsRequest {}).unwrap()).await.unwrap();
-        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode A received 200".to_string())).unwrap());
-        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode B received 99".to_string())).unwrap());
-        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode B received 125".to_string())).unwrap());
-        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode A received 200".to_string())).unwrap());
-
-
-        // assert_eq!(router_to_modes_transport_handle.t)
-
+        assert_eq!(serde_json::from_str::<TestCommand>(client_stream.read().await.unwrap().as_str()).unwrap().value, "Mode A received 200".to_string());
+        assert_eq!(serde_json::from_str::<TestCommand>(client_stream.read().await.unwrap().as_str()).unwrap().value, "Mode B received 99".to_string());
+        assert_eq!(serde_json::from_str::<TestCommand>(client_stream.read().await.unwrap().as_str()).unwrap().value, "Mode B received 125".to_string());
+        assert_eq!(serde_json::from_str::<TestCommand>(client_stream.read().await.unwrap().as_str()).unwrap().value, "Mode A received 200".to_string());
     }
 }
 
