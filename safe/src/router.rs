@@ -1,23 +1,20 @@
-use crate::c2::{Command, Telemetry, Timestamped};
+use crate::c2::{Timestamped};
 use crate::config::{Config, EngagementMode};
 use crate::definitions::Variable;
 use crate::definitions::{Activation, Resolvable, Value};
 use crate::{observability as obs, utils};
-use crate::transports::{MpscTransport, ReadHalf, TransportHandle};
+use crate::transports::{MpscTransport, ReadHalf};
 use crate::transports::Stream;
 use crate::transports::Transport;
 use crate::transports::WriteHalf;
 use anyhow::Result;
 use async_trait::async_trait;
 use core::panic;
-use std::alloc::System;
-use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use tracing::{debug, info, debug_span, warn};
 use tracing::Instrument;
@@ -368,7 +365,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::definitions::{Expr, Value, Variable};
+    use crate::{c2::Telemetry, definitions::{Expr, Value, Variable}};
 
     use super::*;
 
