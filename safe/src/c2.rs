@@ -12,30 +12,28 @@ pub struct Telemetry {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Command {
     pub set_pid_controller_gains: (f64, f64, f64, f64),
-    timestamp_ns: u128,
 }
 
 impl Command {
     pub fn new(set_pid_controller_gains: (f64, f64, f64, f64)) -> Self {
         Self {
             set_pid_controller_gains,
-            timestamp_ns: SystemTime::now()
-              .duration_since(UNIX_EPOCH)
-              .expect("Time went backwards")
-              .as_nanos(),
         }
     }
 }
 
-// Temporary work around for command queue flushes (FIXME)
-pub trait Timestamped {
-    fn unix_timestamp_ns(&self) -> u128;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum AutonomyModeMessage<T> {
+    Telemetry(T),
+    Active { nonce: u64, },
+    Inactive,
+    // InactiveWarning, // TODO: Warn of getting unscheduled
+    // C2AcceptedCommand { generation: u64, seq: u64,  }, // TODO: Ack from C2 that command was accepted
 }
 
-impl Timestamped for Command {
-    fn unix_timestamp_ns(&self) -> u128 {
-        self.timestamp_ns
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum RouterMessage<C> {
+    Command { data: C, nonce: u64, },
 }
 
 // CLI request structures
