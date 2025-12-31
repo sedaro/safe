@@ -7,6 +7,7 @@ mod router;
 mod transports;
 mod simulation;
 mod flight;
+mod utils;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -417,9 +418,7 @@ impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutono
                 if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
                   info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
                   stream
-                    .write(Command {
-                        set_pid_controller_gains: pid_controller_gains,
-                    })
+                    .write(Command::new(pid_controller_gains))
                     .await?;
                 }
               }
@@ -534,23 +533,43 @@ async fn main() -> Result<()> {
 }
 
 mod tests {
-    use std::sync::Arc;
+    use std::{any::Any, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
     use tokio::sync::{broadcast, mpsc};
     use anyhow::Result;
 
-    use crate::{definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, Transport, TransportHandle}};
+    use crate::{c2::Timestamped, definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, TestTransportHandle, Transport, TransportHandle}};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestCommand {
         value: String,
+        timestamp_ns: u128,
+    }
+    impl TestCommand {
+        fn new(value: String) -> Self {
+            Self {
+                value,
+                timestamp_ns: SystemTime::now()
+                  .duration_since(UNIX_EPOCH)
+                  .expect("Time went backwards")
+                  .as_nanos(),
+            }
+        }
+    }
+    impl Timestamped for TestCommand {
+        fn unix_timestamp_ns(&self) ->  u128 {
+            self.timestamp_ns
+        }
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestTelemetry {
-        value: String,
+        value: f64,
     }
+
+    #[derive(Clone, Serialize, Deserialize, Debug)]
+    pub struct CommandsRequest {} // FIXME: Centralize with safectl
 
     #[derive(Debug, Serialize)]
     struct TestAutonomyMode {
@@ -575,11 +594,10 @@ mod tests {
             active: Arc<tokio::sync::Mutex<bool>>,
         ) -> Result<()> {
             loop {
+                // Loop back telem, intentionally ignoring active to test inactive command handling
                 if let Ok(telemetry) = stream.read().await {
                   stream
-                      .write(TestCommand {
-                          value: format!("{} received {}", self.name(), telemetry.value),
-                      })
+                      .write(TestCommand::new(format!("{} received {}", self.name(), telemetry.value)))
                       .await?;
                 }
             }
@@ -590,10 +608,7 @@ mod tests {
     async fn test_flight_basic() {
         let client_transport: TestTransport<String, String> = TestTransport::new(1024);
         let client_transport_handle = client_transport.handle();
-        let router_to_modes_transport: TestTransport<TestTelemetry, TestCommand> = TestTransport::new(1024);
-        let router_to_modes_transport_handle = router_to_modes_transport.handle();
-        let mut flight = Flight::new().await.client_to_c2_transport(client_transport)
-          .c2_to_router_transport(router_to_modes_transport);
+        let mut flight = Flight::new().await.client_to_c2_transport(client_transport);
 
         let mode = TestAutonomyMode {
             name: "Mode A".to_string(),
@@ -602,7 +617,7 @@ mod tests {
                 Value::Literal(true),
             )))),
         };
-        flight.register_autonomy_mode(mode);
+        flight.register_autonomy_mode(mode).await.unwrap();
 
         let mode = TestAutonomyMode {
             name: "Mode B".to_string(),
@@ -610,20 +625,43 @@ mod tests {
             activation: Some(Activation::Hysteretic {
                 enter: Expr::Not(Box::new(Expr::GreaterThan(
                     Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                        "proximity_m".to_string(),
+                        "value".to_string(),
                     )))),
                     Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
                 ))),
                 exit: Expr::GreaterThan(
                     Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                        "proximity_m".to_string(),
+                        "value".to_string(),
                     )))),
                     Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
                 ),
             }),
         };
-        flight.register_autonomy_mode(mode);
+        flight.register_autonomy_mode(mode).await.unwrap();
         flight.run();
+
+        // Allow time for first mode to activate
+        // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        let mut client_stream = client_transport_handle.connect().await.unwrap();
+        client_stream.write(serde_json::to_string(&TestTelemetry { value: 200.0 }).unwrap()).await.unwrap();
+        let mut client_stream = client_transport_handle.connect().await.unwrap();
+        client_stream.write(serde_json::to_string(&TestTelemetry { value: 99.0 }).unwrap()).await.unwrap();
+        let mut client_stream = client_transport_handle.connect().await.unwrap();
+        client_stream.write(serde_json::to_string(&TestTelemetry { value: 125.0 }).unwrap()).await.unwrap();
+        let mut client_stream = client_transport_handle.connect().await.unwrap();
+        client_stream.write(serde_json::to_string(&TestTelemetry { value: 200.0 }).unwrap()).await.unwrap();
+        
+        let mut client_stream = client_transport_handle.connect().await.unwrap();
+        client_stream.write(serde_json::to_string(&CommandsRequest {}).unwrap()).await.unwrap();
+        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode A received 200".to_string())).unwrap());
+        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode B received 99".to_string())).unwrap());
+        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode B received 125".to_string())).unwrap());
+        assert_eq!(client_stream.read().await.unwrap(), serde_json::to_string(&TestCommand::new("Mode A received 200".to_string())).unwrap());
+
+
+        // assert_eq!(router_to_modes_transport_handle.t)
+
     }
 }
 

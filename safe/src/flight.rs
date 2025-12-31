@@ -24,7 +24,7 @@ use tracing::Instrument;
 use time;
 use base64::Engine;
 
-use crate::c2::{Command, Telemetry};
+use crate::c2::{Command, Telemetry, Timestamped};
 use crate::config::Config;
 use crate::definitions::{Activation, Expr, Value, Variable};
 use crate::observability as obs;
@@ -64,7 +64,7 @@ pub struct Flight<T, C, State = Build> {
 impl<T, C> Flight<T, C, Build>
 where
   T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
-  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync + Timestamped,
 {
     pub async fn new() -> Self {
 
@@ -208,75 +208,82 @@ where
         mut stream: Box<dyn Stream<String, String>>,
         mut router_stream: Box<dyn Stream<C, T>>,
     ) {
-        if let Ok(msg) = stream.read().await {
-            if let Ok(logs_request) = serde_json::from_str::<LogsRequest>(&msg) { // TODO: Rewrite this once tested and more tightly couple to observability system
-                // Tail safe.log.<date> files and send over stream
-                let log_dir = std::path::Path::new("./logs");
-                let day_date = time::OffsetDateTime::now_utc().date().to_string();
-                let file_prefix = match logs_request.mode {
-                  Some(mode) => mode,
-                  None => "safe".to_string(),
-                };
-                let log_file = format!("{}.log.{}", file_prefix, day_date);
-                // TODO: Return error response if log stream (i.e. file) doesn't exist
-                if let Ok(mut file) = File::open(log_dir.join(log_file)).await {
-                  // Seek to end of file
-                  let _ = file.seek(SeekFrom::End(0)).await;
-                  let mut reader = BufReader::new(file);
-                  let mut line = String::new();
+        match stream.read().await {
+          Ok(msg) => {
+              if let Ok(logs_request) = serde_json::from_str::<LogsRequest>(&msg) { // TODO: Rewrite this once tested and more tightly couple to observability system
+                  // Tail safe.log.<date> files and send over stream
+                  let log_dir = std::path::Path::new("./logs");
+                  let day_date = time::OffsetDateTime::now_utc().date().to_string();
+                  let file_prefix = match logs_request.mode {
+                    Some(mode) => mode,
+                    None => "safe".to_string(),
+                  };
+                  let log_file = format!("{}.log.{}", file_prefix, day_date);
+                  // TODO: Return error response if log stream (i.e. file) doesn't exist
+                  if let Ok(mut file) = File::open(log_dir.join(log_file)).await {
+                    // Seek to end of file
+                    let _ = file.seek(SeekFrom::End(0)).await;
+                    let mut reader = BufReader::new(file);
+                    let mut line = String::new();
 
-                  loop {
-                    let curr_day_date = time::OffsetDateTime::now_utc().date().to_string();
-                    if day_date != curr_day_date {
-                      // Day has changed, switch to new log file after sending the rest of current file
-                      while let Ok(bytes_read) = reader.read_line(&mut line).await {
-                        if bytes_read == 0 {
-                          break; // Reached end of file
+                    loop {
+                      let curr_day_date = time::OffsetDateTime::now_utc().date().to_string();
+                      if day_date != curr_day_date {
+                        // Day has changed, switch to new log file after sending the rest of current file
+                        while let Ok(bytes_read) = reader.read_line(&mut line).await {
+                          if bytes_read == 0 {
+                            break; // Reached end of file
+                          }
+                          if let Err(_) = stream.write(line.trim().to_string()).await {
+                            return; // Client disconnected
+                          }
+                          line.clear();
                         }
-                        if let Err(_) = stream.write(line.trim().to_string()).await {
-                          return; // Client disconnected
+                        let log_file = format!("{}.log.{}", file_prefix, curr_day_date);
+                        if let Ok(new_file) = File::open(log_dir.join(log_file)).await {
+                          file = new_file;
+                          reader = BufReader::new(file);
+                          line.clear();
                         }
-                        line.clear();
                       }
-                      let log_file = format!("{}.log.{}", file_prefix, curr_day_date);
-                      if let Ok(new_file) = File::open(log_dir.join(log_file)).await {
-                        file = new_file;
-                        reader = BufReader::new(file);
-                        line.clear();
-                      }
-                    }
-                    match reader.read_line(&mut line).await {
-                      Ok(0) => {
-                        // No new data, wait and try again
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                      }
-                      Ok(_) => {
-                        if let Err(_) = stream.write(line.trim().to_string()).await {
-                          break; // Client disconnected
+                      match reader.read_line(&mut line).await {
+                        Ok(0) => {
+                          // No new data, wait and try again
+                          tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                        line.clear();
+                        Ok(_) => {
+                          if let Err(_) = stream.write(line.trim().to_string()).await {
+                            break; // Client disconnected
+                          }
+                          line.clear();
+                        }
+                        Err(_) => break,
                       }
-                      Err(_) => break,
                     }
                   }
+              } else if let Ok(tlm) = serde_json::from_str::<T>(&msg) {
+                  router_stream.write(tlm).await.ok();
+              } else if let Ok(_) = serde_json::from_str::<CommandsRequest>(&msg) {
+                loop {
+                    // TODO: Figure out how to break out of this loop when client hangs up!
+                    match router_stream.read().await {
+                        Ok(cmd) => {
+                            let msg = serde_json::to_string(&cmd).unwrap();
+                            stream.write(msg).await.ok();
+                        }
+                        Err(_) => break,
+                    }
                 }
-            } else if let Ok(tlm) = serde_json::from_str::<T>(&msg) {
-                router_stream.write(tlm).await.ok();
-            } else if let Ok(_) = serde_json::from_str::<CommandsRequest>(&msg) {
-              loop {
-                  // TODO: Figure out how to break out of this loop when client hangs up!
-                  match router_stream.read().await {
-                      Ok(cmd) => {
-                          let msg = serde_json::to_string(&cmd).unwrap();
-                          stream.write(msg).await.ok();
-                      }
-                      Err(_) => break,
-                  }
+              } else {
+                  println!("Unknown client message: {}", msg);
+                  error!("Unknown client message: {}", msg);
               }
-            } else {
-                error!("Unknown client message: {}", msg);
-            }
-            
-        }
+              
+          }
+          Err(e) => {
+              println!("C2 client connection error: {}", e);
+              error!("C2 client connection error: {}", e);
+          }
+      }
     }
 }
