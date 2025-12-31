@@ -27,7 +27,7 @@ where
   C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static,
 {
     fn name(&self) -> String;
-    fn activation(&self) -> Option<Activation>;
+    fn activation(&self) -> Activation;
     fn priority(&self) -> u8;
     async fn run(&mut self, stream: Box<dyn Stream<AutonomyModeMessage<T>, RouterMessage<C>>>) -> Result<()>;
 }
@@ -36,7 +36,7 @@ pub struct ManagedAutonomyMode {
     name: String,
     active: bool,
     priority: u8,
-    activation: Option<Activation>,
+    activation: Activation,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -257,7 +257,7 @@ where
       // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
       if let Some((current_mode_name, _)) = &self.selected_mode {
         let current_mode = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
-        if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
+        if let Activation::Hysteretic { enter: _, exit } = &current_mode.activation {
           // Evaluate exit criteria
           match exit.eval(&self.resolver) {
             Ok(exit_met) => {
@@ -274,20 +274,18 @@ where
       }
       // Else find highest priority mode whose activation criteria is met and switch to it
       for (mode_name, managed_mode) in &self.autonomy_modes {
-        if let Some(activation) = &managed_mode.activation {
-          let activation = match activation {
-            Activation::Immediate(expr) => expr,
-            Activation::Hysteretic { enter, exit: _ } => enter,
-          };
-          match activation.eval(&self.resolver) {
-            Ok(activation_met) => {
-              if activation_met {
-                candidate_modes.push((managed_mode.priority, mode_name.clone()));
-              }
+        let activation = match &managed_mode.activation {
+          Activation::Immediate(expr) => expr,
+          Activation::Hysteretic { enter, exit: _ } => enter,
+        };
+        match activation.eval(&self.resolver) {
+          Ok(activation_met) => {
+            if activation_met {
+              candidate_modes.push((managed_mode.priority, mode_name.clone()));
             }
-            Err(e) => {
-              warn!("Failed to evaluate activation criteria for mode {}: {:?}.  Mode will not be activated.", mode_name, e);
-            }
+          }
+          Err(e) => {
+            warn!("Failed to evaluate activation criteria for mode {}: {:?}.  Mode will not be activated.", mode_name, e);
           }
         }
       }

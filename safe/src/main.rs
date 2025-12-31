@@ -46,7 +46,7 @@ use crate::flight::Flight;
 struct CollisionAvoidanceAutonomyMode {
     name: String,
     priority: u8,
-    activation: Option<Activation>,
+    activation: Activation,
 }
 #[async_trait]
 impl AutonomyMode<Telemetry, Command> for CollisionAvoidanceAutonomyMode {
@@ -56,7 +56,7 @@ impl AutonomyMode<Telemetry, Command> for CollisionAvoidanceAutonomyMode {
     fn priority(&self) -> u8 {
         self.priority
     }
-    fn activation(&self) -> Option<Activation> {
+    fn activation(&self) -> Activation {
         self.activation.clone()
     }
     async fn run(&mut self, stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
@@ -70,7 +70,7 @@ impl AutonomyMode<Telemetry, Command> for CollisionAvoidanceAutonomyMode {
 struct NominalOperationsAutonomyMode {
     name: String,
     priority: u8,
-    activation: Option<Activation>,
+    activation: Activation,
 }
 #[async_trait]
 impl AutonomyMode<Telemetry, Command> for NominalOperationsAutonomyMode {
@@ -80,7 +80,7 @@ impl AutonomyMode<Telemetry, Command> for NominalOperationsAutonomyMode {
     fn priority(&self) -> u8 {
         self.priority
     }
-    fn activation(&self) -> Option<Activation> {
+    fn activation(&self) -> Activation {
         self.activation.clone()
     }
     async fn run(&mut self, stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
@@ -94,7 +94,7 @@ impl AutonomyMode<Telemetry, Command> for NominalOperationsAutonomyMode {
 struct GenericUncertaintyQuantificationAutonomyMode {
     name: String,
     priority: u8,
-    activation: Option<Activation>,
+    activation: Activation,
     N: usize,
     concurrency: usize,
     simulator: SedaroSimulator,
@@ -107,7 +107,7 @@ impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutono
     fn priority(&self) -> u8 {
         self.priority
     }
-    fn activation(&self) -> Option<Activation> {
+    fn activation(&self) -> Activation {
         self.activation.clone()
     }
     async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
@@ -398,38 +398,34 @@ async fn main() -> Result<()> {
     let mode = CollisionAvoidanceAutonomyMode {
         name: "CollisionAvoidance".to_string(),
         priority: 1,
-        activation: Some(Activation::Hysteretic {
-            enter: Expr::Not(Box::new(Expr::GreaterThan(
-                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string(),
-                )))),
-                Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-            ))),
-            exit: Expr::GreaterThan(
-                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "proximity_m".to_string(),
-                )))),
-                Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
+        activation: Activation::Hysteretic {
+            enter: Expr::not(
+              Expr::greater_than(
+                  Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string()))),
+                  Expr::Term(Variable::Float64(Value::Literal(100.0))),
+              )
             ),
-        }),
+            exit: Expr::greater_than(
+                Expr::Term(Variable::Float64(Value::TelemetryRef("proximity_m".to_string()))),
+                Expr::Term(Variable::Float64(Value::Literal(150.0))),
+            ),
+        },
     };
     let mode = GenericUncertaintyQuantificationAutonomyMode {
         name: "AttitudeControlAnomalyRecovery".to_string(),
         priority: 1,
-        activation: Some(Activation::Hysteretic {
-            enter: Expr::GreaterThan(
-                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
+        activation: Activation::Hysteretic {
+            enter: Expr::greater_than(
+                Expr::Term(Variable::Float64(Value::TelemetryRef(
                     "pointing_error".to_string(),
-                )))),
-                Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
+                ))),
+                Expr::Term(Variable::Float64(Value::Literal(2.0))),
             ),
-            exit: Expr::Not(Box::new(Expr::GreaterThan(
-                Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                    "pointing_error".to_string(),
-                )))),
-                Box::new(Expr::Term(Variable::Float64(Value::Literal(2.0)))),
-            ))),
-        }),
+            exit: Expr::not(Expr::greater_than(
+                Expr::Term(Variable::Float64(Value::TelemetryRef("pointing_error".to_string()))),
+                Expr::Term(Variable::Float64(Value::Literal(2.0))),
+            )),
+        },
         N: 100,
         concurrency: 12,
         simulator: SedaroSimulator::new(
@@ -441,9 +437,9 @@ async fn main() -> Result<()> {
     let mode = NominalOperationsAutonomyMode {
         name: "NominalOps".to_string(),
         priority: 0,
-        activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
+        activation: Activation::Immediate(Expr::Term(Variable::Bool(
             Value::Literal(true),
-        )))),
+        ))),
     };
     flight.register_autonomy_mode(mode).await?;
 
@@ -516,7 +512,22 @@ mod tests {
     struct TestAutonomyMode {
         name: String,
         priority: u8,
-        activation: Option<Activation>,
+        activation: Activation,
+    }
+    impl TestAutonomyMode {
+        fn new(name: &str, priority: u8) -> Self {
+            Self {
+                name: name.to_string(),
+                priority,
+                activation: Activation::Immediate(Expr::Term(Variable::Bool(
+                    Value::Literal(true),
+                ))),
+            }
+        }
+        fn with_activation(mut self, activation: Activation) -> Self {
+            self.activation = activation;
+            self
+        }
     }
     #[async_trait]
     impl AutonomyMode<TestTelemetry, TestCommand> for TestAutonomyMode {
@@ -526,7 +537,7 @@ mod tests {
         fn priority(&self) -> u8 {
             self.priority
         }
-        fn activation(&self) -> Option<Activation> {
+        fn activation(&self) -> Activation {
             self.activation.clone()
         }
         async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<TestTelemetry>, RouterMessage<TestCommand>>>) -> Result<()> {
@@ -561,33 +572,24 @@ mod tests {
         let client_transport_handle = client_transport.handle();
         let mut flight = Flight::new().await.client_to_c2_transport(client_transport);
 
-        let mode = TestAutonomyMode {
-            name: "Mode A".to_string(),
-            priority: 0,
-            activation: Some(Activation::Immediate(Expr::Term(Variable::Bool(
-                Value::Literal(true),
-            )))),
-        };
+        let mode = TestAutonomyMode::new("Mode A", 0);
         flight.register_autonomy_mode(mode).await.unwrap();
 
-        let mode = TestAutonomyMode {
-            name: "Mode B".to_string(),
-            priority: 1,
-            activation: Some(Activation::Hysteretic {
-                enter: Expr::Not(Box::new(Expr::GreaterThan(
-                    Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                        "value".to_string(),
-                    )))),
-                    Box::new(Expr::Term(Variable::Float64(Value::Literal(100.0)))),
-                ))),
-                exit: Expr::GreaterThan(
-                    Box::new(Expr::Term(Variable::Float64(Value::TelemetryRef(
-                        "value".to_string(),
-                    )))),
-                    Box::new(Expr::Term(Variable::Float64(Value::Literal(150.0)))),
+        let mode = TestAutonomyMode::new("Mode B", 1)
+          .with_activation(
+            Activation::Hysteretic {
+                enter: Expr::not(
+                    Expr::greater_than(
+                      Expr::Term(Variable::Float64(Value::TelemetryRef("value".to_string()))),
+                      Expr::Term(Variable::Float64(Value::Literal(100.0))),
+                    )
                 ),
-            }),
-        };
+                exit: Expr::greater_than(
+                    Expr::Term(Variable::Float64(Value::TelemetryRef("value".to_string()))),
+                    Expr::Term(Variable::Float64(Value::Literal(150.0))),
+                ),
+            }
+        );
         flight.register_autonomy_mode(mode).await.unwrap();
         flight.run();
 
@@ -613,6 +615,9 @@ mod tests {
 - The Transport interface should likely implement a means of ackowledging what has been received
   - This gets more difficult with split streams though
   - Is TCP ack enough?  What about UDP?
+- Does the client/server model for transports make sense?  Should router take a stream instead of a transport impls?
+  - Document: Passing a handle to the modes allow them to handle reconnect
+  - A: It does make sense for flexiblity and the opportunity to flag off certain transports which aren't supported on particular platforms.  Also server-broadcast is nice.
 - Make unit-testable and more of a framework
 - Support background running modes and foreground
   - Implement a way to have background modes which are alerted when they are activated/deactivated
