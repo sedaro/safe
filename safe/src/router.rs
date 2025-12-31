@@ -330,7 +330,7 @@ where
     pub async fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mut mode: M) -> Result<()> {
         let (client_stream, server_stream) = self.autonomy_modes_transport.channel().await?;
         let mode_name = mode.name().clone();
-        let priority = mode.priority().clone();
+        let priority = mode.priority();
         let activation = mode.activation().clone();
         let active = Arc::new(tokio::sync::Mutex::new(false));
         let active_clone = active.clone();

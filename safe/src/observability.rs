@@ -6,7 +6,6 @@ use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::time;
 use tracing::warn;
-use crate::c2::{Command, Telemetry};
 use crate::config::Config;
 
 pub struct ObservabilitySubsystem<T, C> {
