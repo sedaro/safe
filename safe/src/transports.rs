@@ -702,16 +702,12 @@ where
     }
 }
 
+#[cfg(test)]
 mod tests {
-    
-
     use std::time::Duration;
-
     use super::*;
-    
     use serde::{Deserialize, Serialize};
     use tokio::time::timeout;
-    
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct TxMsg {
