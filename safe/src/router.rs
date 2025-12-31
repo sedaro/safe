@@ -1,8 +1,8 @@
-use crate::c2::{Command, Telemetry};
+use crate::c2::{Command, Telemetry, Timestamped};
 use crate::config::{Config, EngagementMode};
 use crate::definitions::Variable;
 use crate::definitions::{Activation, Resolvable, Value};
-use crate::observability as obs;
+use crate::{observability as obs, utils};
 use crate::transports::{MpscTransport, ReadHalf, TransportHandle};
 use crate::transports::Stream;
 use crate::transports::Transport;
@@ -10,6 +10,8 @@ use crate::transports::WriteHalf;
 use anyhow::Result;
 use async_trait::async_trait;
 use core::panic;
+use std::alloc::System;
+use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -108,7 +110,7 @@ pub struct Router<T, C, State = Build> {
     c2_transport: Box<dyn Transport<T, C>>,
     autonomy_modes_transport: Box<dyn Transport<C, T>>,
     observability: Arc<obs::ObservabilitySubsystem<T, C>>,
-    selected_mode: Option<String>,
+    selected_mode: Option<utils::Timestamped<String>>,
     autonomy_modes: HashMap<String, ManagedAutonomyMode>,
     autonomy_mode_write_handles: Arc<tokio::sync::Mutex<HashMap<String, Box<dyn WriteHalf<T>>>>>,
     autonomy_mode_read_handles: Arc<tokio::sync::Mutex<HashMap<String, Box<dyn ReadHalf<C>>>>>,
@@ -118,7 +120,7 @@ pub struct Router<T, C, State = Build> {
 impl<T, C> Router<T, C, Build> 
 where
   T: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + std::marker::Sync,
-  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + std::marker::Sync,
+  C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + std::marker::Sync + Timestamped,
 {
     pub fn new(
         c2_transport: Box<dyn Transport<T, C>>,
@@ -153,64 +155,87 @@ where
 
     pub async fn run(mut self, config: &Config) -> Result<Router<T, C, Run>> {
         info!("Router is starting");
+        self.update_active_mode().await;
         let mut routing_interval =
             time::interval(std::time::Duration::from_secs(config.router.period_seconds));
-        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<C> + Send>>::new();
+        let mut client_stream_write_halves = Vec::<Box<dyn WriteHalf<C>>>::new();
+        let mut client_stream_read_halves = Vec::<Box<dyn ReadHalf<T>>>::new();
         loop {
             tokio::select! {
                 // Accept new connections from C2
                 Ok(stream) = self.c2_transport.accept() => {
                     info!("C2 connected to Router");
-                    let (mut read_half, write_half) = stream.split();
+                    let (read_half, write_half) = stream.split();
                     client_stream_write_halves.push(write_half);
+                    client_stream_read_halves.push(read_half);
+                }
 
-                    // Spawn read handler
-                    let observability = self.observability.clone();
-                    let telem_buffer = self.resolver.telem_buffer.clone();
-                    let config = config.clone();
-                    let autonomy_mode_write_handles = self.autonomy_mode_write_handles.clone();
-                    tokio::spawn(async move {
-                      loop {
-                        match read_half.read().await {
-                          Ok(telemetry) => {
-                              // handle msg from clients
-                              observability.log_event(
-                                  obs::Location::Router,
-                                  obs::Event::TelemetryReceived(telemetry.clone()),
-                              );
-                              {
-                                let mut telem_buffer = telem_buffer.lock().unwrap();
-                                telem_buffer.push_front(telemetry.clone());
-                                if telem_buffer.len() > config.router.historic_telem_buffer_size {
-                                  telem_buffer.pop_back();
+                // Handle incoming messages from C2
+                Some((result, idx)) = async {
+                    if client_stream_read_halves.is_empty() {
+                        return None;
+                    }
+                    let mut futures = Vec::new();
+                    for (i, read_half) in client_stream_read_halves.iter_mut().enumerate() {
+                        futures.push(Box::pin(async move { (read_half.read().await, i) }));
+                    }
+                    Some(futures::future::select_all(futures).await.0)
+                } => {
+                    match result {
+                        Ok(telemetry) => {
+                            self.observability.log_event(
+                                obs::Location::Router,
+                                obs::Event::TelemetryReceived(telemetry.clone()),
+                            );
+
+                            {
+                              let mut telem_buffer = self.resolver.telem_buffer.lock().unwrap();
+                              telem_buffer.push_front(telemetry.clone());
+                              if telem_buffer.len() > config.router.historic_telem_buffer_size {
+                                telem_buffer.pop_back();
+                              }
+                            }
+
+                            // Re-eval activations and update active mode prior to passing along telemetry in case mode switch is needed
+                            self.update_active_mode().await;
+                            
+                            // Broadcast to all registered autonomy modes
+                            for (mode_name, handle) in self.autonomy_mode_write_handles.lock().await.iter_mut() {
+                                if let Err(_) = handle.write(telemetry.clone()).await {
+                                    warn!("Failed to forward telemetry to autonomy mode {}", mode_name);
                                 }
-                              }
-                              
-                              // Broadcast to autonomy modes
-                              for (mode_name, handle) in autonomy_mode_write_handles.lock().await.iter_mut() {
-                                  if let Err(_) = handle.write(telemetry.clone()).await {
-                                      warn!("Failed to forward telemetry to autonomy mode {}", mode_name);
-                                  }
-                              }
-                          },
-                          Err(_) => break, // Connection closed by client
+                            }
                         }
-                      }
-                    });
+                        Err(e) => {
+                            // Connection closed, remove this client
+                            client_stream_read_halves.remove(idx);
+                        }
+                    }
                 }
 
                 // Forward commands from active mode to C2
-                // TODO: There is an issue here where modes can send a bunch of commands when inactive and then when the become active we'll forward them along
-                // Need to flush the channels when switching modes
-                Ok(command) = async {
-                  if let Some(mode_name) = &self.selected_mode {
-                    self.autonomy_mode_read_handles.lock().await.get_mut(mode_name).expect("Mode not found").read().await
+                command = async {
+                  if let Some(timestamp_mode) = &self.selected_mode {
+                    let timestamp = timestamp_mode.timestamp();
+                    let mode_name = timestamp_mode.inner();
+                    loop {
+                      match self.autonomy_mode_read_handles.lock().await.get_mut(mode_name).expect("Mode not found").read().await {
+                        Ok(cmd) => {
+                          if cmd.unix_timestamp_ns() >= timestamp {
+                            break cmd;
+                          }
+                        }
+                        Err(_) => {
+                          warn!("Failed to read command from active mode {}", mode_name);
+                        }
+                      }
+                    }
                   } else {
                     futures::future::pending().await
                   }
                 } => {
                     self.observability.log_event(
-                        obs::Location::AutonomyMode(self.selected_mode.clone().unwrap()),
+                        obs::Location::AutonomyMode(self.selected_mode.clone().unwrap().inner().clone()),
                         obs::Event::CommandIssued { // TODO: Have this include which mode issued it
                             commands: vec![command.clone()],
                             reason: None,
@@ -230,66 +255,71 @@ where
                 }
 
                 // Updating Routing Decision
-                _ = routing_interval.tick() => {
-                  let mut candidate_modes: Vec<(u8, String)> = vec![];
-                  // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
-                  if let Some(current_mode_name) = &self.selected_mode {
-                    let current_mode = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
-                    if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
-                      // Evaluate exit criteria
-                      match exit.eval(&self.resolver) {
-                        Ok(exit_met) => {
-                          if !exit_met {
-                            continue;
-                          }
-                        }
-                        Err(e) => {
-                          warn!("Failed to evaluate exit criteria for mode {}: {:?}.  Exiting.", current_mode_name, e); // TODO: Figure out what desired behavior is here (and make configurable)
-                          continue;
-                        }
-                      }
-                    }
-                  }
-                  // Else find highest priority mode whose activation criteria is met and switch to it
-                  for (mode_name, managed_mode) in &self.autonomy_modes {
-                    if let Some(activation) = &managed_mode.activation {
-                      let activation = match activation {
-                        Activation::Immediate(expr) => expr,
-                        Activation::Hysteretic { enter, exit: _ } => enter,
-                      };
-                      match activation.eval(&self.resolver) {
-                        Ok(activation_met) => {
-                          if activation_met {
-                            candidate_modes.push((managed_mode.priority, mode_name.clone()));
-                          }
-                        }
-                        Err(e) => {
-                          warn!("Failed to evaluate activation criteria for mode {}: {:?}.  Mode will not be activated.", mode_name, e);
-                        }
-                      }
-                    }
-                  }
-                  if !candidate_modes.is_empty() {
-                    candidate_modes.sort_by(|a, b| b.0.cmp(&a.0)); // Descending
-                    let highest_priority_mode = &candidate_modes[0].1;
-                    if Some(highest_priority_mode.clone()) != self.selected_mode {
-                      info!("Switching to mode: {}", highest_priority_mode);
-                      { // Atomically set active flags
-                        if let Some(current_mode_name) = &self.selected_mode {
-                          let mode = self.autonomy_modes.get_mut(current_mode_name).unwrap();
-                          let mut active = mode.active.lock().await;
-                          *active = false;
-                        }
-                        let mode = self.autonomy_modes.get_mut(highest_priority_mode).unwrap();
-                        let mut active = mode.active.lock().await;
-                        *active = true;
-                      }
-                      self.selected_mode = Some(highest_priority_mode.clone());
-                    }
-                  }
-                }
+                _ = routing_interval.tick() => self.update_active_mode().await,
             }
         }
+    }
+
+    async fn update_active_mode(&mut self) {
+      let mut candidate_modes: Vec<(u8, String)> = vec![];
+      // Determine if current mode has a Histeretic activation, if so, evaluate exit criteria
+      if let Some(current_mode) = &self.selected_mode {
+        let current_mode_name = current_mode.inner();
+        let current_mode = self.autonomy_modes.get(current_mode_name).unwrap(); // TODO: Handle when no match between current_mode and index.  Add test.
+        if let Some(Activation::Hysteretic { enter: _, exit }) = &current_mode.activation {
+          // Evaluate exit criteria
+          match exit.eval(&self.resolver) {
+            Ok(exit_met) => {
+              if !exit_met {
+                return;
+              }
+            }
+            Err(e) => {
+              warn!("Failed to evaluate exit criteria for mode {}: {:?}.  Exiting.", current_mode_name, e); // TODO: Figure out what desired behavior is here (and make configurable)
+              return;
+            }
+          }
+        }
+      }
+      // Else find highest priority mode whose activation criteria is met and switch to it
+      for (mode_name, managed_mode) in &self.autonomy_modes {
+        if let Some(activation) = &managed_mode.activation {
+          let activation = match activation {
+            Activation::Immediate(expr) => expr,
+            Activation::Hysteretic { enter, exit: _ } => enter,
+          };
+          match activation.eval(&self.resolver) {
+            Ok(activation_met) => {
+              if activation_met {
+                candidate_modes.push((managed_mode.priority, mode_name.clone()));
+              }
+            }
+            Err(e) => {
+              warn!("Failed to evaluate activation criteria for mode {}: {:?}.  Mode will not be activated.", mode_name, e);
+            }
+          }
+        }
+      }
+      if !candidate_modes.is_empty() {
+        candidate_modes.sort_by(|a, b| b.0.cmp(&a.0)); // Descending
+        let highest_priority_mode = &candidate_modes[0].1;
+        if self.selected_mode.is_none() || highest_priority_mode.clone() != *self.selected_mode.clone().unwrap().inner() {
+          info!("Switching to mode: {}", highest_priority_mode);
+          self.selected_mode = Some(utils::Timestamped::new(highest_priority_mode.clone()));
+          { // Atomically set active flags
+            if let Some(current_mode) = &self.selected_mode {
+              let current_mode_name = current_mode.clone();
+              let current_mode_name = current_mode_name.inner();
+              let mode = self.autonomy_modes.get_mut(current_mode_name).unwrap();
+              let mut active = mode.active.lock().await;
+              *active = false;
+            }
+            let mode = self.autonomy_modes.get_mut(highest_priority_mode).unwrap();
+            let mut active = mode.active.lock().await;
+            *active = true;
+          }
+        }
+      }
     }
 
 }
@@ -310,6 +340,7 @@ where
         let mode_name_clone = mode_name.clone();
         let handle = tokio::spawn(async move {
             // TODO: Make thread/process
+            // TODO: Implement restart on Err, with backoff?
             if let Err(e) = mode
                 .run(client_stream, active_clone)
                 .await
