@@ -525,14 +525,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
-    
     use anyhow::Result;
-
     use crate::{c2::Timestamped, definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, Transport}};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

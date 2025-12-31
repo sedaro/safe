@@ -86,12 +86,9 @@ pub struct FileTargetConfigEntry {
   pub stream_id: String,
 }
 
+#[cfg(test)]
 mod tests {
     use crate::simulation::FileTargetFrameEntry;
-
-    
-
-    
 
     #[test]
     fn test_deser() {
