@@ -22,25 +22,22 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 use std::sync::Arc;
 use std::vec;
-use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{error, info, warn};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 use tokio::sync::Semaphore;
 use ordered_float::OrderedFloat;
 use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing::Instrument;
-use time;
 use base64::Engine;
 
-use simvm::sv::{combine::TR, data::Datum, parse::Parse, pretty::Pretty};
-use crate::transports::Transport;
-use crate::transports::TransportHandle;
-use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
+use simvm::sv::{combine::TR, data::Datum, parse::Parse};
+use crate::transports::{Stream, TcpTransport};
 use crate::simulation::SedaroSimulator;
 use crate::kits::stats::{GuassianSet, NormalDistribution};
 use crate::kits::stats::StatisticalDistribution;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncSeekExt, SeekFrom};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use std::time::Duration;
 use crate::flight::Flight;
 
@@ -377,9 +374,9 @@ impl AutonomyMode<Telemetry, Command> for GenericUncertaintyQuantificationAutono
           // If at 5% increments
           if (self.N / 20) > 0 && (i + 1) % (self.N / 20) == 0 {
             let s_count = success_count.clone();
-            let s_count = s_count.lock().await.clone();
+            let s_count = *s_count.lock().await;
             let f_count = fail_count.clone();
-            let f_count = f_count.lock().await.clone();
+            let f_count = *f_count.lock().await;
             info!(
               "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
               (s_count + f_count)/start_time.elapsed().as_secs_f64(),
@@ -529,14 +526,14 @@ async fn main() -> Result<()> {
 }
 
 mod tests {
-    use std::{any::Any, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+    use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
-    use tokio::sync::{broadcast, mpsc};
+    
     use anyhow::Result;
 
-    use crate::{c2::Timestamped, definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, TestTransportHandle, Transport, TransportHandle}};
+    use crate::{c2::Timestamped, definitions::{Activation, Expr, Value, Variable}, flight::Flight, router::AutonomyMode, transports::{Stream, TestTransport, Transport}};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestCommand {

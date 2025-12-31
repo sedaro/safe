@@ -1,42 +1,26 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
 use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
-use simvm::sv::data::{Data, FloatValue};
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
-use tracing::instrument::WithSubscriber;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt::format::{Json, JsonFields};
-use tracing_subscriber::layer::Layered;
 use tracing_subscriber::{EnvFilter, Registry};
-use tracing_subscriber::util::SubscriberInitExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 use tracing::{error, info, warn};
-use tokio::sync::{Mutex, Semaphore};
-use ordered_float::OrderedFloat;
 use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
-use tracing::Instrument;
-use time;
 use base64::Engine;
 
-use crate::c2::{Command, Telemetry, Timestamped};
+use crate::c2::Timestamped;
 use crate::config::Config;
-use crate::definitions::{Activation, Expr, Value, Variable};
 use crate::observability as obs;
 use crate::router::{AutonomyMode, Router};
-use simvm::sv::{combine::TR, data::Datum, parse::Parse, pretty::Pretty};
 use crate::c2::{CommandsRequest, LogsRequest};
-use crate::transports::{MpscTransportHandle, Transport};
+use crate::transports::Transport;
 use crate::transports::TransportHandle;
-use crate::transports::{MpscTransport, Stream, TcpTransport, UnixTransport};
-use crate::simulation::SedaroSimulator;
-use crate::kits::stats::{GuassianSet, NormalDistribution};
-use crate::kits::stats::StatisticalDistribution;
+use crate::transports::{MpscTransport, Stream};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncSeekExt, SeekFrom};
 use std::time::Duration;
@@ -139,7 +123,7 @@ where
     }
     // TODO: Build out rest of configurability here as continuous of builder pattern rather than constructor params
 
-    pub fn run(mut self) -> () {
+    pub fn run(self) {
       // Start client handler (if transport is set)
       if let Some(mut client_transport) = self.client_to_c2_transport {
         let handle = self.c2_to_router_transport_handle;
@@ -263,7 +247,7 @@ where
                   }
               } else if let Ok(tlm) = serde_json::from_str::<T>(&msg) {
                   router_stream.write(tlm).await.ok();
-              } else if let Ok(_) = serde_json::from_str::<CommandsRequest>(&msg) {
+              } else if serde_json::from_str::<CommandsRequest>(&msg).is_ok() {
                 loop {
                     // TODO: Figure out how to break out of this loop when client hangs up!
                     match router_stream.read().await {

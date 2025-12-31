@@ -35,7 +35,7 @@ impl SedaroSimulator {
   }
   pub async fn run(&self, duration_days: f64, target_path: &std::path::PathBuf) -> Result<std::process::Output> {
     match timeout(
-        self.timeout.clone(),
+        self.timeout,
         TokioCommand::new(&self.command)
           .args(vec!["--duration", &(duration_days).to_string(), "--target-config", target_path.to_str().unwrap()]) 
           .args(self.args.clone())
@@ -87,9 +87,11 @@ pub struct FileTargetConfigEntry {
 }
 
 mod tests {
-    use base64::{Engine, prelude::BASE64_STANDARD};
+    use crate::simulation::FileTargetFrameEntry;
 
-    use super::*;
+    
+
+    
 
     #[test]
     fn test_deser() {
