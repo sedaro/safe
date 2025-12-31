@@ -6,16 +6,16 @@ use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::time;
 use tracing::warn;
-use crate::c2::{Command, Telemetry};
 use crate::config::Config;
 
-pub struct ObservabilitySubsystem {
+pub struct ObservabilitySubsystem<T, C> {
+    _marker: std::marker::PhantomData<(T, C)>,
     sig: String, // Signature for differentiating concurrent log streams
     seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum Event {
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Event<T, C> {
     MetricsCollected {
         uptime: u64,
         memory: f64,
@@ -24,13 +24,14 @@ pub enum Event {
         cpu: f32,
     },
     CommandIssued {
-        commands: Vec<Command>,
+        commands: Vec<C>,
         reason: Option<String>,
     },
-    TelemetryReceived(Telemetry),
+    TelemetryReceived(T),
     // ConfigChanged { before: , after },
 }
-#[derive(Clone, Serialize, Deserialize, Debug)]
+
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Location {
     Main,
     Router,
@@ -39,9 +40,14 @@ pub enum Location {
     C2,
 }
 
-impl ObservabilitySubsystem {
+impl<T, C> ObservabilitySubsystem<T, C> 
+where
+  T: Serialize,
+  C: Serialize,
+{
     pub fn new(seq: Option<u64>) -> Self {
         Self {
+            _marker: std::marker::PhantomData,
             sig: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -51,9 +57,9 @@ impl ObservabilitySubsystem {
         }
     }
 
-    pub fn log_event(&self, location: Location, event: Event) {
+    pub fn log_event(&self, location: Location, event: Event<T, C>) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(sig = self.sig, seq = seq, loc = ?location, event = ?event);
+        tracing::info!(sig = self.sig, seq = seq, loc = serde_json::to_string(&location).unwrap(), event = serde_json::to_string(&event).unwrap()); // FIXME: Serialize properly and avoid nested json serialization
     }
 
     pub async fn run(&self, config: &Config) -> Result<()> {

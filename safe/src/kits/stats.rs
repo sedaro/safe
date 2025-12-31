@@ -3,9 +3,6 @@ use std::fmt::Display;
 use rand::{self, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
-// TODO: Brad to architect this module
-// https://sedaro.slack.com/archives/D03FLBA7WCT/p1765289350221849
-
 pub trait StatisticalDistribution<T> {
     fn sample(&mut self) -> T;
 }
@@ -88,8 +85,9 @@ impl Display for GuassianSet {
     }
 }
 
+#[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::kits::stats::{GuassianSet, NormalDistribution, StatisticalDistribution};
 
     fn approx_eq(a: f64, b: f64, epsilon: f64) -> bool {
         (a - b).abs() < epsilon
