@@ -1008,4 +1008,4 @@ mod tests {
 
 // TODO:
 // - Implement timeouts on reads?
-// - Implement connection retries and reconnect on any transport that can be disrupted
+// - Implement connection retries and reconnect on any transport that can be disrupted?

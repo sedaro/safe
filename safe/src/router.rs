@@ -125,7 +125,7 @@ where
             c2_transport,
             autonomy_modes_transport: Box::new(autonomy_modes_transport),
             observability,
-            selected_mode: None, // TODO: Figure out a better way to sequence start up and initial configuration.  Best to just rely on the routing rules to determine which Mode activates first?
+            selected_mode: None,
             autonomy_modes: HashMap::new(),
             autonomy_mode_write_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             autonomy_mode_read_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

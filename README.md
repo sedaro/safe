@@ -161,7 +161,6 @@ cargo run -- tx '{"timestamp": 1625247600, "proximity_m": 200 }'
 ## Project Layout
 
 - [`safe`](./safe/): `safe` implementation
-  - [`sedaro`](./safe/sedaro/): Utilities and drivers for integrating [Sedaro](https://sedaro.com) Edge Deployable Simulators (EDS)
 - [`safectl`](./safectl/): A CLI for interacting with a running `safe` process
 - [`examples`](./examples/): Example autonomy implementations and reference designs
 

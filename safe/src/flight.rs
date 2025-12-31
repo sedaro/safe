@@ -34,13 +34,11 @@ pub struct Flight<T, C, State = Build> {
   _state: std::marker::PhantomData<State>,
   config: Config,
   router: Router<T, C>,
-  // router: Arc<Mutex<Router<MpscTransport<Telemetry, Command>>>>, // TODO: Make generic
   tracing_layers: Vec<tracing_subscriber::fmt::Layer<Registry, JsonFields, tracing_subscriber::fmt::format::Format<Json>, NonBlocking>>,
   // tracing_layers: Vec<tracing_subscriber::fmt::Layer<Registry>>,
   tracing_guards: HashMap<String, WorkerGuard>,
   c2_to_router_transport_handle: Box<dyn TransportHandle<T, C>>,
   client_to_c2_transport: Option<Box<dyn Transport<String, String>>>,
-  // client_to_c2_transport: Option<Arc<Mutex<TcpTransport<String, String>>>>, // TODO: Make generic
 }
 
 
@@ -149,7 +147,7 @@ where
   C: Clone + Serialize + for<'de>Deserialize<'de> + Send + 'static + Sync,
 {
     // TODO: Support registering and deregistering modes while running
-    pub async fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mode: M) -> Result<()> { // TODO: Implement dynamic registration
+    pub async fn register_autonomy_mode<M: AutonomyMode<T, C>>(&mut self, mode: M) -> Result<()> {
       // FIXME: This block doesn't work currently
       let (non_blocking, guard) =
       tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", format!("{}.log", mode.name().clone())));
