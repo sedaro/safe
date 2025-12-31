@@ -617,7 +617,7 @@ mod tests {
   - Is TCP ack enough?  What about UDP?
 - Does the client/server model for transports make sense?  Should router take a stream instead of a transport impls?
   - Document: Passing a handle to the modes allow them to handle reconnect
-  - A: It does make sense for flexiblity and the opportunity to flag off certain transports which aren't supported on particular platforms.  Also server-broadcast is nice.
+  - A: It does make sense for flexiblity and the opportunity to flag off certain transports which aren't supported on particular platforms.  Also server-broadcast is nice.  Transports enable platform-agnostic IPC.
 - Make unit-testable and more of a framework
 - Support background running modes and foreground
   - Implement a way to have background modes which are alerted when they are activated/deactivated

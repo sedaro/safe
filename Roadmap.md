@@ -60,6 +60,8 @@ The work completed to date has aimed to:
 
 - [ ] 🔴 There is an issuing with the router loop given hows it's implemented with a tokio::select.  Essentially commands from active modes can be never forwarded because the telemetry received branch runs faster than the active mode command forwarder branch.  If you send many telemetry writes quickly which cause mode switches you'll only get the commands from the last mode activation out.  The intent should be for all commands sent while active to make it out, regardless of telemetry arrival rates.  tokio::select likely doesn't give us the necessary control authority here.  Create a unit test for this where you send several telem messages back to back and then assert that all loopbacks are properly ordered and from the expected mode.
   - This also means that a fault in how frequently telem is sent could completely disable the ability for safe to issue commands
+- [ ] Autonomy Mode heartbeat (like k8s readiness) that is configurable
+  - If an AM becomes unresponsive and it has a probe defined, Router should deactivate it and allow another mode to activate until the unhealthy mode is healthy again.
 - [ ] Observability and Reproducibility Subsystem
   - Figure out if current logging is ugly and non-future proof.  We don't want to miss important logs because of some nested span.  But maybe this is okay because they are still written to the main log.  How do we record logs from subprocesses such that they are still queryable by timestamp??
   - 🔴 Replay needs immediate attention and design before its too late to rollout.
