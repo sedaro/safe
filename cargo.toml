@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "safe",
+    "safectl",
+]
+resolver = "2"
