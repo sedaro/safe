@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use tokio::{process::Command as TokioCommand, time::timeout};
 use anyhow::Result;
 
+// TODO
+#[derive(Clone, Debug)]
+pub struct SimulationResult {}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct SedaroSimulator {
   path: std::path::PathBuf,
