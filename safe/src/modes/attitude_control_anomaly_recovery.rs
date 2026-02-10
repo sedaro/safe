@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::prelude::BASE64_STANDARD;
+use simvm::sv::check::Check;
 use crate::c2::{Command, Telemetry};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
@@ -138,33 +139,44 @@ impl AttitudeControlAnomalyRecovery {
         let max_pointing_error_observations_clone = max_pointing_error_observations.clone();
         let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
 
+          let agent_id = "FpKnj2S4YcchDdf2BGX8cfn";
+          let eds_path = std::path::PathBuf::from("/Users/sebastianwelsh/Downloads/simulation");
+          let results_path = std::path::PathBuf::from(format!("/Users/sebastianwelsh/Development/sedaro/scf/results/uq_run_{}", i));
+
           // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
           // - random suffix?
           // - accept file name as input
           let _init_file_guard = init_file_lock_clone.lock().await;
-          let init_type = TR::parse("(gnc: (\"$as_Position.eci_HGDv5HpfFwcMfs3XpDM5Cl7\": {(float, float, float) | #, eci}, \"PTnxx2jZ8vzTJlRwjxyctn.id\": u128, \"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxx2jZ8vzTJlRwjxyctn.orientation\": {(float, float, float) | #}, \"PTnxx2jZ8vzTJlRwjxyctn.rated_momentum\": float, \"PTnxx2jZ8vzTJlRwjxyctn.rated_torque\": float, \"PTnxx2jZ8vzTJlRwjxyctn.speed\": float, \"PTnxx2jZ8vzTJlRwjxyctn.torque\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.id\": u128, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.orientation\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.rated_momentum\": float, \"PTnxxBv6drdQlzqJlVvvbC.rated_torque\": float, \"PTnxxBv6drdQlzqJlVvvbC.speed\": float, \"PTnxxBv6drdQlzqJlVvvbC.torque\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.id\": u128, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.orientation\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.rated_momentum\": float, \"PTnxxMb7DrlvQKWQsDST4r.rated_torque\": float, \"PTnxxMb7DrlvQKWQsDST4r.speed\": float, \"PTnxxMb7DrlvQKWQsDST4r.torque\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.commanded_moment\": float, \"PTnxxWYyx6GZyvPWwZnmkh.id\": u128, \"PTnxxWYyx6GZyvPWwZnmkh.orientation\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.rated_magnetic_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.commanded_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.id\": u128, \"PTnxxX7KfDFTtZwDWS9L3Z.orientation\": {(float, float, float) | #}, \"PTnxxX7KfDFTtZwDWS9L3Z.rated_magnetic_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.commanded_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.id\": u128, \"PTnxxXTwZYcKSqfzCdNkqc.orientation\": {(float, float, float) | #}, \"PTnxxXTwZYcKSqfzCdNkqc.rated_magnetic_moment\": float, \"PTnxyLN97zsstnd4dVDwcv.absorptivity\": float, \"PTnxyLN97zsstnd4dVDwcv.area\": float, \"PTnxyLN97zsstnd4dVDwcv.centroid\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.diffuse_reflectivity\": float, \"PTnxyLN97zsstnd4dVDwcv.orientation\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.specular_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.absorptivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.area\": float, \"PTnxyLNC6LbltcjyVy7NyW.centroid\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.diffuse_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.orientation\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.specular_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.absorptivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.area\": float, \"PTnxyLNF8gJTrK9VH59Cnw.centroid\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.diffuse_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.orientation\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.specular_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.absorptivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.area\": float, \"PTnxyLNH75rVPjCzhzwYxg.centroid\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.diffuse_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.orientation\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.specular_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.absorptivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.area\": float, \"PTnxyLNK5GqqJtBHHmDhz2.centroid\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.diffuse_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.orientation\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.specular_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.absorptivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.area\": float, \"PTnxyLNM7KjhddLfmsxMNJ.centroid\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.diffuse_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.orientation\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.specular_reflectivity\": float, \"root!.angular_acceleration\": {(float, float, float) | #}, \"root!.angular_velocity\": {(float, float, float) | #}, \"root!.attitude\": {(float, float, float, float) | #}, \"root!.elapsedTime\": day, \"root!.inertia\": {((float, float, float), (float, float, float), (float, float, float)) | #}, \"root!.mass\": float, \"root!.pid_config\": (float, float, float, float), \"root!.position\": {(float, float, float) | #, eci}, \"root!.time\": day, \"root!.timeStep\": day, \"root!.velocity\": {(float, float, float) | #}),)").unwrap();
-          let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin")?; // FIXME
-          let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
+          let type_sig = std::fs::read(eds_path.join(format!("data/init_ty_{agent_id}.json")))?;
+          let type_sig_str = std::str::from_utf8(&type_sig)?;
+          let init_type = TR::parse(type_sig_str).unwrap();
+          let init_file_path = eds_path.join(format!("data/init_{agent_id}.bin"));
+          let init_bytes = std::fs::read(&init_file_path)?;
+          let init_val = dyn_de(&init_type.typ, &init_bytes).unwrap();
           let init_val = TRD::from((init_type.clone(), init_val));
-          println!("Original simulation input Datum: {:?}", init_val.pretty());
+          // println!("Original simulation input Datum: {:?}", init_val.pretty());
+          // println!("===============================================================");
 
-          let patch_str = format!("(((({}, {}, {}, {}),),) : (gnc: (\"root!.pid_config\": (float, float, float, float),),))", pid_controller_gains.0, pid_controller_gains.1, pid_controller_gains.2, pid_controller_gains.3);
+          let patch_str = format!("(((({:.15}, {:.15}, {:.15}, {:.15}),),) : (gnc: (\"root!.pid_config\": (float, float, float, float),),))", 5e-5, 123456.0, 2.5e-4, 0.01);
           let patch_trd = TRD::parse(&patch_str).unwrap();
+          patch_trd.refn.check(&patch_trd.data).unwrap(); // Get helpful error if patch is malformed
           let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("(((({}, {}, {}),),) : (gnc: (\"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float),))", x_wheel_inertia, y_wheel_inertia, z_wheel_inertia);
+          let patch_str = format!("((({:.15}, {:.15}, {:.15}),) : (gnc: (\"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float),))", 123456.0, 123456.0, 123456.0);
           let patch_trd = TRD::parse(&patch_str).unwrap();
+          patch_trd.refn.check(&patch_trd.data).unwrap(); // Get helpful error if patch is malformed
           let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("((((({},), (, {}), (, , {})),),) : (gnc: (\"root!.inertia\": {{((float,), (, float), (, , float)) | #}},),))", inertia_0_0, inertia_1_1, inertia_2_2);
+          let patch_str = format!("((((({:.15}, 0, 0), (0, {:.15}, 0), (0, 0, {:.15})),),) : (gnc: (\"root!.inertia\": {{((float, float, float), (float, float, float), (float, float, float)) | #}},),))", 123456.0, 123456.0, 123456.0);
           let patch_trd = TRD::parse(&patch_str).unwrap();
+          // patch_trd.refn.check(&patch_trd.data).unwrap(); // BUG
           let init_val = init_val.update(&patch_trd).unwrap();
-          println!("Modified simulation input Datum: {:?}", init_val.pretty());
+          // println!("Modified simulation input Datum: {:?}", init_val.pretty());
 
+          // Write modified initial data back to file
           let init_val = init_val.data;
           let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
-          std::fs::write("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin", bytes)?; // FIXME
+          std::fs::write(&init_file_path, bytes)?;
           drop(_init_file_guard);
 
-          let results_path = std::path::PathBuf::from(format!("/Users/sebastianwelsh/Development/sedaro/scf/results/uq_run_{}", i));
           // Clear results
           if results_path.exists() {
             tokio::fs::remove_dir_all(&results_path).await.ok();
@@ -211,14 +223,14 @@ impl AttitudeControlAnomalyRecovery {
           // }
 
           for frame in &frames {
-            let speed = frame.get(1).unwrap().as_f64().unwrap();
+            let speed = frame.get(1).unwrap().data.as_f64().unwrap();
             if max_speed < speed.abs() { max_speed = speed.abs() }
-            let speed = frame.get(4).unwrap().as_f64().unwrap();
+            let speed = frame.get(4).unwrap().data.as_f64().unwrap();
             if max_speed < speed.abs() { max_speed = speed.abs() }
-            let speed = frame.get(7).unwrap().as_f64().unwrap();
+            let speed = frame.get(7).unwrap().data.as_f64().unwrap();
             if max_speed < speed.abs() { max_speed = speed.abs() }
             if i > frames.len()/2 {
-              let pointing_error = frame.get(25).unwrap().as_f64().unwrap();
+              let pointing_error = frame.get(25).unwrap().data.as_f64().unwrap();
               pointing_errors.push(pointing_error);
               if max_pointing_error < pointing_error.abs() { max_pointing_error = pointing_error.abs() }
             }

@@ -10,7 +10,7 @@ use anyhow::Result;
 use tracing_subscriber::fmt::format;
 use simvm::sv::data::{Data, FloatValue};
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
-use simvm::sv::{combine::TR, data::Datum, parse::Parse};
+use simvm::sv::{combine::TR, combine::TRD, data::Datum, parse::Parse};
 use base64::Engine;
 use tokio::fs::File;
 
@@ -26,9 +26,9 @@ pub struct SedaroSimulator {
 }
 
 impl SedaroSimulator {
-  pub fn new(path: std::path::PathBuf) -> Self {
+  pub fn new(path: &std::path::PathBuf) -> Self {
     SedaroSimulator { 
-      path,
+      path: path.clone(),
       args: Vec::new(),
       timeout: Duration::MAX,
       release: true,
@@ -70,6 +70,7 @@ impl SedaroSimulator {
           .env("LANG", "en_US.UTF-8")
           .env("LC_ALL", "en_US.UTF-8")
           .env("LC_CTYPE", "en_US.UTF-8")
+          .env("SIM_UPLOAD_ARTIFACT", "0")
           .output(),
     ).await {
       Err(_) => Err(anyhow::anyhow!("Simulation timed out after {:?} seconds", self.timeout.as_secs())),
@@ -113,7 +114,7 @@ pub struct FileTargetReader {
   reader: BufReader<File>,
   ty: Option<TR>,
   timestamps_mjd: Vec<f64>,
-  frames: Vec<Datum>,
+  frames: Vec<TRD>,
   line_idx: u64,
 }
 
@@ -149,7 +150,7 @@ impl FileTargetReader {
           match dyn_de(&parsed.typ, &frame_bytes) {
             Ok(val) => {
               self.timestamps_mjd.push(entry.data.time);
-              self.frames.push(val);
+              self.frames.push(TRD::from((parsed.clone(), val))); // TODO: More memory efficient approach?
             },
             Err(e) => {
               return Err(anyhow::anyhow!("Simulation frame deserialization error: {:?}", e));
@@ -162,7 +163,7 @@ impl FileTargetReader {
     Ok(())
   }
 
-  pub async fn read_frames(&mut self) -> Result<Vec<Datum>> {
+  pub async fn read_frames(&mut self) -> Result<Vec<TRD>> {
     self.parse_frames().await?;
     let frames = self.frames.clone();
     Ok(frames)
@@ -174,7 +175,7 @@ impl FileTargetReader {
       Err(idx) => idx,
     }
   }
-  pub async fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<Datum>> {
+  pub async fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<TRD>> {
     self.parse_frames().await?;
     if let Some(start_time_mjd) = self.timestamps_mjd.first() {
       if timestamp_mjd < *start_time_mjd || timestamp_mjd > *self.timestamps_mjd.last().unwrap() {
@@ -186,7 +187,7 @@ impl FileTargetReader {
 
     Ok(Some(self.frames[self.idx_of_timestamp(timestamp_mjd)].clone()))
   }
-  pub async fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<Datum>> {
+  pub async fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
     if let Some(start_time_mjd) = self.timestamps_mjd.first() {
       let timestamp_mjd = start_time_mjd + (duration.as_secs_f64() / 86400.0);
       self.read_frame_at_timestamp(timestamp_mjd).await
