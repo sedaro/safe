@@ -6,6 +6,9 @@ pub struct Telemetry {
     // pub timestamp: u64,
     pub pointing_error: f64,
     pub in_sunlight: bool,
+    pub disk_util: f64,
+    pub battery_soc: f64,
+    pub od_solution: (f64, f64, f64),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

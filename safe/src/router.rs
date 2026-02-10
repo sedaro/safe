@@ -217,8 +217,8 @@ where
                             },
                           };
                         }
-                        Err(_) => {
-                          warn!("Failed to read command from active mode {}", mode_name);
+                        Err(e) => {
+                          warn!("Failed to read command from active mode {}: {:?}", mode_name, e);
                         }
                       }
                     }
@@ -362,7 +362,13 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::{c2::Telemetry, definitions::{Expr, Value, Variable}};
+    use crate::{definitions::{Expr, Value, Variable}};
+
+    #[derive(Clone, Serialize, Deserialize, Debug)]
+    pub struct Telemetry {
+        pub pointing_error: f64,
+        pub in_sunlight: bool,
+    }
 
     use super::*;
 
