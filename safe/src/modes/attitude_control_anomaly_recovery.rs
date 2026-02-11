@@ -207,8 +207,8 @@ impl AttitudeControlAnomalyRecovery {
 
           let mut reader = FileTargetReader::try_from_path(
             &results_path.join("PTnYWzsc2Nhywc8WVS4blm.gnc.jsonl")
-          ).await?;
-          let frames = reader.read_frames().await?;
+          )?;
+          let frames = reader.read_frames()?;
 
           let mut max_speed: f64 = 0.0;
           let mut max_pointing_error: f64 = 0.0;
