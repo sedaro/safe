@@ -97,7 +97,7 @@ fn run_simulation(
     match &result {
         Ok(output) => match output.status.success() {
             true => {
-                println!("Simulation completed successfully");
+                // println!("Simulation completed successfully");
             }
             false => {
                 return Err(anyhow::anyhow!(
@@ -172,7 +172,7 @@ impl CostFunction for PowerOptimization {
         let perf = run_simulation(&self.simulator, &pointing_schedule, &imaging_schedule).unwrap();
         let out_of_bounds = (end_time - SIM_DURATION * 86400.0).max(0.0);
         let cost = perf + OUT_OF_BOUNDS_PENALTY * out_of_bounds;
-        println!("Evaluated cost: {:.4} for start_time: {:.2}s, duration: {:.2}s", cost, param[0], param[1]);
+        // println!("Evaluated cost: {:.4} for start_time: {:.2}s, duration: {:.2}s", cost, param[0], param[1]);
         Ok(cost)
     }
 }
@@ -233,7 +233,7 @@ impl AutonomyMode<Telemetry, TimedCommand> for MultiObjectiveOptimization {
                 .write(RouterMessage::Command { 
                   data: TimedCommand::Scheduled {
                     cmd: Command::CaptureImage,
-                    gps_time: utc_mjd_to_gps(best_param[0]),
+                    gps_time: utc_mjd_to_gps(60_000.0 + best_param[0]), // FIXME: Hardcode
                   },
                   nonce: new_nonce,
                 })
