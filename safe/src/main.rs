@@ -24,6 +24,7 @@ use crate::modes::multi_objective_optimization::MultiObjectiveOptimization;
 use crate::transports::TcpTransport;
 use crate::simulation::SedaroSimulator;
 use crate::modes::attitude_control_anomaly_recovery::AttitudeControlAnomalyRecovery;
+use std::env;
 use std::time::Duration;
 use crate::flight::Flight;
 
@@ -58,9 +59,9 @@ async fn main() -> Result<()> {
         100,
         12,
         SedaroSimulator::new(
-          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/imaging"),
+          &std::path::PathBuf::from("./simulators/imaging"),
         ).venv(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -71,9 +72,9 @@ async fn main() -> Result<()> {
         Activation::Immediate(Expr::not(Expr::Term(Variable::Bool(Value::TelemetryRef("in_sunlight".to_string()))))),
         // Activation::Immediate(Expr::Term(Variable::Bool(Value::Literal(true)))),
         SedaroSimulator::new(
-          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/iridium"),
+          &std::path::PathBuf::from("./simulators/iridium"),
         ).venv(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -85,9 +86,9 @@ async fn main() -> Result<()> {
         100,
         12,
         SedaroSimulator::new(
-          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/imaging"),
+          &std::path::PathBuf::from("./simulators/imaging"),
         ).venv(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
