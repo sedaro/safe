@@ -66,6 +66,7 @@ impl SedaroSimulator {
         };
         std::fs::create_dir_all(&target_path)?;
         let target_path = target_path.canonicalize().unwrap();
+        let path = self.path.canonicalize().unwrap();
         match timeout(
             self.timeout,
             TokioCommand::new(&command)
@@ -80,7 +81,7 @@ impl SedaroSimulator {
                     Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
                     None => vec![],
                 })
-                .current_dir(&self.path)
+                .current_dir(&path)
                 // .env("SIMULATION_PATH", self.path.to_str().unwrap())
                 // .env("PYTHONPATH", format!("{}/simulation_python:{}/simulation_buildtime_python:{}/simvm_python:{}", self.path.to_str().unwrap(), self.path.to_str().unwrap(), self.path.to_str().unwrap(), env::var("PYTHONPATH").unwrap_or_default()))
                 .env(
@@ -133,6 +134,7 @@ impl SedaroSimulator {
         };
         std::fs::create_dir_all(&target_path)?;
         let target_path = target_path.canonicalize().unwrap();
+        let path = self.path.canonicalize().unwrap();
         let output = std::process::Command::new(&command)
             .args(vec![
                 "--duration",
@@ -145,7 +147,7 @@ impl SedaroSimulator {
                 Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
                 None => vec![],
             })
-            .current_dir(&self.path)
+            .current_dir(&path)
             .env(
                 "PATH",
                 match self.venv {
@@ -173,11 +175,12 @@ impl SedaroSimulator {
         Ok(output)        
     }
     pub fn read_init_type(&self, agent_id: &str) -> Result<TR> {
+        let path = self.path.canonicalize().unwrap();
         match &self.init_type {
             Some(ty) => Ok(ty.clone()),
             None => {
                 let type_sig =
-                    std::fs::read(self.path.join(format!("data/init_ty_{agent_id}.json")))?;
+                    std::fs::read(path.join(format!("data/init_ty_{agent_id}.json")))?;
                 let type_sig_str = std::str::from_utf8(&type_sig)?;
                 let parsed_ty = TR::parse(type_sig_str).unwrap();
                 Ok(parsed_ty)
