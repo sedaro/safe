@@ -16,8 +16,10 @@ use crate::simulation::{FileTargetReader, SedaroSimulator};
 use argmin::core::{CostFunction, Error, Executor};
 use argmin::core::State;
 
-const SIM_DURATION: f64 = 1.0 / 24.0; // 1 hour in days
+const SIM_DURATION: f64 = 1.0 / 24.0;
 const AGENT_ID: &str = "PTnYWzsc2Nhywc8WVS4blm";
+
+const IMAGING_DELAY: f64 = 25.0; // Seconds to delay after switching to observation mode before starting imaging
 
 const SOC_WEIGHT: f64 = 1000.0;
 const DATA_GEN_WEIGHT: f64 = 1.0;
@@ -25,38 +27,33 @@ const DATA_DOWN_WEIGHT: f64 = 1.0;
 const OUT_OF_BOUNDS_PENALTY: f64 = 1e6;
 
 const MAX_ITERATIONS: u64 = 20;
-const TARGET_PERFORMANCE: f64 = -0.8;
-const SWARM_SIZE: usize = 5;
+const TARGET_PERFORMANCE: f64 = -1500.0;
+const SWARM_SIZE: usize = 10;
 
 fn performance(power_frames: &Vec<TRD>, cdh_frames: &Vec<TRD>) -> f64 {
     let min_soc = power_frames.iter().fold(f64::INFINITY, |min_soc, frame| {
         let soc = frame
             .get_by_field("6VN95ZbK4TNfzYGpr9wGSK.state_of_charge")
-            .unwrap()
+            .expect("Failed to get state_of_charge field")
             .data
             .as_f64()
-            .unwrap();
+            .expect("Failed to get state_of_charge data");
         min_soc.min(soc)
     });
-    let max_data_generated = cdh_frames.iter().fold(f64::INFINITY, |max_data_gen, frame| {
-        let data_gen = frame
-            .get_by_field("root.cumulative_generated_image_data")
-            .unwrap()
-            .data
-            .as_f64()
-            .unwrap();
-        max_data_gen.min(data_gen)
-    });
-    let max_data_downlinked = cdh_frames.iter().fold(f64::INFINITY, |max_data_down, frame| {
-        let data_down = frame
-            .get_by_field("root.cumulative_downlinked_image_data")
-            .unwrap()
-            .data
-            .as_f64()
-            .unwrap();
-        max_data_down.min(data_down)
-    });
+    let max_data_generated = cdh_frames.last().unwrap()
+        .get_by_field("root.cumulative_generated_image_data")
+        .expect("Failed to get cumulative_generated_image_data field")
+        .data
+        .as_f64()
+        .expect("Failed to get cumulative_generated_image_data data");
+    let max_data_downlinked = cdh_frames.last().unwrap()
+        .get_by_field("root.cumulative_downlinked_image_data")
+        .expect("Failed to get cumulative_downlinked_image_data field")
+        .data
+        .as_f64()
+        .expect("Failed to get cumulative_downlinked_image_data data");
 
+    println!("Min SOC: {:.4}, Max Data Generated: {:.4}, Max Data Downlinked: {:.4}", min_soc, max_data_generated, max_data_downlinked);
     -(min_soc * SOC_WEIGHT + max_data_generated * DATA_GEN_WEIGHT + max_data_downlinked * DATA_DOWN_WEIGHT)
 }
 
@@ -66,14 +63,15 @@ fn run_simulation(
     imaging_schedule: &[(f64, &str)],
 ) -> Result<f64> {
     // Working directory
-    println!("-- Starting simulation run --");
+    // println!("-- Starting simulation run --");
     let results_path = tempfile::Builder::new()
         .prefix("simulation_results_")
-        .tempdir()?
+        .tempdir()
+        .expect("Failed to create temporary directory for simulation results")
         .into_path();
 
     let mut patches = vec![];
-    println!("Patching simulation input data...");
+    // println!("Patching simulation input data...");
     let schedule_str = pointing_schedule
         .iter()
         .map(|(t, s)| format!("({:.15}, \"{}\")", t, s))
@@ -91,7 +89,7 @@ fn run_simulation(
     patches.push((var_details, format!("((([{schedule_str}],),),)")));
 
     // Clear results dir and run simulation
-    println!("Running simulation...");
+    // println!("Running simulation...");
     if results_path.exists() {
         std::fs::remove_dir_all(&results_path).ok();
     }
@@ -115,8 +113,8 @@ fn run_simulation(
 
     // Extract frames from local target
     Ok(performance(
-        &get_results(AGENT_ID, "power", &results_path)?,
-        &get_results(AGENT_ID, "cdh", &results_path)?,
+        &get_results(AGENT_ID, "power", &results_path).expect("Failed to get power results"),
+        &get_results(AGENT_ID, "cdh", &results_path).expect("Failed to get cdh results"),
     ))
 }
 
@@ -148,25 +146,34 @@ impl CostFunction for PowerOptimization {
         //
         // TODO: add an offset for imaging to start
         let start_time = param[0] / 86400.0; // Convert seconds to days
-        let duration = param[1] / 86400.0; // Convert seconds to days
+        let end_time = start_time + param[1] / 86400.0;
 
         // Construct schedule based on the parameters
         let pointing_schedule: Vec<(f64, &str)> = vec![
             (60000., "6VPcrRLY3CrmDrNCpxpVTK"),               // Yaw-only sun
             (60000.0 + start_time, "6VPctJwTStz3JdspSxMgVz"), // Nadir (observation)
-            (60000.0 + start_time + duration, "6VPcrRLY3CrmDrNCpxpVTK"),   // Yaw-only sun
+            (60000.0 + end_time, "6VPcrRLY3CrmDrNCpxpVTK"),   // Yaw-only sun
         ];
 
-        let imaging_schedule: Vec<(f64, &str)> = vec![
-            (60000.0 + start_time, "6VPhZGYSSK9fCDQgYSkdrp"), // Start imaging
-            (60000.0 + start_time + duration, "6VPhZGYSSK9fCDQgYSkdrp"),   // FIXME Stop imaging
-        ];
+        let imaging_start_time = start_time + IMAGING_DELAY / 86400.0;
+        let imaging_schedule = {
+            if imaging_start_time > end_time {
+                vec![]
+            } else {
+                vec![
+                    (60000.0 + imaging_start_time, "6VPhZGYSSK9fCDQgYSkdrp"), // Start imaging
+                    (60000.0 + end_time, "6VV4GdVZGZvjGb76fPmtnj"),   // Stop imaging
+                ]
+            }
+        };
 
         // Run simulation and get performance metric
         // Penalty for out of bounds schedules
         let perf = run_simulation(&self.simulator, &pointing_schedule, &imaging_schedule).unwrap();
-        let out_of_bounds = (start_time + duration - SIM_DURATION * 86400.0).min(0.0);
-        Ok(perf + OUT_OF_BOUNDS_PENALTY * out_of_bounds)
+        let out_of_bounds = (end_time - SIM_DURATION * 86400.0).max(0.0);
+        let cost = perf + OUT_OF_BOUNDS_PENALTY * out_of_bounds;
+        println!("Evaluated cost: {:.4} for start_time: {:.2}s, duration: {:.2}s", cost, param[0], param[1]);
+        Ok(cost)
     }
 }
 
@@ -202,17 +209,18 @@ impl AutonomyMode<Telemetry, TimedCommand> for MultiObjectiveOptimization {
               println!("MultiObjectiveOptimization activated");
 
               let problem = PowerOptimization { simulator: self.simulator.clone() };
-              let initial_guess = vec![300.0, 600.0]; // Initial guess for start and end times (in seconds)
-              let vertices = vec![
-                  vec![initial_guess[0], initial_guess[1]], // Initial guess
-                  vec![initial_guess[0] + 60.0, initial_guess[1]], // Perturb start time
-                  vec![initial_guess[0], initial_guess[1] + 60.0], // Perturb end time
-              ];
+            //   let initial_guess = vec![300.0, 600.0]; // Initial guess for start and end times (in seconds)
+            //   let vertices = vec![
+            //       vec![initial_guess[0], initial_guess[1]], // Initial guess
+            //       vec![initial_guess[0] + 60.0, initial_guess[1]], // Perturb start time
+            //       vec![initial_guess[0], initial_guess[1] + 60.0], // Perturb end time
+            //   ];
               // let solver = NelderMead::new(vertices).with_sd_tolerance(1e-3).unwrap();
-              let bounds = (vec![0.0, 60.0], vec![3600.0, 3600.0 - 60.0]); // At least 60 seconds of imaging
+              let bounds = (vec![0.0, 60.0], vec![SIM_DURATION, 600.0]); // 60 sec to 10 minutes imaging
               let solver = ParticleSwarm::new(bounds, SWARM_SIZE);
               let res = Executor::new(problem, solver)
                   .configure(|state| { state.target_cost(TARGET_PERFORMANCE).max_iters(MAX_ITERATIONS) })
+                  .timeout(std::time::Duration::from_secs(45))
                   .run()
                   .unwrap();
               println!("Optimization best performance: {:?}", res.state.best_cost);
