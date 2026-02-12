@@ -55,7 +55,7 @@ impl AutonomyMode<Telemetry, TimedCommand> for ContactAnalysis {
                 Ok(output) => {
                   match output.status.success() {
                     true => {
-                      println!("Simulation completed successfully");
+                      // println!("Simulation completed successfully");
                     },
                     false => {
                       panic!("Simulation failed with non-zero exit code: {:?}", String::from_utf8_lossy(&output.stderr)); // FIXME: warn instead?
@@ -81,7 +81,7 @@ impl AutonomyMode<Telemetry, TimedCommand> for ContactAnalysis {
                 }
               }
 
-              println!("Optimal contact angle: {} degrees at MJD {}", optimal_contact_angle, optimal_timestamp_mjd);
+              // println!("Optimal contact angle: {} degrees at MJD {}", optimal_contact_angle, optimal_timestamp_mjd);
 
               stream
                 .write(RouterMessage::Command { 
