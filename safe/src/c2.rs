@@ -19,6 +19,7 @@ pub enum Command {
     IridiumTransmitMsg(String),
     PointSunYaw,
     PointNadir,
+    CaptureImage,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

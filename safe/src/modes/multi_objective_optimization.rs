@@ -1,31 +1,173 @@
 use anyhow::Result;
+use argmin::solver::particleswarm::ParticleSwarm;
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
-use crate::c2::{Command, Telemetry, TimedCommand};
+use crate::c2::{Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
 use serde::Serialize;
-use simvm::sv::data::{Data, FloatValue};
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
-use std::sync::Arc;
+use simvm::sv::data::Data;
 use std::vec;
-use tokio::sync::Mutex;
-use tracing::{info, warn};
-use tokio::sync::Semaphore;
-use ordered_float::OrderedFloat;
-use tracing::Instrument;
-use base64::Engine;
 
-use simvm::sv::{combine::TR, combine::TRD, data::Datum, parse::Parse};
+use simvm::sv::combine::TRD;
 use crate::c2::{AutonomyModeMessage, RouterMessage};
 use crate::transports::Stream;
-use crate::simulation::{self, SedaroSimulator};
-use crate::kits::stats::{GuassianSet, NormalDistribution};
-use crate::kits::stats::StatisticalDistribution;
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use simvm::sv::update::Update;
-use simvm::sv::pretty::Pretty;
+use crate::simulation::{FileTargetReader, SedaroSimulator};
+use argmin::core::{CostFunction, Error, Executor};
+use argmin::core::State;
+
+const SIM_DURATION: f64 = 1.0 / 24.0; // 1 hour in days
+const AGENT_ID: &str = "PTnYWzsc2Nhywc8WVS4blm";
+
+const SOC_WEIGHT: f64 = 1000.0;
+const DATA_GEN_WEIGHT: f64 = 1.0;
+const DATA_DOWN_WEIGHT: f64 = 1.0;
+const OUT_OF_BOUNDS_PENALTY: f64 = 1e6;
+
+const MAX_ITERATIONS: u64 = 20;
+const TARGET_PERFORMANCE: f64 = -0.8;
+const SWARM_SIZE: usize = 5;
+
+fn performance(power_frames: &Vec<TRD>, cdh_frames: &Vec<TRD>) -> f64 {
+    let min_soc = power_frames.iter().fold(f64::INFINITY, |min_soc, frame| {
+        let soc = frame
+            .get_by_field("6VN95ZbK4TNfzYGpr9wGSK.state_of_charge")
+            .unwrap()
+            .data
+            .as_f64()
+            .unwrap();
+        min_soc.min(soc)
+    });
+    let max_data_generated = cdh_frames.iter().fold(f64::INFINITY, |max_data_gen, frame| {
+        let data_gen = frame
+            .get_by_field("root.cumulative_generated_image_data")
+            .unwrap()
+            .data
+            .as_f64()
+            .unwrap();
+        max_data_gen.min(data_gen)
+    });
+    let max_data_downlinked = cdh_frames.iter().fold(f64::INFINITY, |max_data_down, frame| {
+        let data_down = frame
+            .get_by_field("root.cumulative_downlinked_image_data")
+            .unwrap()
+            .data
+            .as_f64()
+            .unwrap();
+        max_data_down.min(data_down)
+    });
+
+    -(min_soc * SOC_WEIGHT + max_data_generated * DATA_GEN_WEIGHT + max_data_downlinked * DATA_DOWN_WEIGHT)
+}
+
+fn run_simulation(
+    simulator: &SedaroSimulator,
+    pointing_schedule: &[(f64, &str)],
+    imaging_schedule: &[(f64, &str)],
+) -> Result<f64> {
+    // Working directory
+    println!("-- Starting simulation run --");
+    let results_path = tempfile::Builder::new()
+        .prefix("simulation_results_")
+        .tempdir()?
+        .into_path();
+
+    let mut patches = vec![];
+    println!("Patching simulation input data...");
+    let schedule_str = pointing_schedule
+        .iter()
+        .map(|(t, s)| format!("({:.15}, \"{}\")", t, s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let var_details = format!("({AGENT_ID}: (cdh: (\"6VPcwrnbQS6HBHdy3kWtDC.mode_schedule\": [(float, str)],),),)");
+    patches.push((var_details, format!("((([{schedule_str}],),),)")));
+
+    let schedule_str = imaging_schedule
+        .iter()
+        .map(|(t, s)| format!("({:.15}, \"{}\")", t, s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let var_details = format!("({AGENT_ID}: (cdh: (\"6VPhZLmbZhNnP96c9qbnBw.mode_schedule\": [(float, str)],),),)");
+    patches.push((var_details, format!("((([{schedule_str}],),),)")));
+
+    // Clear results dir and run simulation
+    println!("Running simulation...");
+    if results_path.exists() {
+        std::fs::remove_dir_all(&results_path).ok();
+    }
+    let result = simulator.run_sync(SIM_DURATION, &results_path, Some(&patches));
+    match &result {
+        Ok(output) => match output.status.success() {
+            true => {
+                println!("Simulation completed successfully");
+            }
+            false => {
+                return Err(anyhow::anyhow!(
+                    "Simulation failed with non-zero exit code: {:?}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        },
+        Err(e) => {
+            return Err(anyhow::anyhow!("Simulation failed: {:?}", e));
+        }
+    }
+
+    // Extract frames from local target
+    Ok(performance(
+        &get_results(AGENT_ID, "power", &results_path)?,
+        &get_results(AGENT_ID, "cdh", &results_path)?,
+    ))
+}
+
+fn get_results(
+    agent_id: &str,
+    engine: &str,
+    results_path: &std::path::PathBuf,
+) -> Result<Vec<TRD>> {
+    // Extract frames from local target
+    let mut reader =
+        FileTargetReader::try_from_path(&results_path.join(format!("{agent_id}.{engine}.jsonl")))
+            .unwrap();
+    let frames = reader.read_frames().unwrap();
+    Ok(frames)
+}
+
+struct PowerOptimization {
+    simulator: SedaroSimulator,
+}
+
+impl CostFunction for PowerOptimization {
+    type Param = Vec<f64>; // Optimize the start and end time of observation window
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+        // We parametrize the schedules on start time and duration of observations. At the
+        // start time we simultaneously switch into Nadir pointing and start imaging, and
+        // at the end time we switch back to yaw-only sun pointing and stop imaging.
+        //
+        // TODO: add an offset for imaging to start
+        let start_time = param[0] / 86400.0; // Convert seconds to days
+        let duration = param[1] / 86400.0; // Convert seconds to days
+
+        // Construct schedule based on the parameters
+        let pointing_schedule: Vec<(f64, &str)> = vec![
+            (60000., "6VPcrRLY3CrmDrNCpxpVTK"),               // Yaw-only sun
+            (60000.0 + start_time, "6VPctJwTStz3JdspSxMgVz"), // Nadir (observation)
+            (60000.0 + start_time + duration, "6VPcrRLY3CrmDrNCpxpVTK"),   // Yaw-only sun
+        ];
+
+        let imaging_schedule: Vec<(f64, &str)> = vec![
+            (60000.0 + start_time, "6VPhZGYSSK9fCDQgYSkdrp"), // Start imaging
+            (60000.0 + start_time + duration, "6VPhZGYSSK9fCDQgYSkdrp"),   // FIXME Stop imaging
+        ];
+
+        // Run simulation and get performance metric
+        // Penalty for out of bounds schedules
+        let perf = run_simulation(&self.simulator, &pointing_schedule, &imaging_schedule).unwrap();
+        let out_of_bounds = (start_time + duration - SIM_DURATION * 86400.0).min(0.0);
+        Ok(perf + OUT_OF_BOUNDS_PENALTY * out_of_bounds)
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct MultiObjectiveOptimization {
@@ -57,14 +199,43 @@ impl AutonomyMode<Telemetry, TimedCommand> for MultiObjectiveOptimization {
               active = true;
               nonce = Some(new_nonce);
               println!("MultiObjectiveOptimization activated");
-              
+
+              let problem = PowerOptimization { simulator: self.simulator.clone() };
+              let initial_guess = vec![300.0, 600.0]; // Initial guess for start and end times (in seconds)
+              let vertices = vec![
+                  vec![initial_guess[0], initial_guess[1]], // Initial guess
+                  vec![initial_guess[0] + 60.0, initial_guess[1]], // Perturb start time
+                  vec![initial_guess[0], initial_guess[1] + 60.0], // Perturb end time
+              ];
+              // let solver = NelderMead::new(vertices).with_sd_tolerance(1e-3).unwrap();
+              let bounds = (vec![0.0, 60.0], vec![3600.0, 3600.0 - 60.0]); // At least 60 seconds of imaging
+              let solver = ParticleSwarm::new(bounds, SWARM_SIZE);
+              let res = Executor::new(problem, solver)
+                  .configure(|state| { state.target_cost(TARGET_PERFORMANCE).max_iters(MAX_ITERATIONS) })
+                  .run()
+                  .unwrap();
+              println!("Optimization best performance: {:?}", res.state.best_cost);
+              let best_param = &res.state.get_best_param().expect("No best parameters found").position;
+              println!(
+                  "Optimization best parameters (start_elapsed_time, duration (s)): ({:?}, {:?})",
+                  best_param[0], best_param[1]);
+
+              // stream
+              //   .write(RouterMessage::Command { 
+              //     data: TimedCommand::Scheduled {
+              //       cmd: Command::CaptureImage,
+              //       gps_time: utc_mjd_to_gps(),
+              //     },
+              //     nonce: new_nonce,
+              //   })
+              //   .await?;
             },
             AutonomyModeMessage::Inactive => {
               active = false;
               println!("MultiObjectiveOptimization deactivated");
             },
             AutonomyModeMessage::Telemetry(_telemetry) => {
-              println!("MultiObjectiveOptimization received telemetry {:?}", _telemetry);
+              // println!("MultiObjectiveOptimization received telemetry {:?}", _telemetry);
               // Ignore telemetry for now
             },
           }
@@ -84,229 +255,4 @@ impl MultiObjectiveOptimization {
           simulator,
       }
   }
-
-  async fn uq_pid_gains(&self, pid_controller_gains: (f64, f64, f64, f64)) -> Result<(f64, f64, f64, f64)> {
-      info!("Average pointing error is too high.  Re-tuning controller.");
-      info!("New PID gains selected: {}, {}, {}, {}", pid_controller_gains.0, pid_controller_gains.1, pid_controller_gains.2, pid_controller_gains.3);
-
-      let semaphore = Arc::new(Semaphore::new(self.concurrency));
-      let mut handles = Vec::new();
-      let start_time = std::time::Instant::now();
-      let success_count = Arc::new(Mutex::new(0.0));
-      let fail_count = Arc::new(Mutex::new(0.0));
-      let init_file_lock = Arc::new(Mutex::new(()));
-
-      let mut inertia_0_0 = 0.005;
-      let mut inertia_1_1 = 0.005;
-      let mut inertia_2_2 = 0.005;
-      let mut x_wheel_inertia = 0.000005;
-      let mut y_wheel_inertia = 0.000005;
-      let mut z_wheel_inertia = 0.000005;
-
-      let mut inertia_mat_0_0_dist = NormalDistribution::new(inertia_0_0, inertia_0_0 * ((5.0 / 3.0) / 100.0)).seed(10);
-      let mut inertia_mat_1_1_dist = NormalDistribution::new(inertia_1_1, inertia_1_1 * ((5.0 / 3.0) / 100.0)).seed(11);
-      let mut inertia_mat_2_2_dist = NormalDistribution::new(inertia_2_2, inertia_2_2 * ((5.0 / 3.0) / 100.0)).seed(12);
-      let mut x_wheel_inertia_dist = NormalDistribution::new(x_wheel_inertia, x_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(13);
-      let mut y_wheel_inertia_dist = NormalDistribution::new(y_wheel_inertia, y_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(14);
-      let mut z_wheel_inertia_dist = NormalDistribution::new(z_wheel_inertia, z_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(15);
-      let max_speed_observations = Arc::new(Mutex::new(GuassianSet::new()));
-      let max_pointing_error_observations = Arc::new(Mutex::new(GuassianSet::new()));
-
-      for i in 0..self.N {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let simulator = self.simulator.clone();
-        
-        if i % self.concurrency == 0 { // TODO: Undo once configuration interface allows for custom file paths
-          // let config_permit = config_sem.clone().acquire_owned().await?;
-          inertia_0_0 = inertia_mat_0_0_dist.sample();
-          inertia_1_1 = inertia_mat_1_1_dist.sample();
-          inertia_2_2 = inertia_mat_2_2_dist.sample();
-          x_wheel_inertia = x_wheel_inertia_dist.sample();
-          y_wheel_inertia = y_wheel_inertia_dist.sample();
-          z_wheel_inertia = z_wheel_inertia_dist.sample();
-        }
-        
-        let success_count_clone = success_count.clone();
-        let fail_count_clone = fail_count.clone();
-        let init_file_lock_clone = init_file_lock.clone();
-        let max_speed_observations_clone = max_speed_observations.clone();
-        let max_pointing_error_observations_clone = max_pointing_error_observations.clone();
-        let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
-
-          // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
-          // - random suffix?
-          // - accept file name as input
-          let _init_file_guard = init_file_lock_clone.lock().await;
-          let init_type = TR::parse("(gnc: (\"$as_Position.eci_HGDv5HpfFwcMfs3XpDM5Cl7\": {(float, float, float) | #, eci}, \"PTnxx2jZ8vzTJlRwjxyctn.id\": u128, \"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxx2jZ8vzTJlRwjxyctn.orientation\": {(float, float, float) | #}, \"PTnxx2jZ8vzTJlRwjxyctn.rated_momentum\": float, \"PTnxx2jZ8vzTJlRwjxyctn.rated_torque\": float, \"PTnxx2jZ8vzTJlRwjxyctn.speed\": float, \"PTnxx2jZ8vzTJlRwjxyctn.torque\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.id\": u128, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.orientation\": {(float, float, float) | #}, \"PTnxxBv6drdQlzqJlVvvbC.rated_momentum\": float, \"PTnxxBv6drdQlzqJlVvvbC.rated_torque\": float, \"PTnxxBv6drdQlzqJlVvvbC.speed\": float, \"PTnxxBv6drdQlzqJlVvvbC.torque\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.id\": u128, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.orientation\": {(float, float, float) | #}, \"PTnxxMb7DrlvQKWQsDST4r.rated_momentum\": float, \"PTnxxMb7DrlvQKWQsDST4r.rated_torque\": float, \"PTnxxMb7DrlvQKWQsDST4r.speed\": float, \"PTnxxMb7DrlvQKWQsDST4r.torque\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.commanded_moment\": float, \"PTnxxWYyx6GZyvPWwZnmkh.id\": u128, \"PTnxxWYyx6GZyvPWwZnmkh.orientation\": {(float, float, float) | #}, \"PTnxxWYyx6GZyvPWwZnmkh.rated_magnetic_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.commanded_moment\": float, \"PTnxxX7KfDFTtZwDWS9L3Z.id\": u128, \"PTnxxX7KfDFTtZwDWS9L3Z.orientation\": {(float, float, float) | #}, \"PTnxxX7KfDFTtZwDWS9L3Z.rated_magnetic_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.commanded_moment\": float, \"PTnxxXTwZYcKSqfzCdNkqc.id\": u128, \"PTnxxXTwZYcKSqfzCdNkqc.orientation\": {(float, float, float) | #}, \"PTnxxXTwZYcKSqfzCdNkqc.rated_magnetic_moment\": float, \"PTnxyLN97zsstnd4dVDwcv.absorptivity\": float, \"PTnxyLN97zsstnd4dVDwcv.area\": float, \"PTnxyLN97zsstnd4dVDwcv.centroid\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.diffuse_reflectivity\": float, \"PTnxyLN97zsstnd4dVDwcv.orientation\": {(float, float, float) | #}, \"PTnxyLN97zsstnd4dVDwcv.specular_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.absorptivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.area\": float, \"PTnxyLNC6LbltcjyVy7NyW.centroid\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.diffuse_reflectivity\": float, \"PTnxyLNC6LbltcjyVy7NyW.orientation\": {(float, float, float) | #}, \"PTnxyLNC6LbltcjyVy7NyW.specular_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.absorptivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.area\": float, \"PTnxyLNF8gJTrK9VH59Cnw.centroid\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.diffuse_reflectivity\": float, \"PTnxyLNF8gJTrK9VH59Cnw.orientation\": {(float, float, float) | #}, \"PTnxyLNF8gJTrK9VH59Cnw.specular_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.absorptivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.area\": float, \"PTnxyLNH75rVPjCzhzwYxg.centroid\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.diffuse_reflectivity\": float, \"PTnxyLNH75rVPjCzhzwYxg.orientation\": {(float, float, float) | #}, \"PTnxyLNH75rVPjCzhzwYxg.specular_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.absorptivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.area\": float, \"PTnxyLNK5GqqJtBHHmDhz2.centroid\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.diffuse_reflectivity\": float, \"PTnxyLNK5GqqJtBHHmDhz2.orientation\": {(float, float, float) | #}, \"PTnxyLNK5GqqJtBHHmDhz2.specular_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.absorptivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.area\": float, \"PTnxyLNM7KjhddLfmsxMNJ.centroid\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.diffuse_reflectivity\": float, \"PTnxyLNM7KjhddLfmsxMNJ.orientation\": {(float, float, float) | #}, \"PTnxyLNM7KjhddLfmsxMNJ.specular_reflectivity\": float, \"root!.angular_acceleration\": {(float, float, float) | #}, \"root!.angular_velocity\": {(float, float, float) | #}, \"root!.attitude\": {(float, float, float, float) | #}, \"root!.elapsedTime\": day, \"root!.inertia\": {((float, float, float), (float, float, float), (float, float, float)) | #}, \"root!.mass\": float, \"root!.pid_config\": (float, float, float, float), \"root!.position\": {(float, float, float) | #, eci}, \"root!.time\": day, \"root!.timeStep\": day, \"root!.velocity\": {(float, float, float) | #}),)").unwrap();
-          let bytes = std::fs::read("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin")?; // FIXME
-          let init_val = dyn_de(&init_type.typ, &bytes).unwrap();
-          let init_val = TRD::from((init_type.clone(), init_val));
-          println!("Original simulation input Datum: {:?}", init_val.pretty());
-
-          let patch_str = format!("(((({}, {}, {}, {}),),) : (gnc: (\"root!.pid_config\": (float, float, float, float),),))", pid_controller_gains.0, pid_controller_gains.1, pid_controller_gains.2, pid_controller_gains.3);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("(((({}, {}, {}),),) : (gnc: (\"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float),))", x_wheel_inertia, y_wheel_inertia, z_wheel_inertia);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("((((({},), (, {}), (, , {})),),) : (gnc: (\"root!.inertia\": {{((float,), (, float), (, , float)) | #}},),))", inertia_0_0, inertia_1_1, inertia_2_2);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          let init_val = init_val.update(&patch_trd).unwrap();
-          println!("Modified simulation input Datum: {:?}", init_val.pretty());
-
-          let init_val = init_val.data;
-          let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
-          // debug!("Modified simulation input Datum: {:?}", init_val);
-          std::fs::write("/Users/sebastianwelsh/Development/sedaro/scf/simulation/data/init_Bf7qyRL5ZwFDD2Cbf9Q7Grz.bin", bytes)?; // FIXME
-          drop(_init_file_guard);
-
-          let results_path = std::path::PathBuf::from(format!("/Users/sebastianwelsh/Development/sedaro/scf/results/uq_run_{}", i));
-          // Clear results
-          if results_path.exists() {
-            tokio::fs::remove_dir_all(&results_path).await.ok();
-          }
-          let result = simulator.run(1.0, &results_path).await;
-          drop(permit); // Release the permit when done
-          match &result {
-            Ok(output) => {
-              match output.status.success() {
-                true => {
-                  *success_count_clone.lock().await += 1.0;
-                },
-                false => {
-                  warn!("Simulation {} failed with non-zero exit code: {:?}", i, String::from_utf8_lossy(&output.stderr));
-                  *fail_count_clone.lock().await += 1.0;
-                  return result;
-                },
-              }
-            },
-            Err(e) => {
-              warn!("Simulation failed: {:?}", e);
-              *fail_count_clone.lock().await += 1.0;
-              return result;
-            },
-          }
-
-          // TODO: Handle there being zero frames
-
-          let mut frames: Vec<Datum> = vec![];
-          if let Ok(file) = File::open(results_path.join("PTnYWzsc2Nhywc8WVS4blm.gnc.jsonl")).await {
-            // Seek to end of file
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            let mut parsed_type: Option<TR> = None;
-            while let Ok(bytes_read) = reader.read_line(&mut line).await {
-              if bytes_read == 0 {
-                break; // Reached end of file
-              }
-              if let Ok(config) = serde_json::from_str::<simulation::FileTargetConfigEntry>(&line) {
-                parsed_type = Some(TR::parse(&config.data.type_).unwrap());
-              } else if let Ok(entry) = serde_json::from_str::<simulation::FileTargetFrameEntry>(&line) {
-                if let Some(parsed) = &parsed_type {
-                  let frame_bytes = BASE64_STANDARD.decode(&entry.data.frame).unwrap();
-                  match dyn_de(&parsed.typ, &frame_bytes) {
-                    Ok(val) => {
-                      frames.push(val);
-                    },
-                    Err(e) => {
-                      warn!("Simulation {} frame deserialization error: {:?}", i, e);
-                    },
-                  }
-                }
-              }
-              line.clear();
-            }
-          }
-          let mut max_speed: f64 = 0.0;
-          let mut max_pointing_error: f64 = 0.0;
-          let mut pointing_errors = vec![];
-          let mut i = 0;
-          // (\"PTnYWzsN8kmmrHNtVgCr9G.commanded_torque\": float, \"PTnYWzsN8kmmrHNtVgCr9G.speed\": float, \"PTnYWzsN8kmmrHNtVgCr9G.torque\": {(float, float, float) | #}, \"PTnYWzsQ5nnKDB5NHtWNj3.commanded_torque\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.speed\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.torque\": {(float, float, float) | #}, \"PTnYWzsS6fbQRNkH9rF4r8.commanded_torque\": float, \"PTnYWzsS6fbQRNkH9rF4r8.speed\": float, \"PTnYWzsS6fbQRNkH9rF4r8.torque\": {(float, float, float) | #}, \"PTnYWzsV7sgvClGvcX4WB3.commanded_moment\": float, \"PTnYWzsV7sgvClGvcX4WB3.duty_cycle\": float, \"PTnYWzsV7sgvClGvcX4WB3.torque\": {(float, float, float) | #}, \"PTnYWzsX5DlGhvkFHmPZ9B.commanded_moment\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.duty_cycle\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.torque\": {(float, float, float) | #}, \"PTnYWzsYyXYkNbPWkPPkry.commanded_moment\": float, \"PTnYWzsYyXYkNbPWkPPkry.duty_cycle\": float, \"PTnYWzsYyXYkNbPWkPPkry.torque\": {(float, float, float) | #}, elapsedTime: day, \"root.angular_velocity\": {(float, float, float) | #}, \"root.attitude\": {(float, float, float, float) | #}, \"root.commanded_attitude\": {(float, float, float, float) | #}, \"root.in_shadow\": bool, \"root.magnetic_field\": {(float, float, float) | #}, \"root.pointing_error\": float, \"root.position\": {(float, float, float) | #, eci}, \"root.velocity\": {(float, float, float) | #}, time: day, timeStep: day)
-          // speeds: 1, 4, 7
-          // pointing_error: 25
-
-          for frame in &frames {
-            let speed = match frame.get(1).unwrap().as_float().unwrap() {
-              FloatValue::F64(f) => f,
-              FloatValue::F32(f) => panic!("Got f32 but expected f64"),
-            };
-            if max_speed < speed.abs() { max_speed = speed.abs() }
-            let speed = match frame.get(4).unwrap().as_float().unwrap() {
-              FloatValue::F64(f) => f,
-              FloatValue::F32(f) => panic!("Got f32 but expected f64"),
-            };
-            if max_speed < speed.abs() { max_speed = speed.abs() }
-            let speed = match frame.get(7).unwrap().as_float().unwrap() {
-              FloatValue::F64(f) => f,
-              FloatValue::F32(f) => panic!("Got f32 but expected f64"),
-            };
-            if max_speed < speed.abs() { max_speed = speed.abs() }
-            if i > frames.len()/2 {
-              let pointing_error = match frame.get(25).unwrap().as_float().unwrap() {
-                FloatValue::F64(f) => f,
-                FloatValue::F32(f) => panic!("Got f32 but expected f64"),
-              };
-              pointing_errors.push(pointing_error);
-              if max_pointing_error < pointing_error.abs() { max_pointing_error = pointing_error.abs() }
-            }
-            // println!("{}", frame.pretty());
-            i += 1;
-          }        
-          let average_error = pointing_errors.iter().sum::<OrderedFloat<f64>>().0 / (pointing_errors.len() as f64);
-          // println!("{} {} {}", frames.len(), max_speed, average_error);
-          println!("{} {} {}", frames.len(), max_speed, max_pointing_error);
-          max_speed_observations_clone.lock().await.add(max_speed);
-          max_pointing_error_observations_clone.lock().await.add(max_pointing_error);
-          result
-        }.in_current_span());
-        
-        handles.push(handle);
-        
-        // If at 5% increments
-        if (self.N / 20) > 0 && (i + 1) % (self.N / 20) == 0 {
-          let s_count = success_count.clone();
-          let s_count = *s_count.lock().await;
-          let f_count = fail_count.clone();
-          let f_count = *f_count.lock().await;
-          info!(
-            "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
-            (s_count + f_count)/start_time.elapsed().as_secs_f64(),
-            s_count,
-            f_count,
-            handles.len() - (s_count as usize) - (f_count as usize),
-          );
-          info!("Interim max wheel speed analysis results: {}", max_speed_observations.lock().await);
-          info!("Interim average pointing error analysis results: {}", max_pointing_error_observations.lock().await);
-        }
-      }
-
-      // Wait for all simulations to complete
-      for handle in handles {
-        if let Err(e) = handle.await {
-          warn!("Simulation task join error: {:?}", e);
-        }
-      }
-
-      // Decide how to proceed
-      let max_speed_observations_locked = max_speed_observations.lock().await;
-      let max_pointing_error_observations_locked = max_pointing_error_observations.lock().await;
-      info!("Final max wheel speed analysis results: {}", max_speed_observations_locked);
-      info!("Final average pointing error analysis results: {}", max_pointing_error_observations_locked);
-      info!("Analysis duration: {} ms", start_time.elapsed().as_millis());
-      if let Some(wstd_err) = max_speed_observations_locked.std_dev() {
-        if let Some(wmean) = max_speed_observations_locked.mean() {
-          if let Some(pstd_err) = max_pointing_error_observations_locked.std_dev() {
-            if let Some(pmean) = max_pointing_error_observations_locked.mean() {
-              let max_wheel_speed = wmean + 3.0 * wstd_err;
-              let max_pointing_error = pmean + 3.0 * pstd_err;
-              if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
-                info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
-                return Ok(pid_controller_gains);
-              }
-            }
-          }
-        }
-      }
-      Err(anyhow::anyhow!("Unable to determine suitable PID gains from UQ analysis"))
-    }
 }

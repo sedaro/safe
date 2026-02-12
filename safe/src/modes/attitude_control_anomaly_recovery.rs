@@ -1,32 +1,22 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
-use simvm::sv::check::Check;
 use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
 use serde::Serialize;
-use simvm::sv::data::{Data, FloatValue};
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
+use simvm::sv::data::Data;
 use std::sync::Arc;
 use std::vec;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tokio::sync::Semaphore;
-use ordered_float::OrderedFloat;
 use tracing::Instrument;
-use base64::Engine;
 
-use simvm::sv::{combine::TR, combine::TRD, data::Datum, parse::Parse};
 use crate::c2::{AutonomyModeMessage, RouterMessage};
 use crate::transports::Stream;
-use crate::simulation::{self, FileTargetReader, SedaroSimulator};
+use crate::simulation::{FileTargetReader, SedaroSimulator};
 use crate::kits::stats::{GuassianSet, NormalDistribution};
 use crate::kits::stats::StatisticalDistribution;
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use simvm::sv::update::Update;
-use simvm::sv::pretty::Pretty;
 
 #[derive(Debug, Serialize)]
 pub struct AttitudeControlAnomalyRecovery {
@@ -100,7 +90,6 @@ impl AttitudeControlAnomalyRecovery {
       let start_time = std::time::Instant::now();
       let success_count = Arc::new(Mutex::new(0.0));
       let fail_count = Arc::new(Mutex::new(0.0));
-      let init_file_lock = Arc::new(Mutex::new(()));
 
       let mut inertia_0_0 = 0.005;
       let mut inertia_1_1 = 0.005;
@@ -122,66 +111,44 @@ impl AttitudeControlAnomalyRecovery {
         let permit = semaphore.clone().acquire_owned().await?;
         let simulator = self.simulator.clone();
         
-        if i % self.concurrency == 0 { // TODO: Undo once configuration interface allows for custom file paths
-          // let config_permit = config_sem.clone().acquire_owned().await?;
-          inertia_0_0 = inertia_mat_0_0_dist.sample();
-          inertia_1_1 = inertia_mat_1_1_dist.sample();
-          inertia_2_2 = inertia_mat_2_2_dist.sample();
-          x_wheel_inertia = x_wheel_inertia_dist.sample();
-          y_wheel_inertia = y_wheel_inertia_dist.sample();
-          z_wheel_inertia = z_wheel_inertia_dist.sample();
-        }
+        inertia_0_0 = inertia_mat_0_0_dist.sample();
+        inertia_1_1 = inertia_mat_1_1_dist.sample();
+        inertia_2_2 = inertia_mat_2_2_dist.sample();
+        x_wheel_inertia = x_wheel_inertia_dist.sample();
+        y_wheel_inertia = y_wheel_inertia_dist.sample();
+        z_wheel_inertia = z_wheel_inertia_dist.sample();
         
         let success_count_clone = success_count.clone();
         let fail_count_clone = fail_count.clone();
-        let init_file_lock_clone = init_file_lock.clone();
         let max_speed_observations_clone = max_speed_observations.clone();
         let max_pointing_error_observations_clone = max_pointing_error_observations.clone();
         let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
 
-          let agent_id = "FpKnj2S4YcchDdf2BGX8cfn";
-          let eds_path = std::path::PathBuf::from("/Users/sebastianwelsh/Downloads/simulation");
-          let results_path = std::path::PathBuf::from(format!("/Users/sebastianwelsh/Development/sedaro/scf/results/uq_run_{}", i));
+          const AGENT_ID: &str = "PTnYWzsc2Nhywc8WVS4blm";
+          let results_path = tempfile::Builder::new()
+            .prefix("simulation_results_")
+            .tempdir()?
+            .into_path();
 
-          // FIXME: RACE: EDS can start up and end up reading the next EDS runs init file if it gets hung up.
-          // - random suffix?
-          // - accept file name as input
-          let _init_file_guard = init_file_lock_clone.lock().await;
-          let type_sig = std::fs::read(eds_path.join(format!("data/init_ty_{agent_id}.json")))?;
-          let type_sig_str = std::str::from_utf8(&type_sig)?;
-          let init_type = TR::parse(type_sig_str).unwrap();
-          let init_file_path = eds_path.join(format!("data/init_{agent_id}.bin"));
-          let init_bytes = std::fs::read(&init_file_path)?;
-          let init_val = dyn_de(&init_type.typ, &init_bytes).unwrap();
-          let init_val = TRD::from((init_type.clone(), init_val));
-          // println!("Original simulation input Datum: {:?}", init_val.pretty());
-          // println!("===============================================================");
-
-          let patch_str = format!("(((({:.15}, {:.15}, {:.15}, {:.15}),),) : (gnc: (\"root!.pid_config\": (float, float, float, float),),))", 5e-5, 123456.0, 2.5e-4, 0.01);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          patch_trd.refn.check(&patch_trd.data).unwrap(); // Get helpful error if patch is malformed
-          let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("((({:.15}, {:.15}, {:.15}),) : (gnc: (\"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float),))", 123456.0, 123456.0, 123456.0);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          patch_trd.refn.check(&patch_trd.data).unwrap(); // Get helpful error if patch is malformed
-          let init_val = init_val.update(&patch_trd).unwrap();
-          let patch_str = format!("((((({:.15}, 0, 0), (0, {:.15}, 0), (0, 0, {:.15})),),) : (gnc: (\"root!.inertia\": {{((float, float, float), (float, float, float), (float, float, float)) | #}},),))", 123456.0, 123456.0, 123456.0);
-          let patch_trd = TRD::parse(&patch_str).unwrap();
-          // patch_trd.refn.check(&patch_trd.data).unwrap(); // BUG
-          let init_val = init_val.update(&patch_trd).unwrap();
-          // println!("Modified simulation input Datum: {:?}", init_val.pretty());
-
-          // Write modified initial data back to file
-          let init_val = init_val.data;
-          let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
-          std::fs::write(&init_file_path, bytes)?;
-          drop(_init_file_guard);
+          let mut patches = vec![];
+          patches.push((
+            format!("({AGENT_ID}: (gnc: (\"root!.pid_config\": (float, float, float, float),),),)"), 
+            format!("(((({:.15}, {:.15}, {:.15}, {:.15}),),),)", pid_controller_gains.0, pid_controller_gains.1, pid_controller_gains.2, pid_controller_gains.3)
+          ));
+          patches.push((
+            format!("({AGENT_ID}: (gnc: (\"PTnxx2jZ8vzTJlRwjxyctn.inertia\": float, \"PTnxxBv6drdQlzqJlVvvbC.inertia\": float, \"PTnxxMb7DrlvQKWQsDST4r.inertia\": float),),)"), 
+            format!("((({:.15}, {:.15}, {:.15}),),)", x_wheel_inertia, y_wheel_inertia, z_wheel_inertia)
+          ));
+          patches.push((
+            format!("({AGENT_ID}: (gnc: (\"root!.inertia\": {{((float, float, float), (float, float, float), (float, float, float)) | #}},),),)"),
+            format!("((((({:.15}, 0, 0), (0, {:.15}, 0), (0, 0, {:.15}))),),)", inertia_0_0, inertia_1_1, inertia_2_2)
+          ));
 
           // Clear results
           if results_path.exists() {
             tokio::fs::remove_dir_all(&results_path).await.ok();
           }
-          let result = simulator.run(1.0, &results_path).await;
+          let result = simulator.run(0.5, &results_path, Some(&patches)).await;
           drop(permit); // Release the permit when done
           match &result {
             Ok(output) => {
@@ -207,20 +174,13 @@ impl AttitudeControlAnomalyRecovery {
 
           let mut reader = FileTargetReader::try_from_path(
             &results_path.join("PTnYWzsc2Nhywc8WVS4blm.gnc.jsonl")
-          ).await?;
-          let frames = reader.read_frames().await?;
+          )?;
+          let frames = reader.read_frames()?;
 
           let mut max_speed: f64 = 0.0;
           let mut max_pointing_error: f64 = 0.0;
           let mut pointing_errors = vec![];
           let mut i = 0;
-          // (\"PTnYWzsN8kmmrHNtVgCr9G.commanded_torque\": float, \"PTnYWzsN8kmmrHNtVgCr9G.speed\": float, \"PTnYWzsN8kmmrHNtVgCr9G.torque\": {(float, float, float) | #}, \"PTnYWzsQ5nnKDB5NHtWNj3.commanded_torque\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.speed\": float, \"PTnYWzsQ5nnKDB5NHtWNj3.torque\": {(float, float, float) | #}, \"PTnYWzsS6fbQRNkH9rF4r8.commanded_torque\": float, \"PTnYWzsS6fbQRNkH9rF4r8.speed\": float, \"PTnYWzsS6fbQRNkH9rF4r8.torque\": {(float, float, float) | #}, \"PTnYWzsV7sgvClGvcX4WB3.commanded_moment\": float, \"PTnYWzsV7sgvClGvcX4WB3.duty_cycle\": float, \"PTnYWzsV7sgvClGvcX4WB3.torque\": {(float, float, float) | #}, \"PTnYWzsX5DlGhvkFHmPZ9B.commanded_moment\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.duty_cycle\": float, \"PTnYWzsX5DlGhvkFHmPZ9B.torque\": {(float, float, float) | #}, \"PTnYWzsYyXYkNbPWkPPkry.commanded_moment\": float, \"PTnYWzsYyXYkNbPWkPPkry.duty_cycle\": float, \"PTnYWzsYyXYkNbPWkPPkry.torque\": {(float, float, float) | #}, elapsedTime: day, \"root.angular_velocity\": {(float, float, float) | #}, \"root.attitude\": {(float, float, float, float) | #}, \"root.commanded_attitude\": {(float, float, float, float) | #}, \"root.in_shadow\": bool, \"root.magnetic_field\": {(float, float, float) | #}, \"root.pointing_error\": float, \"root.position\": {(float, float, float) | #, eci}, \"root.velocity\": {(float, float, float) | #}, time: day, timeStep: day)
-          // speeds: 1, 4, 7
-          // pointing_error: 25
-
-          // let FloatValue::F64(x) = f else {
-          //   panic!();
-          // }
 
           for frame in &frames {
             let speed = frame.get(1).unwrap().data.as_f64().unwrap();
@@ -230,9 +190,16 @@ impl AttitudeControlAnomalyRecovery {
             let speed = frame.get(7).unwrap().data.as_f64().unwrap();
             if max_speed < speed.abs() { max_speed = speed.abs() }
             if i > frames.len()/2 {
-              let pointing_error = frame.get(25).unwrap().data.as_f64().unwrap();
-              pointing_errors.push(pointing_error);
-              if max_pointing_error < pointing_error.abs() { max_pointing_error = pointing_error.abs() }
+              match frame.get_by_field("root.pointing_error").unwrap().data.as_variant().unwrap() { // TODO: Better way?
+                (1, datum) => {
+                  let pointing_error = datum.as_f64().unwrap();
+                  pointing_errors.push(pointing_error);
+                  if max_pointing_error < pointing_error.abs() { max_pointing_error = pointing_error.abs() }
+                },
+                _ => {
+                  panic!("Unexpected data type for pointing error");
+                }
+              }
             }
             // println!("{}", frame.pretty());
             i += 1;

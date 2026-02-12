@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use simvm::sv::data::{Data, FloatValue};
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use simvm::sv::{combine::TR, combine::TRD, data::Datum, parse::Parse};
-use tokio::fs::File;
-use tokio::io::AsyncSeekExt;
-use tokio::{io::AsyncBufReadExt, io::BufReader, process::Command as TokioCommand, time::timeout};
 use tracing_subscriber::fmt::format;
+use tokio::{process::Command as TokioCommand, time::timeout};
+use std::io::{BufReader, Seek, BufRead};
+use std::fs::File;
 
 use crate::simulation;
 
@@ -57,6 +57,7 @@ impl SedaroSimulator {
         &self,
         duration_days: f64,
         target_path: &std::path::PathBuf,
+        patches: Option<&Vec<(String, String)>>,
     ) -> Result<std::process::Output> {
         let command = if self.release {
             "./target/release/main"
@@ -75,6 +76,10 @@ impl SedaroSimulator {
                     target_path.to_str().unwrap(),
                 ])
                 .args(self.args.clone())
+                .args(match patches {
+                    Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
+                    None => vec![],
+                })
                 .current_dir(&self.path)
                 // .env("SIMULATION_PATH", self.path.to_str().unwrap())
                 // .env("PYTHONPATH", format!("{}/simulation_python:{}/simulation_buildtime_python:{}/simvm_python:{}", self.path.to_str().unwrap(), self.path.to_str().unwrap(), self.path.to_str().unwrap(), env::var("PYTHONPATH").unwrap_or_default()))
@@ -113,7 +118,61 @@ impl SedaroSimulator {
             Ok(output) => Ok(output?),
         }
     }
-    pub async fn read_init_type(&self, agent_id: &str) -> Result<TR> {
+    pub fn run_sync(
+        &self,
+        duration_days: f64,
+        target_path: &std::path::PathBuf,
+        patches: Option<&Vec<(String, String)>>,
+    ) -> Result<std::process::Output> {
+        // TODO: timeout handling
+        // TODO: Minimize redundant code with async version
+        let command = if self.release {
+            "./target/release/main"
+        } else {
+            "./target/debug/main"
+        };
+        std::fs::create_dir_all(&target_path)?;
+        let target_path = target_path.canonicalize().unwrap();
+        let output = std::process::Command::new(&command)
+            .args(vec![
+                "--duration",
+                &(duration_days).to_string(),
+                "--target-config",
+                target_path.to_str().unwrap(),
+            ])
+            .args(self.args.clone())
+            .args(match patches {
+                Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
+                None => vec![],
+            })
+            .current_dir(&self.path)
+            .env(
+                "PATH",
+                match self.venv {
+                    Some(ref venv_path) => format!(
+                        "{}/bin:{}",
+                        venv_path.to_str().unwrap(),
+                        env::var("PATH").unwrap_or_default()
+                    ),
+                    None => env::var("PATH").unwrap_or_default(),
+                },
+            )
+            .env(
+                "VIRTUAL_ENV",
+                match self.venv {
+                    Some(ref venv_path) => venv_path.to_str().unwrap(),
+                    None => "",
+                },
+            )
+            .env("LANG", "en_US.UTF-8")
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LC_CTYPE", "en_US.UTF-8")
+            .env("SIM_UPLOAD_ARTIFACT", "0")
+            .output()?;
+
+        Ok(output)        
+    }
+    pub fn read_init_type(&self, agent_id: &str) -> Result<TR> {
         match &self.init_type {
             Some(ty) => Ok(ty.clone()),
             None => {
@@ -125,8 +184,8 @@ impl SedaroSimulator {
             }
         }
     }
-    pub async fn read_init_trd(&self, agent_id: &str) -> Result<TRD> {
-        let init_type = self.read_init_type(agent_id).await?;
+    pub fn read_init_trd(&self, agent_id: &str) -> Result<TRD> {
+        let init_type = self.read_init_type(agent_id)?;
         let init_file_path = self
             .path
             .join(format!("data/init_{agent_id}.bin"))
@@ -136,8 +195,8 @@ impl SedaroSimulator {
         let init_val = TRD::from((init_type.clone(), init_val));
         Ok(init_val)
     }
-    pub async fn write_init_trd(&self, agent_id: &str, init_val: TRD) -> Result<()> {
-        let init_type = self.read_init_type(agent_id).await?;
+    pub fn write_init_trd(&self, agent_id: &str, init_val: TRD) -> Result<()> {
+        let init_type = self.read_init_type(agent_id)?;
         let init_file_path = self
             .path
             .join(format!("data/init_{agent_id}.bin"))
@@ -187,10 +246,9 @@ pub struct FileTargetReader {
 }
 
 impl FileTargetReader {
-    pub async fn try_from_path(target_file_path: &std::path::PathBuf) -> Result<Self> {
+    pub fn try_from_path(target_file_path: &std::path::PathBuf) -> Result<Self> {
         let path = target_file_path.canonicalize().unwrap();
         let file = File::open(&path)
-            .await
             .expect(format!("Failed to open file: {}", path.to_str().unwrap()).as_str());
         Ok(FileTargetReader {
             reader: BufReader::new(file),
@@ -201,11 +259,11 @@ impl FileTargetReader {
         })
     }
 
-    async fn parse_frames(&mut self) -> Result<()> {
-        self.reader.seek(SeekFrom::Start(self.line_idx)).await?;
+    fn parse_frames(&mut self) -> Result<()> {
+        self.reader.seek(SeekFrom::Start(self.line_idx))?;
         loop {
             let mut line = String::new();
-            let bytes_read = self.reader.read_line(&mut line).await?;
+            let bytes_read = self.reader.read_line(&mut line)?;
             if bytes_read == 0 {
                 break; // Reached end of file
             }
@@ -238,8 +296,8 @@ impl FileTargetReader {
         Ok(())
     }
 
-    pub async fn read_frames(&mut self) -> Result<Vec<TRD>> {
-        self.parse_frames().await?;
+    pub fn read_frames(&mut self) -> Result<Vec<TRD>> {
+        self.parse_frames()?;
         let frames = self.frames.clone();
         Ok(frames)
     }
@@ -254,8 +312,8 @@ impl FileTargetReader {
             Err(idx) => idx,
         }
     }
-    pub async fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<TRD>> {
-        self.parse_frames().await?;
+    pub fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<TRD>> {
+        self.parse_frames()?;
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             if timestamp_mjd < *start_time_mjd
                 || timestamp_mjd > *self.timestamps_mjd.last().unwrap()
@@ -269,11 +327,11 @@ impl FileTargetReader {
             self.frames[self.idx_of_timestamp(timestamp_mjd)].clone(),
         ))
     }
-    pub async fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
-        self.parse_frames().await?; // TODO: Figure out how to avoid this redundant parse
+    pub fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
+        self.parse_frames()?; // TODO: Figure out how to avoid this redundant parse
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             let timestamp_mjd = start_time_mjd + (duration.as_secs_f64() / 86400.0);
-            self.read_frame_at_timestamp(timestamp_mjd).await
+            self.read_frame_at_timestamp(timestamp_mjd)
         } else {
             println!("No frames available to read at elapsed time {:?}", duration);
             Ok(None)
