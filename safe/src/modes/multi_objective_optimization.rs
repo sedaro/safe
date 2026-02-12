@@ -1,9 +1,10 @@
 use anyhow::Result;
 use argmin::solver::particleswarm::ParticleSwarm;
 use async_trait::async_trait;
-use crate::c2::{Telemetry, TimedCommand};
+use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
+use crate::utils::utc_mjd_to_gps;
 use serde::Serialize;
 use simvm::sv::data::Data;
 use std::vec;
@@ -220,15 +221,15 @@ impl AutonomyMode<Telemetry, TimedCommand> for MultiObjectiveOptimization {
                   "Optimization best parameters (start_elapsed_time, duration (s)): ({:?}, {:?})",
                   best_param[0], best_param[1]);
 
-              // stream
-              //   .write(RouterMessage::Command { 
-              //     data: TimedCommand::Scheduled {
-              //       cmd: Command::CaptureImage,
-              //       gps_time: utc_mjd_to_gps(),
-              //     },
-              //     nonce: new_nonce,
-              //   })
-              //   .await?;
+              stream
+                .write(RouterMessage::Command { 
+                  data: TimedCommand::Scheduled {
+                    cmd: Command::CaptureImage,
+                    gps_time: utc_mjd_to_gps(best_param[0]),
+                  },
+                  nonce: new_nonce,
+                })
+                .await?;
             },
             AutonomyModeMessage::Inactive => {
               active = false;

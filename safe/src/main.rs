@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         SedaroSimulator::new(
           &std::path::PathBuf::from("./simulators/imaging"),
         ).venv(
-          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
         SedaroSimulator::new(
           &std::path::PathBuf::from("./simulators/iridium"),
         ).venv(
-          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         SedaroSimulator::new(
           &std::path::PathBuf::from("./simulators/imaging"),
         ).venv(
-          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap_or_default())
+          std::path::PathBuf::from(env::var("SAFE_VENV").unwrap())
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
