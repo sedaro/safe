@@ -11,7 +11,7 @@ mod utils;
 mod modes;
 
 use anyhow::Result;
-use c2::{Command, Telemetry};
+use c2::{TimedCommand, Telemetry};
 use definitions::{Activation, Expr, Value, Variable};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -31,7 +31,7 @@ use crate::flight::Flight;
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    let mut flight: Flight<Telemetry, Command> = Flight::new().await
+    let mut flight: Flight<Telemetry, TimedCommand> = Flight::new().await
       .client_to_c2_transport(
         TcpTransport::new("127.0.0.1", 8001).await.unwrap_or_else(|e| {
           panic!("Unable to initialized TCP transport: {}", e);
@@ -58,17 +58,22 @@ async fn main() -> Result<()> {
         100,
         12,
         SedaroSimulator::new(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
+          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
+        ).venv(
+          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
     
     let mode = ContactAnalysis::new(
         "IridiumContactAnalysis",
-        5,
-        Activation::Immediate(Expr::not(Expr::Term(Variable::Bool(Value::TelemetryRef("in_sunlight".to_string()))))),
+        50,
+        // Activation::Immediate(Expr::not(Expr::Term(Variable::Bool(Value::TelemetryRef("in_sunlight".to_string()))))),
+        Activation::Immediate(Expr::Term(Variable::Bool(Value::Literal(true)))),
         SedaroSimulator::new(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
+          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/iridium"),
+        ).venv(
+          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -80,7 +85,9 @@ async fn main() -> Result<()> {
         100,
         12,
         SedaroSimulator::new(
-          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
+          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/imaging"),
+        ).venv(
+          std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
         ).timeout(Duration::from_secs_f64(20.0)),
     );
     flight.register_autonomy_mode(mode).await?;
@@ -304,6 +311,7 @@ mod tests {
 }
 
 /*
+- IDEA: Way to isolate the exercise/test/develope AMs in isolation without SAFE overhead
 - The Transport interface should likely implement a means of ackowledging what has been received
   - This gets more difficult with split streams though
   - Is TCP ack enough?  What about UDP?

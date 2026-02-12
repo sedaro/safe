@@ -4,3 +4,5 @@
 /safe/logs
 /safectl/target
 /tmp/target
+/safe/simulators
+/safe/results

@@ -23,6 +23,7 @@ pub struct SedaroSimulator {
   timeout: Duration,
   release: bool,
   venv: Option<std::path::PathBuf>,
+  init_type: Option<TR>,
 }
 
 impl SedaroSimulator {
@@ -33,6 +34,7 @@ impl SedaroSimulator {
       timeout: Duration::MAX,
       release: true,
       venv: None,
+      init_type: None,
     }
   }
   pub fn args(mut self, args: Vec<&str>) -> Self {
@@ -53,6 +55,8 @@ impl SedaroSimulator {
   }
   pub async fn run(&self, duration_days: f64, target_path: &std::path::PathBuf) -> Result<std::process::Output> {
     let command = if self.release { "./target/release/main" } else { "./target/debug/main" };
+    std::fs::create_dir_all(&target_path)?;
+    let target_path = target_path.canonicalize().unwrap();
     match timeout(
         self.timeout,
         TokioCommand::new(&command)
@@ -65,6 +69,10 @@ impl SedaroSimulator {
             Some(ref venv_path) => format!("{}/bin:{}", venv_path.to_str().unwrap(), env::var("PATH").unwrap_or_default()),
             None => env::var("PATH").unwrap_or_default(),
           })
+          .env("VIRTUAL_ENV", match self.venv {
+            Some(ref venv_path) => venv_path.to_str().unwrap(),
+            None => "",
+          })
           // .env("SIM_VM_WORKSPACE", self.path.join("generated").to_str().unwrap())
           // .env("SIM_VM_LOCAL", "1")
           .env("LANG", "en_US.UTF-8")
@@ -76,6 +84,33 @@ impl SedaroSimulator {
       Err(_) => Err(anyhow::anyhow!("Simulation timed out after {:?} seconds", self.timeout.as_secs())),
       Ok(output) => Ok(output?),
     }
+  }
+  pub async fn read_init_type(&self, agent_id: &str) -> Result<TR> {
+    match &self.init_type {
+      Some(ty) => Ok(ty.clone()),
+      None => {
+        let type_sig = std::fs::read(self.path.join(format!("data/init_ty_{agent_id}.json")))?;
+        let type_sig_str = std::str::from_utf8(&type_sig)?;
+        let parsed_ty = TR::parse(type_sig_str).unwrap();
+        Ok(parsed_ty)
+      },
+    }
+  }
+  pub async fn read_init_trd(&self, agent_id: &str) -> Result<TRD> {
+    let init_type = self.read_init_type(agent_id).await?;
+    let init_file_path = self.path.join(format!("data/init_{agent_id}.bin")).canonicalize()?;
+    let init_bytes = std::fs::read(&init_file_path)?;
+    let init_val = dyn_de(&init_type.typ, &init_bytes).unwrap();
+    let init_val = TRD::from((init_type.clone(), init_val));
+    Ok(init_val)
+  }
+  pub async fn write_init_trd(&self, agent_id: &str, init_val: TRD) -> Result<()> {
+    let init_type = self.read_init_type(agent_id).await?;
+    let init_file_path = self.path.join(format!("data/init_{agent_id}.bin")).canonicalize()?;
+    let init_val = init_val.data;
+    let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+    std::fs::write(&init_file_path, bytes)?;
+    Ok(())
   }
 }
 
@@ -121,7 +156,10 @@ pub struct FileTargetReader {
 impl FileTargetReader {
   
   pub async fn try_from_path(target_file_path: &std::path::PathBuf) -> Result<Self> {
-    let file = File::open(target_file_path).await?;
+    let path = target_file_path.canonicalize().unwrap();
+    let file = File::open(&path).await.expect(
+      format!("Failed to open file: {}", path.to_str().unwrap()).as_str()
+    );
     Ok(FileTargetReader {
       reader: BufReader::new(file),
       ty: None,
@@ -184,14 +222,15 @@ impl FileTargetReader {
     } else {
       return Ok(None);
     }
-
     Ok(Some(self.frames[self.idx_of_timestamp(timestamp_mjd)].clone()))
   }
   pub async fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
+    self.parse_frames().await?; // TODO: Figure out how to avoid this redundant parse
     if let Some(start_time_mjd) = self.timestamps_mjd.first() {
       let timestamp_mjd = start_time_mjd + (duration.as_secs_f64() / 86400.0);
       self.read_frame_at_timestamp(timestamp_mjd).await
     } else {
+      println!("No frames available to read at elapsed time {:?}", duration);
       Ok(None)
     }
   }

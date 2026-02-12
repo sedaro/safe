@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::prelude::BASE64_STANDARD;
 use simvm::sv::check::Check;
-use crate::c2::{Command, Telemetry};
+use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
 use serde::Serialize;
@@ -38,7 +38,7 @@ pub struct AttitudeControlAnomalyRecovery {
     simulator: SedaroSimulator,
 }
 #[async_trait]
-impl AutonomyMode<Telemetry, Command> for AttitudeControlAnomalyRecovery {
+impl AutonomyMode<Telemetry, TimedCommand> for AttitudeControlAnomalyRecovery {
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -48,7 +48,7 @@ impl AutonomyMode<Telemetry, Command> for AttitudeControlAnomalyRecovery {
     fn activation(&self) -> Activation {
         self.activation.clone()
     }
-    async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
+    async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<TimedCommand>>>) -> Result<()> {
       let mut active = false;
       let mut nonce: Option<u64> = None;
       loop {
@@ -61,7 +61,7 @@ impl AutonomyMode<Telemetry, Command> for AttitudeControlAnomalyRecovery {
               if let Ok(vetted_gains) = self.uq_pid_gains(pid_controller_gains).await {
                 stream
                     .write(RouterMessage::Command { 
-                      data: Command::new(vetted_gains),
+                      data: TimedCommand::Now(Command::SetPidControllerGains(vetted_gains.0, vetted_gains.1, vetted_gains.2, vetted_gains.3)),
                       nonce: new_nonce,
                     })
                     .await?;
