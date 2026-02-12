@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         100,
         12,
         SedaroSimulator::new(
-          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/simulation"),
+          &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/imaging"),
         ).venv(
           std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/scf/.venv")
         ).timeout(Duration::from_secs_f64(20.0)),
@@ -67,9 +67,9 @@ async fn main() -> Result<()> {
     
     let mode = ContactAnalysis::new(
         "IridiumContactAnalysis",
-        50,
-        // Activation::Immediate(Expr::not(Expr::Term(Variable::Bool(Value::TelemetryRef("in_sunlight".to_string()))))),
-        Activation::Immediate(Expr::Term(Variable::Bool(Value::Literal(true)))),
+        5,
+        Activation::Immediate(Expr::not(Expr::Term(Variable::Bool(Value::TelemetryRef("in_sunlight".to_string()))))),
+        // Activation::Immediate(Expr::Term(Variable::Bool(Value::Literal(true)))),
         SedaroSimulator::new(
           &std::path::PathBuf::from("/Users/sebastianwelsh/Development/sedaro/safe/safe/simulators/iridium"),
         ).venv(
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
       SAFE should keep a buffer of all commands it sent, scheduled, etc and which were accepted so that all modes know what conops looks like ahead
         - Maybe you can initialize or update SAFE with current commands scheduled as well as current state to is knows starting point, beyond just telem
       
-      Don't let AM run routines return a result.  They must handle all exceptions themselves?  Or should safe restart them?
+      Don't let AM run routines return a result.  They must handle all exceptions themselves?  Or should safe restart them? A: Safe should restart them - panics are likely unavoidable due to IPC complexity
       When a channel closes, for whatever reason, implement robust recovery
      */
 

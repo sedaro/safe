@@ -1,35 +1,19 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
-use simvm::sv::check::Check;
 use simvm::sv::pretty::Pretty;
 use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
 use crate::utils::utc_mjd_to_gps;
 use serde::Serialize;
-use simvm::sv::data::{Data, FloatValue};
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
+use simvm::sv::data::Data;
 use core::panic;
-use std::sync::Arc;
-use std::time::Duration;
 use std::vec;
-use tokio::sync::Mutex;
-use tracing::{info, warn};
-use tokio::sync::Semaphore;
-use ordered_float::OrderedFloat;
-use tracing::Instrument;
-use base64::Engine;
 
-use simvm::sv::{combine::TRD, data::Datum, parse::Parse};
+use simvm::sv::combine::TRD;
 use crate::c2::{AutonomyModeMessage, RouterMessage};
 use crate::transports::Stream;
-use crate::simulation::{self, FileTargetReader, SedaroSimulator};
-use crate::kits::stats::{GuassianSet, NormalDistribution};
-use crate::kits::stats::StatisticalDistribution;
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use simvm::sv::update::Update;
+use crate::simulation::{FileTargetReader, SedaroSimulator};
 
 #[derive(Debug, Serialize)]
 pub struct ContactAnalysis {
@@ -58,19 +42,15 @@ impl AutonomyMode<Telemetry, TimedCommand> for ContactAnalysis {
             AutonomyModeMessage::Active { nonce: new_nonce } => {
               active = true;
               nonce = Some(new_nonce);
+              println!("ContactAnalysis activated");
+
               let agent_id = "PTnYWzsc2Nhywc8WVS4blm";
-              let results_path = std::path::PathBuf::from(format!("./results/iridium"));
-              
-              // let some_id = "7wJKDxJwljL36hVFGw3hK98"; // FIXME: What is this?
-              // let start_time = 60000.0;
-              // let init_val = self.simulator.read_init_trd(some_id).await.expect("Failed to read init TRD");
-              // let patch_str = format!("((({:.15},), ({:.15},), ({:.15},),) : (gnc: (\"root!.time\": float,), cdh: (\"root!.time\": float,), power: (\"root!.time\": float,)))", start_time, start_time, start_time);
-              // let patch_trd = TRD::parse(&patch_str).unwrap();
-              // patch_trd.refn.check(&patch_trd.data).unwrap(); // Gives helpful error if patch is malformed
-              // let init_val = init_val.update(&patch_trd).unwrap();
-              // self.simulator.write_init_trd(some_id, init_val).await.expect("Failed to write init TRD");
-              
-              let result = self.simulator.run(30.0*60.0/86_400.0, &results_path).await;
+              let results_path = tempfile::Builder::new()
+                .prefix("simulation_results_")
+                .tempdir()?
+                .into_path();
+                            
+              let result = self.simulator.run(30.0*60.0/86_400.0, &results_path, None).await;
               match &result {
                 Ok(output) => {
                   match output.status.success() {
@@ -89,15 +69,14 @@ impl AutonomyMode<Telemetry, TimedCommand> for ContactAnalysis {
 
               let mut reader = FileTargetReader::try_from_path(
                 &results_path.join(format!("{agent_id}.gnc.jsonl"))
-              ).await.expect("Failed to create FileTargetReader");
-              let frames = reader.read_frames().await.unwrap();
+              ).expect("Failed to create FileTargetReader");
+              let frames = reader.read_frames().unwrap();
               let mut optimal_contact_angle = f64::MAX;
               let mut optimal_timestamp_mjd = 0.0;
               for frame in &frames {
                 let angle = min_contact_angle_to_iridium(frame);
                 if angle < optimal_contact_angle {
                   optimal_contact_angle = angle;
-                  println!("{}", frame.pretty());
                   optimal_timestamp_mjd = frame.get_by_field("time").unwrap().data.as_f64().unwrap();
                 }
               }
@@ -119,7 +98,7 @@ impl AutonomyMode<Telemetry, TimedCommand> for ContactAnalysis {
               println!("ContactAnalysis deactivated");
             },
             AutonomyModeMessage::Telemetry(_telemetry) => {
-              println!("ContactAnalysis received telemetry {:?}", _telemetry);
+              // println!("ContactAnalysis received telemetry {:?}", _telemetry);
               // Ignore telemetry for now
             },
           }
