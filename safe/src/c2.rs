@@ -12,16 +12,19 @@ pub struct Telemetry {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Command {
-    pub set_pid_controller_gains: (f64, f64, f64, f64),
+pub enum Command {
+    SetPidControllerGains(f64, f64, f64, f64),
+    IridiumPowerOn,
+    IridiumPowerOff,
+    IridiumTransmitMsg(String),
+    PointSunYaw,
+    PointNadir,
 }
 
-impl Command {
-    pub fn new(set_pid_controller_gains: (f64, f64, f64, f64)) -> Self {
-        Self {
-            set_pid_controller_gains,
-        }
-    }
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum TimedCommand {
+    Now(Command),
+    Scheduled { cmd: Command, gps_time: f64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
