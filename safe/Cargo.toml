@@ -29,3 +29,7 @@ simvm = { path = "/Users/sebastianwelsh/Development/sedaro/simulation/simvm" } #
 ordered-float = "5.1.0"
 time = "0.3"
 base64 = "0.22.1"
+chrono = "0.4.43"
+argmin = { version = "0.11.0", features = ["rayon"] }
+argmin-math = "0.5.1"
+rand_xoshiro = "0.8.0"
