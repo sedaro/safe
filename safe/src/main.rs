@@ -108,7 +108,6 @@ async fn main() -> Result<()> {
 
       Iridium 
       Last contact from ground?
-      Successful iridium session - I don't think this exists
       Inputs are 
         - Current pointing plan
         - Time - which drives iridium location
@@ -120,11 +119,9 @@ async fn main() -> Result<()> {
       Add activation for when telemetry changes value!
 
       We need to think hard about how schedules and temporary deviations in vehicle config from the model are captured
-      e.g. ground turns on a heater for a bit, ad hoc, increasing power consumption.  Need to add this to SAFE or provide SAFE a way to interropgate host for current ConOps
+      e.g. ground turns on a heater for a bit, ad hoc, increasing power consumption.  Need to add this to SAFE or provide SAFE a way to interrogate host for current ConOps
       A full picture of what the future is expected to hold for the vehicle
       
-      What is the recommended approach to having two authorities to commanding a system?  Probably to not do it?
-
       SAFE should keep a buffer of all commands it sent, scheduled, etc and which were accepted so that all modes know what conops looks like ahead
         - Maybe you can initialize or update SAFE with current commands scheduled as well as current state to is knows starting point, beyond just telem
       
