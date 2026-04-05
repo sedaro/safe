@@ -1,5 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Duration, Utc};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +12,9 @@ impl<W> Timestamped<W> {
     pub fn new(wrapped: W) -> Self {
         Self {
             timestamp: SystemTime::now()
-              .duration_since(UNIX_EPOCH)
-              .expect("Time went backwards")
-              .as_nanos(),
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos(),
             wrapped,
         }
     }
@@ -45,8 +45,8 @@ pub(crate) fn utc_mjd_to_datetime(mjd: f64) -> DateTime<Utc> {
     DT_EPOCH + Duration::new(mjd_sec as i64, (mjd_sec.fract() * 1e9) as u32).unwrap()
 }
 
-const LEAP_SECONDS: f64 = 18.0;  // number of leap seconds as of 2017-01-01
-const GPS_EPOCH: f64 = 44244.0;  // MJD for 1980-01-06
+const LEAP_SECONDS: f64 = 18.0; // number of leap seconds as of 2017-01-01
+const GPS_EPOCH: f64 = 44244.0; // MJD for 1980-01-06
 
 /// Convert GPS time to Modified Julian Date (MJD).
 /// NOTE: This is only valid for GPS times after 2017 and before the next leap second as of 2026.

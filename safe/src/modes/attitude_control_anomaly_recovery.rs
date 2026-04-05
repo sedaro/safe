@@ -1,22 +1,22 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
+use anyhow::Result;
+use async_trait::async_trait;
 use serde::Serialize;
 use simvm::sv::data::Data;
 use std::sync::Arc;
 use std::vec;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
 use tokio::sync::Semaphore;
 use tracing::Instrument;
+use tracing::{info, warn};
 
 use crate::c2::{AutonomyModeMessage, RouterMessage};
-use crate::transports::Stream;
-use crate::simulation::{FileTargetReader, SedaroSimulator};
-use crate::kits::stats::{GuassianSet, NormalDistribution};
 use crate::kits::stats::StatisticalDistribution;
+use crate::kits::stats::{GuassianSet, NormalDistribution};
+use crate::simulation::{FileTargetReader, SedaroSimulator};
+use crate::transports::Stream;
 
 #[derive(Debug, Serialize)]
 pub struct AttitudeControlAnomalyRecovery {
@@ -38,91 +38,124 @@ impl AutonomyMode<Telemetry, TimedCommand> for AttitudeControlAnomalyRecovery {
     fn activation(&self) -> Activation {
         self.activation.clone()
     }
-    async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<TimedCommand>>>) -> Result<()> {
-      let mut active = false;
-      let mut nonce: Option<u64> = None;
-      loop {
-        if let Ok(message) = stream.read().await {
-          match message {
-            AutonomyModeMessage::Active { nonce: new_nonce } => {
-              active = true;
-              nonce = Some(new_nonce);
-              let pid_controller_gains = (5e-5, 0.0, 2.5e-4, 0.01);
-              if let Ok(vetted_gains) = self.uq_pid_gains(pid_controller_gains).await {
-                stream
-                    .write(RouterMessage::Command { 
-                      data: TimedCommand::Now(Command::SetPidControllerGains(vetted_gains.0, vetted_gains.1, vetted_gains.2, vetted_gains.3)),
-                      nonce: new_nonce,
-                    })
-                    .await?;
-              }
-            },
-            AutonomyModeMessage::Inactive => {
-              active = false;
-            },
-            AutonomyModeMessage::Telemetry(_telemetry) => {
-              // Ignore telemetry for now
-            },
-          }
+    async fn run(
+        &mut self,
+        mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<TimedCommand>>>,
+    ) -> Result<()> {
+        let mut active = false;
+        let mut nonce: Option<u64> = None;
+        loop {
+            if let Ok(message) = stream.read().await {
+                match message {
+                    AutonomyModeMessage::Active { nonce: new_nonce } => {
+                        active = true;
+                        nonce = Some(new_nonce);
+                        let pid_controller_gains = (5e-5, 0.0, 2.5e-4, 0.01);
+                        if let Ok(vetted_gains) = self.uq_pid_gains(pid_controller_gains).await {
+                            stream
+                                .write(RouterMessage::Command {
+                                    data: TimedCommand::Now(Command::SetPidControllerGains(
+                                        vetted_gains.0,
+                                        vetted_gains.1,
+                                        vetted_gains.2,
+                                        vetted_gains.3,
+                                    )),
+                                    nonce: new_nonce,
+                                })
+                                .await?;
+                        }
+                    }
+                    AutonomyModeMessage::Inactive => {
+                        active = false;
+                    }
+                    AutonomyModeMessage::Telemetry(_telemetry) => {
+                        // Ignore telemetry for now
+                    }
+                }
+            }
         }
-      }
     }
 }
 
 impl AttitudeControlAnomalyRecovery {
-  pub fn new(name: &str, priority: u8, activation: Activation, N: usize, concurrency: usize, simulator: SedaroSimulator) -> Self {
-      Self {
-          name: name.to_string(),
-          priority,
-          activation,
-          N,
-          concurrency,
-          simulator,
-      }
-  }
+    pub fn new(
+        name: &str,
+        priority: u8,
+        activation: Activation,
+        N: usize,
+        concurrency: usize,
+        simulator: SedaroSimulator,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            priority,
+            activation,
+            N,
+            concurrency,
+            simulator,
+        }
+    }
 
-  async fn uq_pid_gains(&self, pid_controller_gains: (f64, f64, f64, f64)) -> Result<(f64, f64, f64, f64)> {
-      info!("Average pointing error is too high.  Re-tuning controller.");
-      info!("New PID gains selected: {}, {}, {}, {}", pid_controller_gains.0, pid_controller_gains.1, pid_controller_gains.2, pid_controller_gains.3);
+    async fn uq_pid_gains(
+        &self,
+        pid_controller_gains: (f64, f64, f64, f64),
+    ) -> Result<(f64, f64, f64, f64)> {
+        info!("Average pointing error is too high.  Re-tuning controller.");
+        info!(
+            "New PID gains selected: {}, {}, {}, {}",
+            pid_controller_gains.0,
+            pid_controller_gains.1,
+            pid_controller_gains.2,
+            pid_controller_gains.3
+        );
 
-      let semaphore = Arc::new(Semaphore::new(self.concurrency));
-      let mut handles = Vec::new();
-      let start_time = std::time::Instant::now();
-      let success_count = Arc::new(Mutex::new(0.0));
-      let fail_count = Arc::new(Mutex::new(0.0));
+        let semaphore = Arc::new(Semaphore::new(self.concurrency));
+        let mut handles = Vec::new();
+        let start_time = std::time::Instant::now();
+        let success_count = Arc::new(Mutex::new(0.0));
+        let fail_count = Arc::new(Mutex::new(0.0));
 
-      let mut inertia_0_0 = 0.005;
-      let mut inertia_1_1 = 0.005;
-      let mut inertia_2_2 = 0.005;
-      let mut x_wheel_inertia = 0.000005;
-      let mut y_wheel_inertia = 0.000005;
-      let mut z_wheel_inertia = 0.000005;
+        let mut inertia_0_0 = 0.005;
+        let mut inertia_1_1 = 0.005;
+        let mut inertia_2_2 = 0.005;
+        let mut x_wheel_inertia = 0.000005;
+        let mut y_wheel_inertia = 0.000005;
+        let mut z_wheel_inertia = 0.000005;
 
-      let mut inertia_mat_0_0_dist = NormalDistribution::new(inertia_0_0, inertia_0_0 * ((5.0 / 3.0) / 100.0)).seed(10);
-      let mut inertia_mat_1_1_dist = NormalDistribution::new(inertia_1_1, inertia_1_1 * ((5.0 / 3.0) / 100.0)).seed(11);
-      let mut inertia_mat_2_2_dist = NormalDistribution::new(inertia_2_2, inertia_2_2 * ((5.0 / 3.0) / 100.0)).seed(12);
-      let mut x_wheel_inertia_dist = NormalDistribution::new(x_wheel_inertia, x_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(13);
-      let mut y_wheel_inertia_dist = NormalDistribution::new(y_wheel_inertia, y_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(14);
-      let mut z_wheel_inertia_dist = NormalDistribution::new(z_wheel_inertia, z_wheel_inertia * ((5.0 / 3.0) / 100.0)).seed(15);
-      let max_speed_observations = Arc::new(Mutex::new(GuassianSet::new()));
-      let max_pointing_error_observations = Arc::new(Mutex::new(GuassianSet::new()));
+        let mut inertia_mat_0_0_dist =
+            NormalDistribution::new(inertia_0_0, inertia_0_0 * ((5.0 / 3.0) / 100.0)).seed(10);
+        let mut inertia_mat_1_1_dist =
+            NormalDistribution::new(inertia_1_1, inertia_1_1 * ((5.0 / 3.0) / 100.0)).seed(11);
+        let mut inertia_mat_2_2_dist =
+            NormalDistribution::new(inertia_2_2, inertia_2_2 * ((5.0 / 3.0) / 100.0)).seed(12);
+        let mut x_wheel_inertia_dist =
+            NormalDistribution::new(x_wheel_inertia, x_wheel_inertia * ((5.0 / 3.0) / 100.0))
+                .seed(13);
+        let mut y_wheel_inertia_dist =
+            NormalDistribution::new(y_wheel_inertia, y_wheel_inertia * ((5.0 / 3.0) / 100.0))
+                .seed(14);
+        let mut z_wheel_inertia_dist =
+            NormalDistribution::new(z_wheel_inertia, z_wheel_inertia * ((5.0 / 3.0) / 100.0))
+                .seed(15);
+        let max_speed_observations = Arc::new(Mutex::new(GuassianSet::new()));
+        let max_pointing_error_observations = Arc::new(Mutex::new(GuassianSet::new()));
 
-      for i in 0..self.N {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let simulator = self.simulator.clone();
-        
-        inertia_0_0 = inertia_mat_0_0_dist.sample();
-        inertia_1_1 = inertia_mat_1_1_dist.sample();
-        inertia_2_2 = inertia_mat_2_2_dist.sample();
-        x_wheel_inertia = x_wheel_inertia_dist.sample();
-        y_wheel_inertia = y_wheel_inertia_dist.sample();
-        z_wheel_inertia = z_wheel_inertia_dist.sample();
-        
-        let success_count_clone = success_count.clone();
-        let fail_count_clone = fail_count.clone();
-        let max_speed_observations_clone = max_speed_observations.clone();
-        let max_pointing_error_observations_clone = max_pointing_error_observations.clone();
-        let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
+        for i in 0..self.N {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let simulator = self.simulator.clone();
+
+            inertia_0_0 = inertia_mat_0_0_dist.sample();
+            inertia_1_1 = inertia_mat_1_1_dist.sample();
+            inertia_2_2 = inertia_mat_2_2_dist.sample();
+            x_wheel_inertia = x_wheel_inertia_dist.sample();
+            y_wheel_inertia = y_wheel_inertia_dist.sample();
+            z_wheel_inertia = z_wheel_inertia_dist.sample();
+
+            let success_count_clone = success_count.clone();
+            let fail_count_clone = fail_count.clone();
+            let max_speed_observations_clone = max_speed_observations.clone();
+            let max_pointing_error_observations_clone = max_pointing_error_observations.clone();
+            let handle = tokio::spawn(async move { // TODO: Try avoiding the spawn?
 
           const AGENT_ID: &str = "PTnYWzsc2Nhywc8WVS4blm";
           let results_path = tempfile::Builder::new()
@@ -203,7 +236,7 @@ impl AttitudeControlAnomalyRecovery {
             }
             // println!("{}", frame.pretty());
             i += 1;
-          }        
+          }
           let average_error = pointing_errors.iter().sum::<f64>() / (pointing_errors.len() as f64);
           // println!("{} {} {}", frames.len(), max_speed, average_error);
           println!("{} {} {}", frames.len(), max_speed, max_pointing_error);
@@ -211,54 +244,68 @@ impl AttitudeControlAnomalyRecovery {
           max_pointing_error_observations_clone.lock().await.add(max_pointing_error);
           result
         }.in_current_span());
-        
-        handles.push(handle);
-        
-        // If at 5% increments
-        if (self.N / 20) > 0 && (i + 1) % (self.N / 20) == 0 {
-          let s_count = success_count.clone();
-          let s_count = *s_count.lock().await;
-          let f_count = fail_count.clone();
-          let f_count = *f_count.lock().await;
-          info!(
-            "Simulation Rate: {} per second ({} successful, {} failed, {} active)", 
-            (s_count + f_count)/start_time.elapsed().as_secs_f64(),
-            s_count,
-            f_count,
-            handles.len() - (s_count as usize) - (f_count as usize),
-          );
-          info!("Interim max wheel speed analysis results: {}", max_speed_observations.lock().await);
-          info!("Interim average pointing error analysis results: {}", max_pointing_error_observations.lock().await);
-        }
-      }
 
-      // Wait for all simulations to complete
-      for handle in handles {
-        if let Err(e) = handle.await {
-          warn!("Simulation task join error: {:?}", e);
-        }
-      }
+            handles.push(handle);
 
-      // Decide how to proceed
-      let max_speed_observations_locked = max_speed_observations.lock().await;
-      let max_pointing_error_observations_locked = max_pointing_error_observations.lock().await;
-      info!("Final max wheel speed analysis results: {}", max_speed_observations_locked);
-      info!("Final average pointing error analysis results: {}", max_pointing_error_observations_locked);
-      info!("Analysis duration: {} ms", start_time.elapsed().as_millis());
-      if let Some(wstd_err) = max_speed_observations_locked.std_dev() {
-        if let Some(wmean) = max_speed_observations_locked.mean() {
-          if let Some(pstd_err) = max_pointing_error_observations_locked.std_dev() {
-            if let Some(pmean) = max_pointing_error_observations_locked.mean() {
-              let max_wheel_speed = wmean + 3.0 * wstd_err;
-              let max_pointing_error = pmean + 3.0 * pstd_err;
-              if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
-                info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
-                return Ok(pid_controller_gains);
-              }
+            // If at 5% increments
+            if (self.N / 20) > 0 && (i + 1) % (self.N / 20) == 0 {
+                let s_count = success_count.clone();
+                let s_count = *s_count.lock().await;
+                let f_count = fail_count.clone();
+                let f_count = *f_count.lock().await;
+                info!(
+                    "Simulation Rate: {} per second ({} successful, {} failed, {} active)",
+                    (s_count + f_count) / start_time.elapsed().as_secs_f64(),
+                    s_count,
+                    f_count,
+                    handles.len() - (s_count as usize) - (f_count as usize),
+                );
+                info!(
+                    "Interim max wheel speed analysis results: {}",
+                    max_speed_observations.lock().await
+                );
+                info!(
+                    "Interim average pointing error analysis results: {}",
+                    max_pointing_error_observations.lock().await
+                );
             }
-          }
         }
-      }
-      Err(anyhow::anyhow!("Unable to determine suitable PID gains from UQ analysis"))
+
+        // Wait for all simulations to complete
+        for handle in handles {
+            if let Err(e) = handle.await {
+                warn!("Simulation task join error: {:?}", e);
+            }
+        }
+
+        // Decide how to proceed
+        let max_speed_observations_locked = max_speed_observations.lock().await;
+        let max_pointing_error_observations_locked = max_pointing_error_observations.lock().await;
+        info!(
+            "Final max wheel speed analysis results: {}",
+            max_speed_observations_locked
+        );
+        info!(
+            "Final average pointing error analysis results: {}",
+            max_pointing_error_observations_locked
+        );
+        info!("Analysis duration: {} ms", start_time.elapsed().as_millis());
+        if let Some(wstd_err) = max_speed_observations_locked.std_dev() {
+            if let Some(wmean) = max_speed_observations_locked.mean() {
+                if let Some(pstd_err) = max_pointing_error_observations_locked.std_dev() {
+                    if let Some(pmean) = max_pointing_error_observations_locked.mean() {
+                        let max_wheel_speed = wmean + 3.0 * wstd_err;
+                        let max_pointing_error = pmean + 3.0 * pstd_err;
+                        if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
+                            info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
+                            return Ok(pid_controller_gains);
+                        }
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Unable to determine suitable PID gains from UQ analysis"
+        ))
     }
 }

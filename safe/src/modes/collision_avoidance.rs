@@ -1,8 +1,8 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use crate::c2::{Command, Telemetry};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
+use anyhow::Result;
+use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::c2::{AutonomyModeMessage, RouterMessage};
@@ -25,7 +25,10 @@ impl AutonomyMode<Telemetry, Command> for CollisionAvoidance {
     fn activation(&self) -> Activation {
         self.activation.clone()
     }
-    async fn run(&mut self, stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
+    async fn run(
+        &mut self,
+        stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>,
+    ) -> Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
