@@ -15,7 +15,8 @@ pub struct NormalDistribution {
 impl NormalDistribution {
     pub fn new(mean: f64, std_dev: f64) -> Self {
         let rng = rand::rngs::StdRng::from_entropy(); // Default seeding from entropy, but allow user to reseed
-        let distribution = Normal::new(mean, std_dev).expect("Could not create normal distribution.");
+        let distribution =
+            Normal::new(mean, std_dev).expect("Could not create normal distribution.");
         NormalDistribution { rng, distribution }
     }
     pub fn seed(mut self, seed: usize) -> Self {
@@ -53,11 +54,7 @@ impl GuassianSet {
             return None;
         }
         let mean = self.mean().unwrap();
-        let var_sum: f64 = self
-            .values
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum();
+        let var_sum: f64 = self.values.iter().map(|value| (value - mean).powi(2)).sum();
         Some(var_sum / ((self.values.len() - 1) as f64)) // Bessel's correction
     }
     pub fn std_dev(&self) -> Option<f64> {
