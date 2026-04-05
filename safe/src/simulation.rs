@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use simvm::sv::data::{Data, FloatValue};
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use simvm::sv::{combine::TR, combine::TRD, data::Datum, parse::Parse};
-use tracing_subscriber::fmt::format;
-use tokio::{process::Command as TokioCommand, time::timeout};
-use std::io::{BufReader, Seek, BufRead};
 use std::fs::File;
+use std::io::{BufRead, BufReader, Seek};
+use tokio::{process::Command as TokioCommand, time::timeout};
+use tracing_subscriber::fmt::format;
 
 use crate::simulation;
 
@@ -78,7 +78,10 @@ impl SedaroSimulator {
                 ])
                 .args(self.args.clone())
                 .args(match patches {
-                    Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
+                    Some(patch_strs) => patch_strs
+                        .iter()
+                        .flat_map(|(a, b)| vec!["--patch", a, b])
+                        .collect(),
                     None => vec![],
                 })
                 .current_dir(&path)
@@ -144,7 +147,10 @@ impl SedaroSimulator {
             ])
             .args(self.args.clone())
             .args(match patches {
-                Some(patch_strs) => patch_strs.iter().flat_map(|(a, b)| vec!["--patch", a, b]).collect(),
+                Some(patch_strs) => patch_strs
+                    .iter()
+                    .flat_map(|(a, b)| vec!["--patch", a, b])
+                    .collect(),
                 None => vec![],
             })
             .current_dir(&path)
@@ -172,15 +178,14 @@ impl SedaroSimulator {
             .env("SIM_UPLOAD_ARTIFACT", "0")
             .output()?;
 
-        Ok(output)        
+        Ok(output)
     }
     pub fn read_init_type(&self, agent_id: &str) -> Result<TR> {
         let path = self.path.canonicalize().unwrap();
         match &self.init_type {
             Some(ty) => Ok(ty.clone()),
             None => {
-                let type_sig =
-                    std::fs::read(path.join(format!("data/init_ty_{agent_id}.json")))?;
+                let type_sig = std::fs::read(path.join(format!("data/init_ty_{agent_id}.json")))?;
                 let type_sig_str = std::str::from_utf8(&type_sig)?;
                 let parsed_ty = TR::parse(type_sig_str).unwrap();
                 Ok(parsed_ty)
