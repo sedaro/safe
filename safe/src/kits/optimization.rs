@@ -113,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_optimization() {
         let problem = Problem {
-            simulator: SedaroSimulator::new("/tmp/path".into()),
+            simulator: SedaroSimulator::new(&"/tmp/path".into()),
             objective: |_result: &SimulationResult| 0.0,
             constraints: vec![],
             initial_state: 42.0,
