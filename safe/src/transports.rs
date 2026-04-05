@@ -352,7 +352,8 @@ pub struct TcpTransport<R, T> {
 }
 
 impl<R, T> TcpTransport<R, T> {
-    pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> { // TODO: Rename to try_new for all transports which return Result
+    pub async fn new(address: &str, port: u16) -> Result<Self, std::io::Error> {
+        // TODO: Rename to try_new for all transports which return Result
         let full_address = format!("{address}:{port}");
         let listener = tokio::net::TcpListener::bind(full_address.clone()).await?;
         let s = Self {
@@ -468,7 +469,10 @@ where
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))
     }
     fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
-        (Box::new(MpscReadHalf { rx: self.rx }), Box::new(MpscWriteHalf { tx: self.tx }))
+        (
+            Box::new(MpscReadHalf { rx: self.rx }),
+            Box::new(MpscWriteHalf { tx: self.tx }),
+        )
     }
 }
 
@@ -565,8 +569,8 @@ where
     async fn read(&mut self) -> Result<R, std::io::Error> {
         let value = self.wrapped.read().await;
         if let Ok(ref value) = value {
-          let mut q = self.queue.lock().await;
-          q.push_back(value.clone());
+            let mut q = self.queue.lock().await;
+            q.push_back(value.clone());
         }
         value
     }
@@ -604,8 +608,8 @@ where
     async fn read(&mut self) -> Result<R, std::io::Error> {
         let value = self.wrapped.read().await;
         if let Ok(ref value) = value {
-          let mut q = self.rx_queue.lock().await;
-          q.push_back(value.clone());
+            let mut q = self.rx_queue.lock().await;
+            q.push_back(value.clone());
         }
         value
     }
@@ -620,8 +624,14 @@ where
     fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
         let (rx_wrapped, tx_wrapped) = self.wrapped.split();
         (
-          Box::new(TestReadHalf { wrapped: rx_wrapped, queue: self.rx_queue.clone() }), 
-          Box::new(TestWriteHalf { wrapped: tx_wrapped, queue: self.tx_queue.clone() })
+            Box::new(TestReadHalf {
+                wrapped: rx_wrapped,
+                queue: self.rx_queue.clone(),
+            }),
+            Box::new(TestWriteHalf {
+                wrapped: tx_wrapped,
+                queue: self.tx_queue.clone(),
+            }),
         )
     }
 }
@@ -636,11 +646,13 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
 {
     async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
-        self.wrapped.connect().await.map(|wrapped_stream| Box::new(TestStream {
-            wrapped: wrapped_stream,
-            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
-            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
-        }) as Box<dyn Stream<T, R>>)
+        self.wrapped.connect().await.map(|wrapped_stream| {
+            Box::new(TestStream {
+                wrapped: wrapped_stream,
+                rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+                tx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            }) as Box<dyn Stream<T, R>>
+        })
     }
 }
 
@@ -671,24 +683,26 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::marker::Sync + Clone,
 {
     async fn accept(&mut self) -> Result<Box<dyn Stream<R, T>>, std::io::Error> {
-        self.wrapped.accept().await.map(|wrapped_stream| Box::new(TestStream {
-            wrapped: wrapped_stream,
-            rx_queue: self.rx_queue.clone(),
-            tx_queue: self.tx_queue.clone(),
-        }) as Box<dyn Stream<R, T>>)
+        self.wrapped.accept().await.map(|wrapped_stream| {
+            Box::new(TestStream {
+                wrapped: wrapped_stream,
+                rx_queue: self.rx_queue.clone(),
+                tx_queue: self.tx_queue.clone(),
+            }) as Box<dyn Stream<R, T>>
+        })
     }
     async fn connect(&self) -> Result<Box<dyn Stream<T, R>>, std::io::Error> {
-        self.wrapped.connect().await.map(|wrapped_stream| Box::new(TestStream {
-            wrapped: wrapped_stream,
-            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
-            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
-        }) as Box<dyn Stream<T, R>>)
+        self.wrapped.connect().await.map(|wrapped_stream| {
+            Box::new(TestStream {
+                wrapped: wrapped_stream,
+                rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+                tx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            }) as Box<dyn Stream<T, R>>
+        })
     }
     fn handle(&self) -> Box<dyn TransportHandle<R, T>> {
         let wrapped = self.wrapped.handle();
-        Box::new(TestTransportHandle {
-            wrapped,
-        })
+        Box::new(TestTransportHandle { wrapped })
     }
 }
 
@@ -704,9 +718,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::time::Duration;
     use tokio::time::timeout;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -972,7 +986,9 @@ mod tests {
         let server_rx_queue = server.rx_queue.clone();
         let server_tx_queue = server.tx_queue.clone();
         let mut client_stream = handle.connect().await.unwrap();
-        let downcasted_client_stream = (&*client_stream as &dyn Any).downcast_ref::<TestStream<TxMsg, RxMsg>>().unwrap();
+        let downcasted_client_stream = (&*client_stream as &dyn Any)
+            .downcast_ref::<TestStream<TxMsg, RxMsg>>()
+            .unwrap();
         let client_rx_queue = downcasted_client_stream.rx_queue.clone();
         let client_tx_queue = downcasted_client_stream.tx_queue.clone();
         let mut server_stream = server.accept().await.unwrap();
@@ -981,28 +997,124 @@ mod tests {
         server_stream.write(TxMsg { value: 70 }).await.unwrap();
         client_stream.write(RxMsg { value: 8 }).await.unwrap();
         server_stream.write(TxMsg { value: 80 }).await.unwrap();
-        assert_eq!(server_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
-        assert_eq!(client_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
-        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![]); // queue empty until message read, which is good
-        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![]); // queue empty until message read, which is good
-        
+        assert_eq!(
+            server_tx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![TxMsg { value: 70 }, TxMsg { value: 80 }]
+        );
+        assert_eq!(
+            client_tx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![RxMsg { value: 7 }, RxMsg { value: 8 }]
+        );
+        assert_eq!(
+            server_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![]
+        ); // queue empty until message read, which is good
+        assert_eq!(
+            client_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![]
+        ); // queue empty until message read, which is good
+
         // Test server reads
         server_stream.read().await.unwrap();
-        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }]);
+        assert_eq!(
+            server_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![RxMsg { value: 7 }]
+        );
         server_stream.read().await.unwrap();
-        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
-        
+        assert_eq!(
+            server_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![RxMsg { value: 7 }, RxMsg { value: 8 }]
+        );
+
         // Test client reads
         client_stream.read().await.unwrap();
-        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }]);
+        assert_eq!(
+            client_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![TxMsg { value: 70 }]
+        );
         client_stream.read().await.unwrap();
-        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
-        
+        assert_eq!(
+            client_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![TxMsg { value: 70 }, TxMsg { value: 80 }]
+        );
+
         // Assert final state of queues is as expected
-        assert_eq!(client_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
-        assert_eq!(client_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
-        assert_eq!(server_tx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<TxMsg>>(), vec![TxMsg { value: 70 }, TxMsg { value: 80 }]);
-        assert_eq!(server_rx_queue.lock().await.iter().map(|r| r.clone()).collect::<Vec<RxMsg>>(), vec![RxMsg { value: 7 }, RxMsg { value: 8 }]);
+        assert_eq!(
+            client_tx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![RxMsg { value: 7 }, RxMsg { value: 8 }]
+        );
+        assert_eq!(
+            client_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![TxMsg { value: 70 }, TxMsg { value: 80 }]
+        );
+        assert_eq!(
+            server_tx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<TxMsg>>(),
+            vec![TxMsg { value: 70 }, TxMsg { value: 80 }]
+        );
+        assert_eq!(
+            server_rx_queue
+                .lock()
+                .await
+                .iter()
+                .map(|r| r.clone())
+                .collect::<Vec<RxMsg>>(),
+            vec![RxMsg { value: 7 }, RxMsg { value: 8 }]
+        );
     }
 }
 

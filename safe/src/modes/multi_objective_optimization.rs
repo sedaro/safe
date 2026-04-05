@@ -1,20 +1,20 @@
-use anyhow::Result;
-use argmin::solver::particleswarm::ParticleSwarm;
-use async_trait::async_trait;
 use crate::c2::{Command, Telemetry, TimedCommand};
 use crate::definitions::Activation;
 use crate::router::AutonomyMode;
 use crate::utils::utc_mjd_to_gps;
+use anyhow::Result;
+use argmin::solver::particleswarm::ParticleSwarm;
+use async_trait::async_trait;
 use serde::Serialize;
 use simvm::sv::data::Data;
 use std::vec;
 
-use simvm::sv::combine::TRD;
 use crate::c2::{AutonomyModeMessage, RouterMessage};
-use crate::transports::Stream;
 use crate::simulation::{FileTargetReader, SedaroSimulator};
-use argmin::core::{CostFunction, Error, Executor};
+use crate::transports::Stream;
 use argmin::core::State;
+use argmin::core::{CostFunction, Error, Executor};
+use simvm::sv::combine::TRD;
 
 const SIM_DURATION: f64 = 1.0 / 24.0;
 const AGENT_ID: &str = "PTnYWzsc2Nhywc8WVS4blm";
@@ -40,21 +40,30 @@ fn performance(power_frames: &Vec<TRD>, cdh_frames: &Vec<TRD>) -> f64 {
             .expect("Failed to get state_of_charge data");
         min_soc.min(soc)
     });
-    let max_data_generated = cdh_frames.last().unwrap()
+    let max_data_generated = cdh_frames
+        .last()
+        .unwrap()
         .get_by_field("root.cumulative_generated_image_data")
         .expect("Failed to get cumulative_generated_image_data field")
         .data
         .as_f64()
         .expect("Failed to get cumulative_generated_image_data data");
-    let max_data_downlinked = cdh_frames.last().unwrap()
+    let max_data_downlinked = cdh_frames
+        .last()
+        .unwrap()
         .get_by_field("root.cumulative_downlinked_image_data")
         .expect("Failed to get cumulative_downlinked_image_data field")
         .data
         .as_f64()
         .expect("Failed to get cumulative_downlinked_image_data data");
 
-    println!("Min SOC: {:.4}, Max Data Generated: {:.4}, Max Data Downlinked: {:.4}", min_soc, max_data_generated, max_data_downlinked);
-    -(min_soc * SOC_WEIGHT + max_data_generated * DATA_GEN_WEIGHT + max_data_downlinked * DATA_DOWN_WEIGHT)
+    println!(
+        "Min SOC: {:.4}, Max Data Generated: {:.4}, Max Data Downlinked: {:.4}",
+        min_soc, max_data_generated, max_data_downlinked
+    );
+    -(min_soc * SOC_WEIGHT
+        + max_data_generated * DATA_GEN_WEIGHT
+        + max_data_downlinked * DATA_DOWN_WEIGHT)
 }
 
 fn run_simulation(
@@ -77,7 +86,9 @@ fn run_simulation(
         .map(|(t, s)| format!("({:.15}, \"{}\")", t, s))
         .collect::<Vec<_>>()
         .join(", ");
-    let var_details = format!("({AGENT_ID}: (cdh: (\"6VPcwrnbQS6HBHdy3kWtDC.mode_schedule\": [(float, str)],),),)");
+    let var_details = format!(
+        "({AGENT_ID}: (cdh: (\"6VPcwrnbQS6HBHdy3kWtDC.mode_schedule\": [(float, str)],),),)"
+    );
     patches.push((var_details, format!("((([{schedule_str}],),),)")));
 
     let schedule_str = imaging_schedule
@@ -85,7 +96,9 @@ fn run_simulation(
         .map(|(t, s)| format!("({:.15}, \"{}\")", t, s))
         .collect::<Vec<_>>()
         .join(", ");
-    let var_details = format!("({AGENT_ID}: (cdh: (\"6VPhZLmbZhNnP96c9qbnBw.mode_schedule\": [(float, str)],),),)");
+    let var_details = format!(
+        "({AGENT_ID}: (cdh: (\"6VPhZLmbZhNnP96c9qbnBw.mode_schedule\": [(float, str)],),),)"
+    );
     patches.push((var_details, format!("((([{schedule_str}],),),)")));
 
     // Clear results dir and run simulation
@@ -162,7 +175,7 @@ impl CostFunction for PowerOptimization {
             } else {
                 vec![
                     (60000.0 + imaging_start_time, "6VPhZGYSSK9fCDQgYSkdrp"), // Start imaging
-                    (60000.0 + end_time, "6VV4GdVZGZvjGb76fPmtnj"),   // Stop imaging
+                    (60000.0 + end_time, "6VV4GdVZGZvjGb76fPmtnj"),           // Stop imaging
                 ]
             }
         };
@@ -197,71 +210,91 @@ impl AutonomyMode<Telemetry, TimedCommand> for MultiObjectiveOptimization {
     fn activation(&self) -> Activation {
         self.activation.clone()
     }
-    async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<TimedCommand>>>) -> Result<()> {
-      let mut active = false;
-      let mut nonce: Option<u64> = None;
-      loop {
-        if let Ok(message) = stream.read().await {
-          match message {
-            AutonomyModeMessage::Active { nonce: new_nonce } => {
-              active = true;
-              nonce = Some(new_nonce);
-              println!("MultiObjectiveOptimization activated");
+    async fn run(
+        &mut self,
+        mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<TimedCommand>>>,
+    ) -> Result<()> {
+        let mut active = false;
+        let mut nonce: Option<u64> = None;
+        loop {
+            if let Ok(message) = stream.read().await {
+                match message {
+                    AutonomyModeMessage::Active { nonce: new_nonce } => {
+                        active = true;
+                        nonce = Some(new_nonce);
+                        println!("MultiObjectiveOptimization activated");
 
-              let problem = PowerOptimization { simulator: self.simulator.clone() };
-            //   let initial_guess = vec![300.0, 600.0]; // Initial guess for start and end times (in seconds)
-            //   let vertices = vec![
-            //       vec![initial_guess[0], initial_guess[1]], // Initial guess
-            //       vec![initial_guess[0] + 60.0, initial_guess[1]], // Perturb start time
-            //       vec![initial_guess[0], initial_guess[1] + 60.0], // Perturb end time
-            //   ];
-              // let solver = NelderMead::new(vertices).with_sd_tolerance(1e-3).unwrap();
-              let bounds = (vec![0.0, 60.0], vec![SIM_DURATION, 600.0]); // 60 sec to 10 minutes imaging
-              let solver = ParticleSwarm::new(bounds, SWARM_SIZE);
-              let res = Executor::new(problem, solver)
-                  .configure(|state| { state.target_cost(TARGET_PERFORMANCE).max_iters(MAX_ITERATIONS) })
-                  .timeout(std::time::Duration::from_secs(45))
-                  .run()
-                  .unwrap();
-              println!("Optimization best performance: {:?}", res.state.best_cost);
-              let best_param = &res.state.get_best_param().expect("No best parameters found").position;
-              println!(
+                        let problem = PowerOptimization {
+                            simulator: self.simulator.clone(),
+                        };
+                        //   let initial_guess = vec![300.0, 600.0]; // Initial guess for start and end times (in seconds)
+                        //   let vertices = vec![
+                        //       vec![initial_guess[0], initial_guess[1]], // Initial guess
+                        //       vec![initial_guess[0] + 60.0, initial_guess[1]], // Perturb start time
+                        //       vec![initial_guess[0], initial_guess[1] + 60.0], // Perturb end time
+                        //   ];
+                        // let solver = NelderMead::new(vertices).with_sd_tolerance(1e-3).unwrap();
+                        let bounds = (vec![0.0, 60.0], vec![SIM_DURATION, 600.0]); // 60 sec to 10 minutes imaging
+                        let solver = ParticleSwarm::new(bounds, SWARM_SIZE);
+                        let res = Executor::new(problem, solver)
+                            .configure(|state| {
+                                state
+                                    .target_cost(TARGET_PERFORMANCE)
+                                    .max_iters(MAX_ITERATIONS)
+                            })
+                            .timeout(std::time::Duration::from_secs(45))
+                            .run()
+                            .unwrap();
+                        println!("Optimization best performance: {:?}", res.state.best_cost);
+                        let best_param = &res
+                            .state
+                            .get_best_param()
+                            .expect("No best parameters found")
+                            .position;
+                        println!(
                   "Optimization best parameters (start_elapsed_time, duration (s)): ({:?}, {:?})",
                   best_param[0], best_param[1]);
 
-              stream
-                .write(RouterMessage::Command { 
-                  data: TimedCommand::Scheduled {
-                    cmd: Command::CaptureImage,
-                    gps_time: utc_mjd_to_gps(60_000.0 + best_param[0]), // FIXME: Hardcode
-                  },
-                  nonce: new_nonce,
-                })
-                .await?;
-            },
-            AutonomyModeMessage::Inactive => {
-              active = false;
-              println!("MultiObjectiveOptimization deactivated");
-            },
-            AutonomyModeMessage::Telemetry(_telemetry) => {
-              // println!("MultiObjectiveOptimization received telemetry {:?}", _telemetry);
-              // Ignore telemetry for now
-            },
-          }
+                        stream
+                            .write(RouterMessage::Command {
+                                data: TimedCommand::Scheduled {
+                                    cmd: Command::CaptureImage,
+                                    gps_time: utc_mjd_to_gps(60_000.0 + best_param[0]), // FIXME: Hardcode
+                                },
+                                nonce: new_nonce,
+                            })
+                            .await?;
+                    }
+                    AutonomyModeMessage::Inactive => {
+                        active = false;
+                        println!("MultiObjectiveOptimization deactivated");
+                    }
+                    AutonomyModeMessage::Telemetry(_telemetry) => {
+                        // println!("MultiObjectiveOptimization received telemetry {:?}", _telemetry);
+                        // Ignore telemetry for now
+                    }
+                }
+            }
         }
-      }
     }
 }
 
 impl MultiObjectiveOptimization {
-  pub fn new(name: &str, priority: u8, activation: Activation, N: usize, concurrency: usize, simulator: SedaroSimulator) -> Self {
-      Self {
-          name: name.to_string(),
-          priority,
-          activation,
-          N,
-          concurrency,
-          simulator,
-      }
-  }
+    pub fn new(
+        name: &str,
+        priority: u8,
+        activation: Activation,
+        N: usize,
+        concurrency: usize,
+        simulator: SedaroSimulator,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            priority,
+            activation,
+            N,
+            concurrency,
+            simulator,
+        }
+    }
 }
