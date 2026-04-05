@@ -176,12 +176,22 @@ async fn main() -> std::io::Result<()> {
             filter,
             level,
         }) => {
-            if tail.is_some() { println!("WARNING: --tail is not yet implemented") }
-            if follow.unwrap_or(false) { println!("WARNING: --follow is not yet implemented") }
-            if since.is_some() { println!("WARNING: --since is not yet implemented") }
-            if before.is_some() { println!("WARNING: --before is not yet implemented") }
-            if filter.is_some() { println!("WARNING: --filter is not yet implemented") }
-            
+            if tail.is_some() {
+                println!("WARNING: --tail is not yet implemented")
+            }
+            if follow.unwrap_or(false) {
+                println!("WARNING: --follow is not yet implemented")
+            }
+            if since.is_some() {
+                println!("WARNING: --since is not yet implemented")
+            }
+            if before.is_some() {
+                println!("WARNING: --before is not yet implemented")
+            }
+            if filter.is_some() {
+                println!("WARNING: --filter is not yet implemented")
+            }
+
             let stream = TcpStream::connect("127.0.0.1:8001").await?;
             // println!("Connected");
             let mut framed_stream = Framed::new(stream, LengthDelimitedCodec::new());
@@ -194,12 +204,9 @@ async fn main() -> std::io::Result<()> {
             let msg = bincode::serialize(&msg).unwrap();
             framed_stream.send(msg.into()).await?;
             loop {
-                let bytes = framed_stream
-                    .next()
-                    .await
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
-                    })??;
+                let bytes = framed_stream.next().await.ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+                })??;
                 let msg: String = bincode::deserialize(&bytes).unwrap();
                 println!("{}", msg);
             }
@@ -226,12 +233,9 @@ async fn main() -> std::io::Result<()> {
             let msg = bincode::serialize(&msg).unwrap();
             framed_stream.send(msg.into()).await?;
             loop {
-                let bytes = framed_stream
-                    .next()
-                    .await
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
-                    })??;
+                let bytes = framed_stream.next().await.ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")
+                })??;
                 let msg: String = bincode::deserialize(&bytes).unwrap();
                 println!("{}", msg);
             }
