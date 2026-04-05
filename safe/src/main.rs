@@ -93,43 +93,6 @@ async fn main() -> Result<()> {
     );
     flight.register_autonomy_mode(mode).await?;
 
-
-    /*
-    
-    MJO
-      Needs to continually evaluate future?
-      Or lock in a plan and yield back?
-      Show statefulness of AMs with gpstime of last command
-      Should also save IDs of scheduled commands in case we need to cancel them
-      Inputs are:
-        - Disk utilization
-        - Power system state (battery SoC mainly)
-        - OD solution
-
-      Iridium 
-      Last contact from ground?
-      Inputs are 
-        - Current pointing plan
-        - Time - which drives iridium location
-        - OD solution
-      
-      Collaboration between modes required because pointing plan dictates iridium visibility
-      - Collaborate through command schedule?
-
-      Add activation for when telemetry changes value!
-
-      We need to think hard about how schedules and temporary deviations in vehicle config from the model are captured
-      e.g. ground turns on a heater for a bit, ad hoc, increasing power consumption.  Need to add this to SAFE or provide SAFE a way to interrogate host for current ConOps
-      A full picture of what the future is expected to hold for the vehicle
-      
-      SAFE should keep a buffer of all commands it sent, scheduled, etc and which were accepted so that all modes know what conops looks like ahead
-        - Maybe you can initialize or update SAFE with current commands scheduled as well as current state to is knows starting point, beyond just telem
-      
-      Don't let AM run routines return a result.  They must handle all exceptions themselves?  Or should safe restart them? A: Safe should restart them - panics are likely unavoidable due to IPC complexity
-      When a channel closes, for whatever reason, implement robust recovery
-     */
-
-
     // TODO: Move this into flight!!!
     let (non_blocking, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily("./logs", "safe.log"));
@@ -307,42 +270,3 @@ mod tests {
         assert_eq!(serde_json::from_str::<TestCommand>(client_rx_stream.read().await.unwrap().as_str()).unwrap().value, "Mode A received 200".to_string());
     }
 }
-
-/*
-- IDEA: Way to isolate the exercise/test/develope AMs in isolation without SAFE overhead
-- The Transport interface should likely implement a means of ackowledging what has been received
-  - This gets more difficult with split streams though
-  - Is TCP ack enough?  What about UDP?
-- Does the client/server model for transports make sense?  Should router take a stream instead of a transport impls?
-  - Document: Passing a handle to the modes allow them to handle reconnect
-  - A: It does make sense for flexiblity and the opportunity to flag off certain transports which aren't supported on particular platforms.  Also server-broadcast is nice.  Transports enable platform-agnostic IPC.
-- Make unit-testable and more of a framework
-- Support background running modes and foreground
-  - Implement a way to have background modes which are alerted when they are activated/deactivated
-- Documentation, if not sensitive?
-  - It is important to guarantee that Modes can't issue commands when Router logic would deactivate them
-- Implement autonomy mode transport fault recovery (i.e. reconnect)
-  - Unless we come up with somethign more clever, this will require that we implement a handshake to identify the Mode on connect.  This could probably be handle by some connection factory.
-- Have a rust-native autonomy mode or two
-- (WIP) Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
-- Allow for different SAFE instances to "collaborate" via dedicated interface
-- Try to compile it for Raspberry PI and STM MCU
-- Focus on the EDS integration piece
-- Integrate redb
- */
-
-/*
-Known issues:
-- Need better Activation interpreter
- */
-
-/*
-Define ontology
-Ontology should be fully persisted in redb
-Ontology should support variables which can be updated via config interface
- */
-
-/*
-How is routing logic defined?  Part of the Ontology?  Ask team.
-Needs to be able to implement arbitrary logic as rust code as a fall back.
- */
