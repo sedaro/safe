@@ -6,25 +6,26 @@ The work completed to date has aimed to:
 - Focus on quality, value-add features from day-one to further catalyze adoption
 - Focus demo on the trust piece
 
+**WARNING: The following is not comprehensive**
 
 ## Depends On 
 
-- [ ] 🔴 Need SimVM TS to be publicly installable crate so that GitHub Actions pipelines can properly `cargo test`
-- [ ] 🔴 Need Sedaro type system in simvm crate to support keying into datum via string keys, otherwise we are majorly at risk of setting the wrong SV
 - [ ] 🔴 `pid_config` not getting sourced from the init file in satops sim
 	- SAFE commit: ad4f084b98541f9aa393f4021c228766cc284410
 	- scf commit: e6bf8a283d9d1d58905d3222923f163c0bf36198
-- [ ] 🔴 How to have multiple init files without racing?
 
 ## Discovery
 
 - [ ] Format as proper crate
 - [ ] Run SAFE ASAP on MCU and figure out whether this is practical.  Will sims run on an MCU?  Do sims require std?  Is `no-std` even possible
 - [ ] Scaffold out `Service` topology kind with as much reuse from `Flight` as possible.
+- Does the client/server model for transports make sense?  Should router take a stream instead of a transport impls?
+  - Document: Passing a handle to the modes allow them to handle reconnect
+  - A: It does make sense for flexiblity and the opportunity to flag off certain transports which aren't supported on particular platforms.  Also server-broadcast is nice.  Transports enable platform-agnostic IPC.
 
 ## Cleanup
 
-- [ ] Fix logging, including moving the tracing setup into flight
+- [ ] Fix logging, including moving the tracing setup into Flight
 - [ ] Rework C2 interface and handler
   - C2 interface should be a client not a server?
 - [ ] Better error handling and reduce unwraps
@@ -43,7 +44,7 @@ The work completed to date has aimed to:
   - [ ] Optimizers
   - [ ] Stats: Brad to architect this module (https://sedaro.slack.com/archives/D03FLBA7WCT/p1765289350221849)
   - ...
-- [ ] Simplement engagement mode
+- [ ] Implement engagement mode
 - [ ] Autonomy Mode reg/dereg and static, persisted state for recovery
 - [ ] `safectl` vNext
 - [ ] Build out routing logic
@@ -55,6 +56,14 @@ The work completed to date has aimed to:
 		- Skylark - python-esque and has rust interpreter (https://github.com/facebook/starlark-rust)
   - Whatever we choose should probably work for `no-std`
   - Justification for our lang is it's guaranteed to work vs. scripting which isn't guaranteed.  We should offer both.
+- IDEA: Way to isolate the exercise/test/develop AMs in isolation without SAFE overhead
+- Add activation for when telemetry changes value!
+- Support background running modes and foreground
+  - Implement a way to have background modes which are alerted when they are activated/deactivated
+- Implement autonomy mode transport fault recovery (i.e. reconnect)
+  - Unless we come up with somethign more clever, this will require that we implement a handshake to identify the Mode on connect.  This could probably be handle by some connection factory.
+- (WIP) Utilities for debouncing or filtering out potentially noisy telemetry inputs to get a confident reading.  Make this part of activations for modes.
+- Allow for different SAFE instances to "collaborate" via dedicated interface
 
 ## Reliability
 
@@ -66,3 +75,10 @@ The work completed to date has aimed to:
   - Figure out if current logging is ugly and non-future proof.  We don't want to miss important logs because of some nested span.  But maybe this is okay because they are still written to the main log.  How do we record logs from subprocesses such that they are still queryable by timestamp??
   - 🔴 Replay needs immediate attention and design before its too late to rollout.
 - [ ] Implement autonomy mode restart on error, with backoff?
+- The Transport interface should likely implement a means of acknowledging what has been received
+  - This gets more difficult with split streams though
+  - Is TCP ack enough?  What about UDP?
+- It is important to guarantee that Modes can't issue commands when Router logic would deactivate them
+
+## Tech Debt
+- Need better Activation interpreter

@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -31,7 +30,7 @@ pub enum TimedCommand {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum AutonomyModeMessage<T> {
     Telemetry(T),
-    Active { nonce: u64, },
+    Active { nonce: u64 },
     Inactive,
     // InactiveWarning, // TODO: Warn of getting unscheduled
     // C2AcceptedCommand { generation: u64, seq: u64,  }, // TODO: Ack from C2 that command was accepted
@@ -39,7 +38,7 @@ pub enum AutonomyModeMessage<T> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RouterMessage<C> {
-    Command { data: C, nonce: u64, },
+    Command { data: C, nonce: u64 },
 }
 
 // CLI request structures
