@@ -35,7 +35,7 @@ pub enum Value<V> {
     Literal(V),
     VariableRef(String),
     TelemetryRef(String),
-    AverageTelemetryRef{ name: String, points: usize, },
+    AverageTelemetryRef { name: String, points: usize },
     // AverageSinceTelemetryRef{ name: String, todo: f64, },
 }
 impl Value<String> {
@@ -52,13 +52,13 @@ impl Value<String> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
             },
-            Value::AverageTelemetryRef{name, points} => {
+            Value::AverageTelemetryRef { name, points } => {
                 let points = ctx.get_telemetry_points(name, *points);
                 if points.is_empty() {
-                  return Err(Error::UndefinedTelemetry(name.clone()));
+                    return Err(Error::UndefinedTelemetry(name.clone()));
                 }
                 unimplemented!()
-            },
+            }
         }
     }
 }
@@ -76,22 +76,22 @@ impl Value<f64> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
             },
-            Value::AverageTelemetryRef{name, points} => {
+            Value::AverageTelemetryRef { name, points } => {
                 let points = ctx.get_telemetry_points(name, *points);
                 if points.is_empty() {
-                  return Err(Error::UndefinedTelemetry(name.clone()));
+                    return Err(Error::UndefinedTelemetry(name.clone()));
                 }
                 let mut sum = 0.0;
                 for point in &points {
-                  match point {
-                    Variable::Float64(v) => {
-                      sum += v.resolve_f64(ctx)?;
-                    },
-                    _ => return Err(Error::TypeMismatch),
-                  }
+                    match point {
+                        Variable::Float64(v) => {
+                            sum += v.resolve_f64(ctx)?;
+                        }
+                        _ => return Err(Error::TypeMismatch),
+                    }
                 }
                 Ok(sum / (points.len() as f64))
-            },
+            }
         }
     }
 }
@@ -109,22 +109,22 @@ impl Value<bool> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
             },
-            Value::AverageTelemetryRef{name, points} => {
+            Value::AverageTelemetryRef { name, points } => {
                 let points = ctx.get_telemetry_points(name, *points);
                 if points.is_empty() {
-                  return Err(Error::UndefinedTelemetry(name.clone()));
+                    return Err(Error::UndefinedTelemetry(name.clone()));
                 }
                 let mut sum = 0.0;
                 for point in &points {
-                  match point {
-                    Variable::Bool(v) => {
-                      sum += if v.resolve_bool(ctx)? { 1.0 } else { 0.0 };
-                    },
-                    _ => return Err(Error::TypeMismatch),
-                  }
+                    match point {
+                        Variable::Bool(v) => {
+                            sum += if v.resolve_bool(ctx)? { 1.0 } else { 0.0 };
+                        }
+                        _ => return Err(Error::TypeMismatch),
+                    }
                 }
                 Ok((sum / (points.len() as f64)) >= 0.5)
-            },
+            }
         }
     }
 }
@@ -142,7 +142,7 @@ impl Variable {
             Variable::Bool(_) => Err(Error::UnresolvedVariable),
             Variable::Float64(Value::Literal(v)) => Ok(*v != 0.0),
             Variable::Float64(_) => Err(Error::UnresolvedVariable),
-            Variable::String(Value::Literal(s)) => Ok(!s.is_empty()), // TODO: Revisit truthiness of strings if we want to change how they are interpreted   
+            Variable::String(Value::Literal(s)) => Ok(!s.is_empty()), // TODO: Revisit truthiness of strings if we want to change how they are interpreted
             Variable::String(_) => Err(Error::UnresolvedVariable),
         }
     }
@@ -151,16 +151,26 @@ impl Variable {
             (Variable::String(a), Variable::String(b)) => Ok(Some(a.cmp(b))),
             (Variable::Float64(a), Variable::Float64(b)) => Ok(a.partial_cmp(b)),
             (Variable::Bool(a), Variable::Bool(b)) => Ok(Some(a.cmp(b))),
-            (Variable::Float64(Value::Literal(a)), Variable::Bool(Value::Literal(b))) => Ok((*a != 0.0).partial_cmp(b)),           
-            (Variable::Bool(Value::Literal(a)), Variable::Float64(Value::Literal(b))) => Ok(a.partial_cmp(&(*b != 0.0))),
+            (Variable::Float64(Value::Literal(a)), Variable::Bool(Value::Literal(b))) => {
+                Ok((*a != 0.0).partial_cmp(b))
+            }
+            (Variable::Bool(Value::Literal(a)), Variable::Float64(Value::Literal(b))) => {
+                Ok(a.partial_cmp(&(*b != 0.0)))
+            }
             _ => Err(Error::TypeMismatch),
         }
     }
     fn resolve(&self, ctx: &impl Resolvable) -> Result<Variable, Error> {
         match self {
-            Variable::String(v) => v.resolve_string(ctx).map(|v| Variable::String(Value::Literal(v))),
-            Variable::Float64(v) => v.resolve_f64(ctx).map(|v| Variable::Float64(Value::Literal(v))),
-            Variable::Bool(v) => v.resolve_bool(ctx).map(|v| Variable::Bool(Value::Literal(v))),
+            Variable::String(v) => v
+                .resolve_string(ctx)
+                .map(|v| Variable::String(Value::Literal(v))),
+            Variable::Float64(v) => v
+                .resolve_f64(ctx)
+                .map(|v| Variable::Float64(Value::Literal(v))),
+            Variable::Bool(v) => v
+                .resolve_bool(ctx)
+                .map(|v| Variable::Bool(Value::Literal(v))),
         }
     }
 }
@@ -219,15 +229,21 @@ impl Expr {
             Expr::Not(expr) => Ok(!expr.eval(ctx)?),
             Expr::GreaterThan(l, r) => {
                 let (lv, rv) = (Self::eval_value(l, ctx)?, Self::eval_value(r, ctx)?);
-                lv.try_cmp(&rv)?.ok_or(Error::NotComparable).map(|o| o.is_gt())
+                lv.try_cmp(&rv)?
+                    .ok_or(Error::NotComparable)
+                    .map(|o| o.is_gt())
             }
             Expr::LessThan(l, r) => {
                 let (lv, rv) = (Self::eval_value(l, ctx)?, Self::eval_value(r, ctx)?);
-                lv.try_cmp(&rv)?.ok_or(Error::NotComparable).map(|o| o.is_lt())
+                lv.try_cmp(&rv)?
+                    .ok_or(Error::NotComparable)
+                    .map(|o| o.is_lt())
             }
             Expr::Equal(l, r) => {
                 let (lv, rv) = (Self::eval_value(l, ctx)?, Self::eval_value(r, ctx)?);
-                lv.try_cmp(&rv)?.ok_or(Error::NotComparable).map(|o| o.is_eq())
+                lv.try_cmp(&rv)?
+                    .ok_or(Error::NotComparable)
+                    .map(|o| o.is_eq())
             }
         }
     }

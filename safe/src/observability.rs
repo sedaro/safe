@@ -1,3 +1,4 @@
+use crate::config::Config;
 use anyhow::Result;
 use rand_distr::num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,6 @@ use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::time;
 use tracing::warn;
-use crate::config::Config;
 
 pub struct ObservabilitySubsystem<T, C> {
     _marker: std::marker::PhantomData<(T, C)>,
@@ -40,10 +40,10 @@ pub enum Location {
     C2,
 }
 
-impl<T, C> ObservabilitySubsystem<T, C> 
+impl<T, C> ObservabilitySubsystem<T, C>
 where
-  T: Serialize,
-  C: Serialize,
+    T: Serialize,
+    C: Serialize,
 {
     pub fn new(seq: Option<u64>) -> Self {
         Self {
@@ -59,7 +59,12 @@ where
 
     pub fn log_event(&self, location: Location, event: Event<T, C>) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(sig = self.sig, seq = seq, loc = serde_json::to_string(&location).unwrap(), event = serde_json::to_string(&event).unwrap()); // FIXME: Serialize properly and avoid nested json serialization
+        tracing::info!(
+            sig = self.sig,
+            seq = seq,
+            loc = serde_json::to_string(&location).unwrap(),
+            event = serde_json::to_string(&event).unwrap()
+        ); // FIXME: Serialize properly and avoid nested json serialization
     }
 
     pub async fn run(&self, config: &Config) -> Result<()> {

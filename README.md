@@ -4,7 +4,7 @@
 
 Sedaro Autonomy Framework for Edge (`safe`) is an open-source flight software mission autonomy framework that integrates Sedaro's Edge Deployable Simulators (EDS's) alongside third-party software to achieve trusted satellite autonomy across the mission lifecycle.
 
-![safe](safe.png)
+![safe](media/safe.png)
 
 ## Yet Another Autonomy Framework?
 
@@ -36,6 +36,8 @@ Features:
 2. A Router sets the active autonomy mode based on telemetry so that developers and mission planners can design an array of modes that incorporate various autonomy approaches for each mission phase, potential state of the vehicle, and potential state of its operating
 environment. 
 3. Batteries-included developer libraries for multi-simulation, multi-parameter optimization and risk analysis, in addition to turnkey support for the integration of EDS’s, enables streamlined development of `safe` autonomy modes.
+
+![arch](media/example.png)
 
 ## Example
 
