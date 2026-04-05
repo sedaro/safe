@@ -16,6 +16,10 @@ use tracing_subscriber::fmt::format;
 
 use crate::simulation;
 
+// TODO
+#[derive(Clone, Debug)]
+pub struct SimulationResult {}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct SedaroSimulator {
     path: std::path::PathBuf,
