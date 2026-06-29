@@ -1,0 +1,31 @@
+tracing:
+  level: "info"
+  filter: "info"
+  with_target: true
+
+sockets:
+  telemetry:
+    ip: "127.0.0.1"
+    port: 44212
+  commands:
+    ip: "127.0.0.1"
+    port: 7002
+
+logging:
+  file_path: "/tmp/safe/logs/safe.log"
+  rotation:
+    max_file_size_mb: 200
+    max_files: 7
+    daily: true
+
+limits:
+  max_autonomy_modes: 10
+
+base_paths:
+  base_writable_directory: /tmp/safe
+
+platform:
+  gatekeeper_adapter: disabled
+  external_gatekeeper_command: null
+
+gatekeeper: {}
