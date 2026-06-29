@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.94.1"
+targets = [ "aarch64-unknown-linux-gnu", "aarch64-apple-darwin" ]
+profile = "default"

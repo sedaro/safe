@@ -1,2 +1,8 @@
 [net]
 git-fetch-with-cli = true
+
+[registry]
+global-credential-providers = ["cargo:token", "cargo:macos-keychain"]
+
+[registries.sedaro-crates]
+index = "sparse+https://crates.sedaro.us/api/v1/crates/"
