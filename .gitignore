@@ -6,3 +6,9 @@
 /tmp/target
 /safe/simulators
 /safe/results
+/.direnv/
+/safe/metrics.bin
+/safe/state
+*.csv
+/eds
+/**/.*.swp

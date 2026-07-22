@@ -1,6 +1,25 @@
 [workspace]
 members = [
     "safe",
+    "safe-time",
     "safectl",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "1.2.3"
+authors = ["Sedaro"]
+edition = "2024"
+description = "Sedaro Autonomy Framework for Edge"
+documentation = "https://gitlab.sedaro.us/trusted-sat-ops/safe"
+
+[profile.release]
+strip = true
+
+[profile.eds]
+inherits = "release"
+opt-level = "z"
+debug = false
+strip = true
+panic = "abort"
+codegen-units = 1
