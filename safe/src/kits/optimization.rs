@@ -1,5 +1,6 @@
-use crate::simulation::{SedaroSimulator, SimulationResult};
 use tokio::time::Duration;
+
+use crate::simulation::{SedaroSimulator, SimulationResult};
 
 /// Status of the optimization process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,9 +88,15 @@ pub trait Optimizer<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        str::FromStr,
+    };
+
+    use tokio;
+
     use super::{OptimizationResult, OptimizationStatus, Optimizer, Problem};
     use crate::simulation::{SedaroSimulator, SimulationResult};
-    use tokio;
 
     fn simple_objective(_result: &SimulationResult) -> f64 {
         0.0 // Placeholder objective function
@@ -112,8 +119,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_optimization() {
+        let tmp_path: PathBuf = PathBuf::from("/tmp/path");
         let problem = Problem {
-            simulator: SedaroSimulator::new(&"/tmp/path".into()),
+            simulator: SedaroSimulator::new(&tmp_path),
             objective: |_result: &SimulationResult| 0.0,
             constraints: vec![],
             initial_state: 42.0,

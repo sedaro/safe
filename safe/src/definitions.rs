@@ -1,10 +1,12 @@
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub enum Error {
     UndefinedVariable(String),
     UndefinedTelemetry(String),
+    UndefinedLastPlannedAutonomyMode(String),
     TypeMismatch,
     NotComparable,
     UnresolvedVariable,
@@ -27,7 +29,7 @@ pub trait Resolvable {
     fn get_variable(&self, name: &str) -> Option<Variable>;
     fn get_telemetry_point(&self, name: &str) -> Option<Variable>;
     fn get_telemetry_points(&self, name: &str, points: usize) -> Vec<Variable>;
-    // fn get_telemetry_points_since(&self, name: &str, points: i32) -> Option<<Variable>>;
+    fn get_last_planned_autonomy_mode(&self) -> Option<Variable>;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
@@ -36,8 +38,9 @@ pub enum Value<V> {
     VariableRef(String),
     TelemetryRef(String),
     AverageTelemetryRef { name: String, points: usize },
-    // AverageSinceTelemetryRef{ name: String, todo: f64, },
+    LastPlannedAutonomyModeRef(String),
 }
+
 impl Value<String> {
     fn resolve_string(&self, ctx: &impl Resolvable) -> Result<String, Error> {
         match self {
@@ -52,6 +55,11 @@ impl Value<String> {
                 Some(_) => Err(Error::TypeMismatch),
                 None => Err(Error::UndefinedTelemetry(name.clone())),
             },
+            Value::LastPlannedAutonomyModeRef(name) => match ctx.get_last_planned_autonomy_mode() {
+                Some(Variable::String(v)) => v.resolve_string(ctx),
+                Some(_) => Err(Error::TypeMismatch),
+                None => Err(Error::UndefinedLastPlannedAutonomyMode(name.clone())),
+            },
             Value::AverageTelemetryRef { name, points } => {
                 let points = ctx.get_telemetry_points(name, *points);
                 if points.is_empty() {
@@ -62,9 +70,13 @@ impl Value<String> {
         }
     }
 }
+
 impl Value<f64> {
     fn resolve_f64(&self, ctx: &impl Resolvable) -> Result<f64, Error> {
         match self {
+            Value::LastPlannedAutonomyModeRef(_) => {
+                unimplemented!()
+            }
             Value::Literal(f) => Ok(*f),
             Value::VariableRef(name) => match ctx.get_variable(name) {
                 Some(Variable::Float64(v)) => v.resolve_f64(ctx),
@@ -95,9 +107,13 @@ impl Value<f64> {
         }
     }
 }
+
 impl Value<bool> {
     fn resolve_bool(&self, ctx: &impl Resolvable) -> Result<bool, Error> {
         match self {
+            Value::LastPlannedAutonomyModeRef(_) => {
+                unimplemented!()
+            }
             Value::Literal(b) => Ok(*b),
             Value::VariableRef(name) => match ctx.get_variable(name) {
                 Some(Variable::Bool(v)) => v.resolve_bool(ctx),
@@ -135,6 +151,7 @@ pub enum Variable {
     Float64(Value<f64>),
     Bool(Value<bool>),
 }
+
 impl Variable {
     fn as_bool(&self) -> Result<bool, Error> {
         match self {
@@ -185,22 +202,28 @@ pub enum Expr {
     LessThan(Box<Expr>, Box<Expr>),
     Equal(Box<Expr>, Box<Expr>),
 }
+
 impl Expr {
     pub fn and(exprs: Vec<Expr>) -> Self {
         Expr::And(exprs)
     }
+
     pub fn or(exprs: Vec<Expr>) -> Self {
         Expr::Or(exprs)
     }
+
     pub fn not(expr: Expr) -> Self {
         Expr::Not(Box::new(expr))
     }
+
     pub fn greater_than(left: Expr, right: Expr) -> Self {
         Expr::GreaterThan(Box::new(left), Box::new(right))
     }
+
     pub fn less_than(left: Expr, right: Expr) -> Self {
         Expr::LessThan(Box::new(left), Box::new(right))
     }
+
     pub fn equal(left: Expr, right: Expr) -> Self {
         Expr::Equal(Box::new(left), Box::new(right))
     }
@@ -247,6 +270,7 @@ impl Expr {
             }
         }
     }
+
     fn eval_value(expr: &Expr, ctx: &impl Resolvable) -> Result<Variable, Error> {
         match expr {
             Expr::Term(var) => var.resolve(ctx),
