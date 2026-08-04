@@ -13,6 +13,7 @@ pub enum Command {
     IridiumTransmitMsg(String),
     PointSunYaw,
     PointNadir,
+    PointQuaternion { x: f64, y: f64, z: f64, w: f64 },
     CaptureImage,
     PointThruster,
     ThrusterOn,
@@ -30,6 +31,9 @@ impl Into<String> for &Command {
             Command::IridiumTransmitMsg(msg) => format!("IridiumTransmitMsg({msg})"),
             Command::PointSunYaw => "PointSunYaw".to_string(),
             Command::PointNadir => "PointNadir".to_string(),
+            Command::PointQuaternion { x, y, z, w } => {
+                format!("PointQuaternion({x}, {y}, {z}, {w})")
+            }
             Command::CaptureImage => "CaptureImage".to_string(),
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
@@ -49,6 +53,9 @@ impl Into<String> for Command {
             Command::IridiumTransmitMsg(msg) => format!("IridiumTransmitMsg({msg})"),
             Command::PointSunYaw => "PointSunYaw".to_string(),
             Command::PointNadir => "PointNadir".to_string(),
+            Command::PointQuaternion { x, y, z, w } => {
+                format!("PointQuaternion({x}, {y}, {z}, {w})")
+            }
             Command::CaptureImage => "CaptureImage".to_string(),
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
@@ -278,6 +285,55 @@ mod tests {
 
         assert_eq!(board.source_of_truth[0].0, "1:a:0");
         assert_eq!(board.source_of_truth[1].0, "2:b:0");
+    }
+
+    #[test]
+    fn point_quaternion_serializes_and_round_trips() {
+        let command = Command::PointQuaternion {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        };
+
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "PointQuaternion": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0,
+                }
+            })
+        );
+
+        let from_json: Command = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            from_json,
+            Command::PointQuaternion {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            }
+        ));
+
+        let bytes = bincode::serialize(&command).unwrap();
+        let from_bincode: Command = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(
+            from_bincode,
+            Command::PointQuaternion {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            }
+        ));
+
+        let rendered: String = (&command).into();
+        assert_eq!(rendered, "PointQuaternion(0, 0, 0, 1)");
     }
 
     prop_compose! {
