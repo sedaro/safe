@@ -48,6 +48,7 @@ fn telemetry_with_flag(flag: bool) -> TelemetryFrame {
 fn mode_meta(id: u128, priority: u8, enabled: bool) -> AutonomyModeMeta {
     AutonomyModeMeta {
         id: mk_mode_id(id),
+        name: format!("mode-{id}"),
         priority,
         enabled,
     }
@@ -55,18 +56,14 @@ fn mode_meta(id: u128, priority: u8, enabled: bool) -> AutonomyModeMeta {
 
 fn flag_true_expr() -> Expr {
     Expr::equal(
-        Expr::Term(Variable::Float64(Value::TelemetryRef(
-            "bitfield.0".into(),
-        ))),
+        Expr::Term(Variable::Float64(Value::TelemetryRef("bitfield.0".into()))),
         Expr::Term(Variable::Float64(Value::Literal(1.0))),
     )
 }
 
 fn flag_false_expr() -> Expr {
     Expr::equal(
-        Expr::Term(Variable::Float64(Value::TelemetryRef(
-            "bitfield.0".into(),
-        ))),
+        Expr::Term(Variable::Float64(Value::TelemetryRef("bitfield.0".into()))),
         Expr::Term(Variable::Float64(Value::Literal(0.0))),
     )
 }
@@ -78,11 +75,13 @@ fn choose_active_autonomy_mode_picks_highest_enabled_priority() {
     f.set_autonomy_modes(vec![
         AutonomyModeMeta {
             id: mk_mode_id(1),
+            name: "mode-1".to_string(),
             priority: 1,
             enabled: true,
         },
         AutonomyModeMeta {
             id: mk_mode_id(2),
+            name: "mode-2".to_string(),
             priority: 2,
             enabled: true,
         },
@@ -100,11 +99,13 @@ fn choose_active_autonomy_mode_skips_disabled_modes() {
     f.set_autonomy_modes(vec![
         AutonomyModeMeta {
             id: mk_mode_id(1),
+            name: "mode-1".to_string(),
             priority: 1,
             enabled: true,
         },
         AutonomyModeMeta {
             id: mk_mode_id(2),
+            name: "mode-2".to_string(),
             priority: 99,
             enabled: false,
         },
@@ -590,6 +591,7 @@ prop_compose! {
     fn arb_mode_meta()(id_bytes in any::<[u8; 16]>(), priority in 0u8..=200, enabled in any::<bool>()) -> AutonomyModeMeta {
         AutonomyModeMeta {
             id: AutonomyModeId(Uuid::from_bytes(id_bytes)),
+            name: "generated".to_string(),
             priority,
             enabled,
         }

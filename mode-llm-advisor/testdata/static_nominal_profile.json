@@ -1,0 +1,47 @@
+{
+  "action_catalog": [
+    {
+      "id": "point_sun_yaw",
+      "description": "Point solar arrays toward the sun while maintaining yaw constraints.",
+      "preconditions": ["Attitude control is available."]
+    },
+    {
+      "id": "point_nadir",
+      "description": "Point the payload toward nadir for a configured recovery posture.",
+      "preconditions": ["Attitude control is available."]
+    }
+  ],
+  "nominal_profiles": [
+    {
+      "id": "example-v1",
+      "source": "example",
+      "rules": [
+        {
+          "id": "temperature_out_of_nominal",
+          "path": "telemetry.temperature_c",
+          "kind": "number_range",
+          "min": -20.0,
+          "max": 45.0,
+          "min_consecutive_samples": 2,
+          "severity": "high",
+          "eligible_actions": ["point_sun_yaw"]
+        },
+        {
+          "id": "mode_invalid",
+          "path": "telemetry.mode",
+          "kind": "enum",
+          "allowed": ["idle", "nominal", "safe"],
+          "severity": "medium",
+          "eligible_actions": ["point_nadir", "point_sun_yaw"]
+        },
+        {
+          "id": "enabled_unexpected",
+          "path": "telemetry.enabled",
+          "kind": "boolean",
+          "expected": true,
+          "severity": "low"
+        }
+      ]
+    }
+  ]
+}
