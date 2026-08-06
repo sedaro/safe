@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use crate::telemetry_frame::TelemetryFrame;
 
+pub const AUTONOMY_MODE_PROTOCOL_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     SetPidControllerGains(f64, f64, f64, f64),
@@ -108,6 +110,17 @@ pub enum AutonomyModeOutput {
     Command(CommandEnvelope),
     Fault(String),
     CancelBoard { id: BoardCmdId, reason: String },
+    Lifecycle { state: AutonomyModeLifecycle },
+    Heartbeat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyModeLifecycle {
+    Ready,
+    Active,
+    Inactive,
+    Stopping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

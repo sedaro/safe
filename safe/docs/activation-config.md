@@ -1,202 +1,163 @@
-# Activation Config Guide
+# Activation Configuration
 
-SAFE can select the active autonomy mode from telemetry-driven activation rules.
+SAFE selects one desired autonomy mode from the entries in
+`autonomy_mode_config.json`. The file is a top-level JSON array. The checked-in
+file is currently empty, so it is a valid configuration with no modes.
 
-At runtime, mode selection works like this:
+## Selection Order
 
-1. If a manual override is set (for example, via `safectl send --op activate_mode`), that mode stays pinned while it remains enabled.
-2. Otherwise, if the current active mode has hysteresis and its `exit` is `false`, SAFE keeps that mode active.
-3. Otherwise, SAFE evaluates mode activation eligibility and picks the highest-priority eligible enabled mode.
+For each telemetry frame, SAFE applies this order:
 
-If an activation expression fails to evaluate, that mode is treated as ineligible for that cycle.
+1. An enabled mode selected by a manual override remains pinned.
+2. Without a manual override, an active hysteretic mode is retained while its
+   `exit` expression evaluates to `false`.
+3. Otherwise, SAFE filters to enabled modes whose activation condition is true
+   and selects the highest-priority eligible mode.
 
-## `activation` field
+An activation evaluation error makes a mode ineligible during normal selection.
+If evaluation of the current hysteretic mode's `exit` expression fails, SAFE
+keeps that mode active rather than switching away from it.
 
-In `autonomy_mode_config.json`, each mode may include an optional `activation` field.
+Manual overrides are issued through `safectl send --op activate_mode`. The
+override is cleared by `deactivate_mode`, by disabling the mode, or when the
+mode is removed from configuration.
 
-- Omitted `activation`: mode is always eligible (current priority-only behavior).
-- `Immediate(expr)`: mode is eligible when `expr` evaluates to `true`.
-- `Hysteretic { enter, exit }`:
-  - mode is eligible to become active when `enter` is `true`
-  - once active, SAFE keeps it active until `exit` becomes `true`
+## Mode Entry Schema
 
-Because this is Rust enum JSON, use externally-tagged enum shape.
+Each array entry has this shape:
 
-## Expression JSON shape
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | yes | Unique mode name. It deterministically derives the mode UUID. |
+| `priority` | yes | Unsigned priority used for selection. |
+| `enabled` | no | Defaults to `true`. Disabled entries remain in metadata but are not spawned. |
+| `bin_path` | yes | Mode executable. Relative paths are resolved relative to this JSON file. |
+| `args` | no | Additional executable arguments. Defaults to `[]`. |
+| `sandbox_resources` | yes | `cpu`, `memory`, and `disk` limits. |
+| `persist_work_dir` | no | Preserve the mode working directory across restarts. Defaults to `false`. |
+| `mode_config` | no | Arbitrary JSON passed to the mode. Defaults to `null`. |
+| `activation` | no | `Immediate` or `Hysteretic` activation rule. |
 
-`Expr` supports:
+Mode IDs are UUID v5 values derived from `name` using the UUID OID namespace.
+Changing a name creates a new mode identity. `limits.max_autonomy_modes` counts
+all entries, including disabled entries.
 
-- `Term(Variable)`
-- `And([Expr, ...])`
-- `Or([Expr, ...])`
-- `Not(Expr)`
-- `GreaterThan(Expr, Expr)`
-- `LessThan(Expr, Expr)`
-- `Equal(Expr, Expr)`
-
-`Variable` supports:
-
-- `Bool(Value<bool>)`
-- `Float64(Value<f64>)`
-- `String(Value<String>)`
-
-`Value<T>` supports:
-
-- `Literal(T)`
-- `TelemetryRef("dot.path")`
-- `AverageTelemetryRef { "name": "dot.path", "points": N }`
-
-## Telemetry paths
-
-Telemetry references resolve against `Telemetry` fields using dot paths.
-
-Examples:
-
-- `"telemetry.temperature_value_c"`
-
-## Example: immediate rule
+Example entry:
 
 ```json
 {
-  "name": "NoImagesHot",
-  "priority": 4,
+  "name": "ExampleMode",
+  "priority": 10,
   "enabled": true,
-  "bin_path": "/home/wdaughtridge.guest/safe/target/debug/mode_no_images_hot",
+  "bin_path": "../target/debug/mode_llm_advisor",
   "args": [],
   "sandbox_resources": {
-    "cpu": 90.0,
-    "memory": 1000000000,
-    "disk": 1000000000
+    "cpu": 25.0,
+    "memory": 536870912,
+    "disk": 104857600
   },
   "persist_work_dir": true,
+  "mode_config": {},
   "activation": {
     "Immediate": {
       "GreaterThan": [
-        { "Term": { "Float64": { "TelemetryRef": "telemetry.temperature_value_c" } } },
-        { "Term": { "Float64": { "Literal": 34.0 } } }
+        {
+          "Term": {
+            "Float64": {
+              "TelemetryRef": "telemetry.temperature_value_c"
+            }
+          }
+        },
+        {
+          "Term": {
+            "Float64": {
+              "Literal": 34.0
+            }
+          }
+        }
       ]
     }
-  },
-  "mode_config": {
-    "label": "NoImagesHot"
   }
 }
 ```
 
-## Example: hysteretic rule
+The example is a schema example only. `mode_llm_advisor` requires its own
+validated `mode_config`; see its README for a complete advisor configuration.
+
+## Activation Types
+
+Omit `activation` for a mode that is always eligible. Use the externally tagged
+JSON enum forms below:
+
+```json
+{ "Immediate": { "Term": { "Bool": { "Literal": true } } } }
+```
 
 ```json
 {
-  "activation": {
-    "Hysteretic": {
-      "enter": {
-        "GreaterThan": [
-          { "Term": { "Float64": { "TelemetryRef": "telemetry.temperature_value_c" } } },
-          { "Term": { "Float64": { "Literal": 25.0 } } }
-        ]
-      },
-      "exit": {
-        "LessThan": [
-          { "Term": { "Float64": { "TelemetryRef": "telemetry.temperature_value_c" } } },
-          { "Term": { "Float64": { "Literal": 23.0 } } }
-        ]
-      }
+  "Hysteretic": {
+    "enter": {
+      "GreaterThan": [
+        { "Term": { "Float64": { "TelemetryRef": "thermal.value_c" } } },
+        { "Term": { "Float64": { "Literal": 25.0 } } }
+      ]
+    },
+    "exit": {
+      "LessThan": [
+        { "Term": { "Float64": { "TelemetryRef": "thermal.value_c" } } },
+        { "Term": { "Float64": { "Literal": 23.0 } } }
+      ]
     }
   }
 }
 ```
 
-This creates a deadband: mode enters above `25.0` and does not release until below `23.0`.
+`Expr` supports `Term`, `And`, `Or`, `Not`, `GreaterThan`, `LessThan`, and
+`Equal`. `Variable` supports `Bool`, `Float64`, and `String`.
 
-## Live Test Recipe
+`Value<T>` supports these forms:
 
-Use this recipe with the sample `autonomy_mode_config.json` that includes:
+| Form | Current behavior |
+| --- | --- |
+| `Literal` | Supported. |
+| `TelemetryRef` | Supported for scalar values in the latest telemetry payload. |
+| `AverageTelemetryRef` | Numeric and boolean averages use recent history. String averages are not implemented. |
+| `VariableRef` | Reserved but currently unresolved because no runtime variables are provided. |
+| `LastPlannedAutonomyModeRef` | String resolution is available; numeric and boolean forms are not implemented. |
 
-- `NoImages` (`priority: 1`, immediate true baseline/fallback)
-- `NoImagesHot` (`priority: 4`, immediate: activate when `rtd1_c > 34.0`)
+Telemetry paths are dot-separated paths into `TelemetryFrame.payload`. Numeric
+segments index JSON arrays. The frame `source` and `ts_mono` fields are not part
+of a telemetry path. Numeric and boolean average lookups use at most the latest
+256 telemetry frames.
 
-### 1) Start SAFE
+## Reload Behavior
 
-```bash
-cargo run -p safe
-```
+SAFE polls the mode configuration approximately once per second and reloads it
+when the file contents change. Added and removed modes are reconciled. Changes
+to `bin_path`, `args`, `sandbox_resources`, `persist_work_dir`, or `mode_config`
+restart the affected mode process. Priority, enabled state, and activation
+changes update selection metadata without requiring a process restart.
 
-In another terminal, watch active mode:
+An invalid reload is logged and the last valid configuration remains active.
+The initial configuration is required to parse successfully before SAFE starts.
 
-```bash
-cargo run -p safectl -- get modes
-```
+## Manual Control
 
-Expected at startup: `NoImages` is active as the baseline fallback mode.
-
-### 2) Trigger manual override pin
-
-```bash
-cargo run -p safectl -- send --op activate_mode --mode NoImagesHot
-```
-
-Then check modes:
-
-```bash
-cargo run -p safectl -- get modes
-```
-
-Expected: `NoImagesHot` stays active (pinned), regardless of scheduler conditions.
-
-### 3) Clear manual pin and return to scheduler
+For a configured mode named `ExampleMode`:
 
 ```bash
-cargo run -p safectl -- send --op deactivate_mode --mode NoImagesHot
+cargo run -p safectl -- send --op activate_mode --mode ExampleMode
+cargo run -p safectl -- get modes --all
+cargo run -p safectl -- send --op deactivate_mode --mode ExampleMode
 ```
 
-Then check modes again:
+Use `--mode-name` or a positional mode name with `safectl logs`; `--mode` is a
+helper option for `send`, not for `logs`:
 
 ```bash
-cargo run -p safectl -- get modes
+cargo run -p safectl -- logs --mode-name ExampleMode --follow
+cargo run -p safectl -- describe mode ExampleMode
 ```
 
-Expected: scheduler decides active mode again (usually `NoImages` unless hysteretic enter condition is true).
-
-### 4) Validate hysteresis with telemetry replay (recommended)
-
-Run SAFE against telemetry where `telemetry.temperature_value_c` crosses thresholds:
-
-- above `34.0` -> `NoImagesHot` becomes eligible and should activate
-- at or below `34.0` -> `NoImagesHot` becomes ineligible and scheduler can switch away
-
-With the 3-mode sample, thresholds should typically behave like this:
-
-- `rtd1_c > 34.0` -> `NoImagesHot` should win (highest priority)
-- lower ranges -> fallback to `NoImages`
-
-Use `safectl get modes` periodically to confirm transitions.
-
-### 5) Optional observability
-
-- Watch JSONL stream:
-
-```bash
-cargo run -p safectl -- watch messages --kind all -f
-```
-
-- Filter logs by mode:
-
-```bash
-cargo run -p safectl -- logs --mode NoImagesHot -f
-```
-
-You should see activate/deactivate behavior align with manual commands and hysteretic thresholds.
-
-To specifically observe switching logs from the new no-op-like mode:
-
-```bash
-cargo run -p safectl -- logs --mode NoImagesHot -f
-```
-
-You should see `mode activated` / `mode deactivated` and `active telemetry` messages as thresholds are crossed.
-
-You can inspect each mode's effective activation JSON and mode payload with:
-
-```bash
-cargo run -p safectl -- describe mode NoImagesHot
-```
+There is no checked-in `NoImages` or `NoImagesHot` executable in this workspace.
+Do not use older recipes that expect those binaries or modes to exist.

@@ -1,18 +1,19 @@
-## Temporary Steps
+# Historical Integration Notes
 
-To configure an EDS for integration
-```
-pull lastest scf
-bash setup.sh
-SIM_UPLOAD_ARTIFACT=0 bash run.sh satops
-cd simulation/scenario_latest
-vim main to add `--release` to `cargo run` command
-./main --target-config /Users/sebastianwelsh/Development/sedaro/scf/results/20251210_183535 --duration 1
-```
+This file is retained as a historical pointer, not as a reproducible workflow.
+The former notes referenced an external SCF repository, private host paths,
+`setup.sh`, simulation scenarios, and generated `.bin` artifacts that are not
+included in this repository.
 
-After doing so, find the .bin file that was created for init
-```
-ls -al simulation/data # find latest file
-```
+For the current local SAFE workflow, run `./run.sh` from the repository root and
+use the documentation under [`safe/docs/`](./safe/docs/).
 
-Update references to a `.bin` file in the main.rs code.
+If EDS integration work resumes, record the following before adding a new
+recipe:
+
+- External repository names and revisions.
+- Required host tools and operating-system assumptions.
+- Exact artifact-generation commands.
+- How generated artifacts are copied or referenced by SAFE.
+- A checked-in fixture or an explicit statement that the workflow requires
+  external infrastructure.
