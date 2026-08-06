@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -18,9 +18,13 @@ use crate::flight::{AutonomyModeActivation, Flight};
 use crate::platform::gatekeeper::{
     GatekeeperAdapterInput, GatekeeperAdapterOutput, spawn_gatekeeper_adapter,
 };
-use crate::platform::{spawn_platform_egress, spawn_platform_ingress};
+use crate::platform::{BoardPublicationStatus, spawn_platform_egress, spawn_platform_ingress};
 use crate::router::AutonomyModeConfig;
 use crate::router::Router;
+use crate::runtime::{
+    BoardCommandState, BoardCommandStatus, DaemonStatus, ModeOperationalStatus, OperationalStatus,
+    TelemetryStatus, TelemetryStatusFrame,
+};
 use crate::sandbox::sandbox::SandboxResources;
 use crate::telemetry_frame::TelemetryFrame;
 use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
@@ -246,6 +250,7 @@ pub struct SafeTEASummary {
 
 pub struct SafeTEA {
     board: BoardState,
+    board_publication_rx: mpsc::Receiver<BoardPublicationStatus>,
     cfg: Config,
     config_reload_tick: time::Interval,
     external_command_rx: mpsc::Receiver<HostCommandRequest>,
@@ -259,13 +264,16 @@ pub struct SafeTEA {
     flight: Flight,
     host_command_dispatch_tx: mpsc::Sender<BoardState>,
     logical_ts: u64,
+    latest_telemetry: Option<TelemetryFrame>,
     next_seq: u64,
     q: VecDeque<Event>,
+    published_board_command_ids: HashSet<BoardCmdId>,
     router: Option<Router>,
     runtime_paths: RuntimePaths,
     telemetry_rx: mpsc::Receiver<TelemetryFrame>,
     tick: time::Interval,
     runtime_config_contents: String,
+    status_tick: time::Interval,
     summary: SafeTEASummary,
 }
 
@@ -383,6 +391,7 @@ impl AutonomyModeRuntimeConfig {
             let id = AutonomyModeRuntimeConfig::mode_id_from_name(&config.name);
             mode_meta.push(AutonomyModeMeta {
                 id,
+                name: config.name.clone(),
                 priority: config.priority,
                 enabled: config.enabled,
             });
@@ -447,6 +456,7 @@ impl SafeTEA {
                     match &ev.msg {
                         Msg::TelemetryReceived(t) => {
                             self.flight.note_telemetry(t);
+                            self.latest_telemetry = Some(t.clone());
                             let previous_active = self.flight.get_active_autonomy_mode();
                             self.flight.recalculate_active_autonomy_mode();
                             if let Some(router) = self.router.as_mut() {
@@ -540,6 +550,8 @@ impl SafeTEA {
         let (host_status_tx, host_status_rx) = mpsc::channel::<HostCommandStatus>(1024);
         let (host_command_dispatch_tx, host_command_dispatch_rx) =
             mpsc::channel::<BoardState>(1024);
+        let (board_publication_tx, board_publication_rx) =
+            mpsc::channel::<BoardPublicationStatus>(1024);
         spawn_platform_ingress(
             &cfg,
             &runtime_paths,
@@ -552,6 +564,7 @@ impl SafeTEA {
             &runtime_paths,
             host_status_rx,
             host_command_dispatch_rx,
+            board_publication_tx,
         )
         .expect("platform egress");
 
@@ -561,6 +574,7 @@ impl SafeTEA {
         let next_seq = flight.peak_next_seq();
         let mut safetea = Self {
             board,
+            board_publication_rx,
             cfg,
             config_reload_tick: time::interval(Duration::from_secs(1)),
             external_command_rx,
@@ -574,13 +588,16 @@ impl SafeTEA {
             host_command_dispatch_tx,
             host_status_tx,
             logical_ts: next_seq,
+            latest_telemetry: None,
             next_seq,
             q: VecDeque::new(),
+            published_board_command_ids: HashSet::new(),
             router,
             runtime_paths,
             telemetry_rx,
             tick: time::interval(Duration::from_millis(100)),
             runtime_config_contents,
+            status_tick: time::interval(Duration::from_secs(1)),
             summary,
         };
 
@@ -611,6 +628,10 @@ impl SafeTEA {
             .expect("atomic save");
 
         safetea.send_board_snapshot_to_all().await;
+        safetea
+            .write_operational_status()
+            .await
+            .expect("write initial status");
 
         safetea
     }
@@ -619,6 +640,126 @@ impl SafeTEA {
         if let Some(router) = self.router.as_ref() {
             router.send_board_snapshot_to_all(self.board.clone()).await;
         }
+    }
+
+    fn board_statuses(&self) -> Vec<BoardCommandStatus> {
+        let mut entries: Vec<BoardCommandStatus> = self
+            .board
+            .proposals
+            .iter()
+            .map(|(id, (from, command, proposed_ts_mono))| {
+                let rejected = self
+                    .board
+                    .rejected
+                    .get(id)
+                    .and_then(|entries| entries.last());
+                let approved = self
+                    .board
+                    .approved
+                    .get(id)
+                    .and_then(|entries| entries.last());
+                let (state, decision) = if let Some(decision) = rejected {
+                    (BoardCommandState::Rejected, Some(decision))
+                } else if self.published_board_command_ids.contains(id) {
+                    (BoardCommandState::Published, approved)
+                } else if let Some(decision) = approved {
+                    (BoardCommandState::Approved, Some(decision))
+                } else {
+                    (BoardCommandState::Pending, None)
+                };
+
+                let (decision_by, decision_reason, decision_ts_mono) = decision
+                    .map(|(by, reason, ts_mono)| {
+                        let by = if by.0.is_nil() {
+                            "gatekeeper".to_string()
+                        } else {
+                            by.to_string()
+                        };
+                        (Some(by), Some(reason.clone()), Some(*ts_mono))
+                    })
+                    .unwrap_or((None, None, None));
+
+                BoardCommandStatus {
+                    id: id.clone(),
+                    from: *from,
+                    command: command.clone(),
+                    proposed_ts_mono: *proposed_ts_mono,
+                    state,
+                    decision_by,
+                    decision_reason,
+                    decision_ts_mono,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        entries
+    }
+
+    async fn write_operational_status(&self) -> anyhow::Result<()> {
+        let router_statuses = match self.router.as_ref() {
+            Some(router) => router.mode_statuses().await,
+            None => HashMap::new(),
+        };
+        let active = self.flight.get_active_autonomy_mode();
+        let selection_reason = self.flight.active_selection_reason();
+        let manual_override = self.flight.get_manual_active_override();
+        let mut modes: Vec<ModeOperationalStatus> = self
+            .flight
+            .get_autonomy_modes()
+            .iter()
+            .map(|meta| {
+                let (eligible, eligibility_reason) = self.flight.mode_eligibility(meta.id);
+                let is_active = active == Some(meta.id);
+                ModeOperationalStatus {
+                    name: meta.name.clone(),
+                    id: meta.id,
+                    priority: meta.priority,
+                    enabled: meta.enabled,
+                    eligible,
+                    active: is_active,
+                    manual_override: manual_override == Some(meta.id),
+                    selection_reason: if is_active {
+                        selection_reason.clone()
+                    } else {
+                        "not selected".to_string()
+                    },
+                    eligibility_reason,
+                    runtime: router_statuses.get(&meta.id).cloned().unwrap_or_default(),
+                }
+            })
+            .collect();
+        modes.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let status = OperationalStatus {
+            schema_version: 1,
+            updated_at: Utc::now().to_rfc3339(),
+            daemon: DaemonStatus {
+                pid: std::process::id(),
+                running: self.flight.is_running(),
+                halted: self.flight.is_halted(),
+                fault: self.flight.get_fault().clone(),
+                last_seq_applied: self.flight.get_seq(),
+            },
+            telemetry: TelemetryStatus {
+                received_count: self.summary.num_telemetry_received,
+                last_received_at: self.summary.last_telemetry_time.clone(),
+                latest: self
+                    .latest_telemetry
+                    .as_ref()
+                    .map(|telemetry| TelemetryStatusFrame {
+                        source: telemetry.source.clone(),
+                        ts_mono: telemetry.ts_mono,
+                        payload: telemetry.payload.clone(),
+                    }),
+            },
+            board: self.board_statuses(),
+            modes,
+        };
+        save_json_atomic(&self.runtime_paths.status, &status).await
     }
 
     fn collect_unapproved_board_batch(&self) -> Option<(Vec<BoardCmdId>, Vec<TimedCommand>)> {
@@ -728,8 +869,18 @@ impl SafeTEA {
                             msg: Msg::TelemetryReceived(t),
                         });
                         self.summary.num_telemetry_received += 1;
-                        self.summary.last_telemetry_time = Some(chrono::Utc::now().naive_utc().to_string());
+                        self.summary.last_telemetry_time = Some(Utc::now().to_rfc3339());
                         self.next_seq += 1;
+                    }
+                }
+
+                maybe_publication = self.board_publication_rx.recv() => {
+                    if let Some(publication) = maybe_publication {
+                        self.published_board_command_ids
+                            .extend(publication.command_ids);
+                        if let Err(e) = self.write_operational_status().await {
+                            error!("failed writing operational status: {e}");
+                        }
                     }
                 }
 
@@ -798,7 +949,7 @@ impl SafeTEA {
                                                 });
                                             summary.num_approved_commands += 1;
                                             summary.last_approved_command_time =
-                                                Some(chrono::Utc::now().naive_utc().to_string());
+                                                Some(Utc::now().to_rfc3339());
                                         }
                                         None => {
                                             info!(
@@ -883,6 +1034,12 @@ impl SafeTEA {
                     });
                     self.next_seq += 1;
                     self.logical_ts += 1;
+                }
+
+                _ = self.status_tick.tick() => {
+                    if let Err(e) = self.write_operational_status().await {
+                        error!("failed writing operational status: {e}");
+                    }
                 }
 
                 // Reload autonomy mode config at runtime mid-flight
@@ -1007,6 +1164,7 @@ impl SafeTEA {
                             self.next_seq += 1;
                             self.logical_ts += 1;
                         }
+                        AutonomyModeOutput::Lifecycle { .. } | AutonomyModeOutput::Heartbeat => {}
                     }
                 }
             }
@@ -1063,6 +1221,7 @@ impl SafeTEA {
 
                 if let Msg::TelemetryReceived(t) = &ev.msg {
                     self.flight.note_telemetry(t);
+                    self.latest_telemetry = Some(t.clone());
                     let previous_active = self.flight.recalculate_active_autonomy_mode();
                     if let Some(router) = self.router.as_ref() {
                         router
@@ -1302,6 +1461,12 @@ impl SafeTEA {
                 save_json_atomic(&self.runtime_paths.summary, &self.summary)
                     .await
                     .expect("save json");
+
+                if !matches!(ev.msg, Msg::Tick)
+                    && let Err(e) = self.write_operational_status().await
+                {
+                    error!("failed writing operational status: {e}");
+                }
 
                 if self.flight.is_halted() {
                     break;

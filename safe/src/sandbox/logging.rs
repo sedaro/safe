@@ -1,21 +1,21 @@
 use std::path::Path;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
+use chrono::{SecondsFormat, Utc};
+use serde_json::Value;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use tracing_subscriber::{
-    fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter, format::Writer as FmtWriter},
-    registry::LookupSpan,
-};
+use tracing_subscriber::{fmt::MakeWriter, registry::LookupSpan};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::runtime::{DEFAULT_LOG_STREAM, LogRecord};
 
 tokio::task_local! {
     pub static CURRENT_TASK_ID: Uuid;
@@ -24,10 +24,7 @@ tokio::task_local! {
 /// Keep this alive for non-blocking appenders if you add them later.
 pub struct TelemetryGuards;
 
-/// Initialize tracing with:
-/// - stdout output
-/// - per-id file output: logs/<id>.log when `id` field exists
-/// - fallback file: logs/default.log when no `id`
+/// Initialize tracing with human-readable stdout and structured per-scope files.
 pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error::Error>> {
     let filter = EnvFilter::try_new(cfg.tracing.filter.clone())
         .or_else(|_| EnvFilter::try_new(cfg.tracing.level.clone()))?;
@@ -37,15 +34,13 @@ pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error:
         .parent()
         .unwrap_or_else(|| Path::new("logs"))
         .to_path_buf();
-    println!("Logging directory: {logs_dir:?}");
     std::fs::create_dir_all(&logs_dir)?;
 
     let router = PerIdMakeWriter::new(logs_dir, "default.log");
-
-    let per_id_layer = PerIdFileLayer::new(router.clone(), cfg.tracing.with_target);
+    let per_id_layer = PerIdFileLayer::new(router, cfg.tracing.with_target);
 
     let stdout_layer = fmt::layer()
-        .with_ansi(true)
+        .with_ansi(std::io::stdout().is_terminal())
         .with_target(cfg.tracing.with_target)
         .with_writer(std::io::stdout);
 
@@ -55,10 +50,12 @@ pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error:
         .with(per_id_layer)
         .init();
 
+    tracing::info!("logging initialized");
+
     Ok(TelemetryGuards)
 }
 
-/// Routes events to `<id>.log` if an `id` field exists, else `default.log`.
+/// Routes events to `<mode-uuid>.log` if a mode ID exists, else `default.log`.
 #[derive(Clone)]
 pub struct PerIdMakeWriter {
     state: Arc<Mutex<PerIdState>>,
@@ -97,12 +94,11 @@ impl<'a> MakeWriter<'a> for PerIdMakeWriter {
     }
 }
 
-/// NOTE: this is used by our formatter directly; `make_writer` default path is fallback.
 impl PerIdMakeWriter {
     fn write_line_for(&self, id: Option<&str>, line: &str) -> io::Result<()> {
-        let mut w = self.writer_for_id(id);
-        w.write_all(line.as_bytes())?;
-        w.flush()
+        let mut writer = self.writer_for_id(id);
+        writer.write_all(line.as_bytes())?;
+        writer.flush()
     }
 }
 
@@ -127,11 +123,11 @@ impl Write for PerIdWriter {
             state.files.insert(file_name.clone(), file);
         }
 
-        let f = state
+        state
             .files
             .get_mut(&file_name)
-            .expect("inserted file missing");
-        f.write(buf)
+            .expect("inserted file missing")
+            .write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -143,71 +139,15 @@ impl Write for PerIdWriter {
             format!("{}.log", self.key)
         };
 
-        if let Some(f) = state.files.get_mut(&file_name) {
-            f.flush()
+        if let Some(file) = state.files.get_mut(&file_name) {
+            file.flush()
         } else {
             Ok(())
         }
     }
 }
 
-/// Custom formatter that extracts `id` from event fields and writes to per-id file.
-#[allow(unused)]
-struct IdAwareFormatter;
-
-impl<S, N> FormatEvent<S, N> for IdAwareFormatter
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'writer> FormatFields<'writer> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: FmtWriter<'_>,
-        event: &Event<'_>,
-    ) -> std::fmt::Result {
-        // Render a normal formatted line first.
-        let mut line = String::new();
-        {
-            let mut tmp_writer = FmtWriter::new(&mut line);
-            let meta = event.metadata();
-            let _ = write!(
-                tmp_writer,
-                "{} {} {}: ",
-                chrono_like_now(),
-                meta.level(),
-                meta.target()
-            );
-
-            // Include span context if present.
-            if let Some(scope) = ctx.event_scope() {
-                for span in scope.from_root() {
-                    let _ = write!(tmp_writer, "[{}] ", span.name());
-                }
-            }
-
-            // Append fields
-            let mut visitor = IdExtractVisitor::default();
-            event.record(&mut visitor);
-            if let Some(msg) = visitor.message {
-                let _ = write!(tmp_writer, "{}", msg);
-            }
-            if !visitor.rest.is_empty() {
-                let _ = write!(tmp_writer, " {}", visitor.rest.join(" "));
-            }
-            let _ = writeln!(tmp_writer);
-        }
-
-        writer.write_str(&line)?;
-
-        let mut visitor = IdExtractVisitor::default();
-        event.record(&mut visitor);
-
-        Ok(())
-    }
-}
-
-/// A dedicated layer that writes each event to per-id files.
+/// A dedicated layer that writes each event to a structured per-scope file.
 pub struct PerIdFileLayer {
     router: PerIdMakeWriter,
     with_target: bool,
@@ -231,39 +171,43 @@ where
 
         let mut visitor = IdExtractVisitor::default();
         event.record(&mut visitor);
-        if visitor.id.is_none() {
+        if visitor.mode_id.is_none() {
             if let Some(scope) = ctx.event_scope(event) {
                 for span in scope.from_root() {
-                    if let Some(id) = span.extensions().get::<CapturedId>() {
-                        visitor.id = Some(id.0.clone());
+                    if let Some(mode_id) = span.extensions().get::<CapturedModeId>() {
+                        visitor.mode_id = Some(mode_id.0.clone());
                         break;
                     }
                 }
             }
         }
 
-        let mut line = String::new();
-        if self.with_target {
-            line.push_str(&format!(
-                "{} {} {} ",
-                chrono_like_now(),
-                meta.level(),
-                meta.target()
-            ));
-        } else {
-            line.push_str(&format!("{} {} ", chrono_like_now(), meta.level()));
-        }
+        let mode_id = visitor
+            .mode_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let record = LogRecord {
+            timestamp: chrono_like_now(),
+            level: meta.level().to_string(),
+            target: if self.with_target {
+                meta.target().to_string()
+            } else {
+                String::new()
+            },
+            mode_id,
+            stream: visitor
+                .stream
+                .unwrap_or_else(|| DEFAULT_LOG_STREAM.to_string()),
+            message: visitor.message.unwrap_or_default(),
+            fields: visitor.fields,
+        };
 
-        if let Some(msg) = visitor.message {
-            line.push_str(&msg);
-        }
-        if !visitor.rest.is_empty() {
-            line.push(' ');
-            line.push_str(&visitor.rest.join(" "));
-        }
+        let mut line = serde_json::to_string(&record).expect("log record should serialize");
         line.push('\n');
-
-        let _ = self.router.write_line_for(visitor.id.as_deref(), &line);
+        let id = record.mode_id.map(|id| id.to_string());
+        if let Err(error) = self.router.write_line_for(id.as_deref(), &line) {
+            eprintln!("failed writing structured log record: {error}");
+        }
     }
 
     fn on_new_span(
@@ -275,39 +219,126 @@ where
         let mut visitor = IdExtractVisitor::default();
         attrs.record(&mut visitor);
         if let Some(span) = ctx.span(id)
-            && let Some(captured_id) = visitor.id
+            && let Some(mode_id) = visitor.mode_id
         {
-            span.extensions_mut().insert(CapturedId(captured_id));
+            span.extensions_mut().insert(CapturedModeId(mode_id));
         }
     }
 }
 
 #[derive(Default)]
 struct IdExtractVisitor {
-    id: Option<String>,
+    mode_id: Option<String>,
     message: Option<String>,
-    rest: Vec<String>,
+    stream: Option<String>,
+    fields: BTreeMap<String, Value>,
 }
 
 #[derive(Debug)]
-struct CapturedId(String);
+struct CapturedModeId(String);
+
+fn debug_text(value: &dyn std::fmt::Debug) -> String {
+    let value = format!("{value:?}");
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(&value)
+        .to_string()
+}
+
+fn normalized_mode_id(value: &str) -> Option<String> {
+    let value = value.trim_matches('"');
+    let value = value
+        .strip_prefix("AutonomyModeId(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(value);
+    Uuid::parse_str(value).ok().map(|id| id.to_string())
+}
 
 impl tracing::field::Visit for IdExtractVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         match field.name() {
-            "id" => self.id = Some(value.to_string()),
+            "id" | "mode_id" => {
+                if let Some(id) = normalized_mode_id(value) {
+                    self.mode_id = Some(id);
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), Value::String(value.to_string()));
+                }
+            }
             "message" => self.message = Some(value.to_string()),
-            name => self.rest.push(format!(r#"{name}="{value}""#)),
+            "stream" => self.stream = Some(value.to_string()),
+            name => {
+                self.fields
+                    .insert(name.to_string(), Value::String(value.to_string()));
+            }
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let v = format!("{value:?}");
+        let value = debug_text(value);
         match field.name() {
-            "id" => self.id = Some(v.trim_matches('"').to_string()),
-            "message" => self.message = Some(v),
-            name => self.rest.push(format!(r#"{name}={v}"#)),
+            "id" | "mode_id" => {
+                if let Some(id) = normalized_mode_id(&value) {
+                    self.mode_id = Some(id);
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), Value::String(value));
+                }
+            }
+            "message" => self.message = Some(value),
+            "stream" => self.stream = Some(value),
+            name => {
+                self.fields.insert(name.to_string(), Value::String(value));
+            }
         }
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.fields.insert(
+            field.name().to_string(),
+            serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::String(value.to_string())),
+        );
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields.insert(
+            field.name().to_string(),
+            Value::Number(serde_json::Number::from(value)),
+        );
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields.insert(
+            field.name().to_string(),
+            Value::Number(serde_json::Number::from(value)),
+        );
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        self.fields
+            .insert(field.name().to_string(), Value::String(value.to_string()));
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        self.fields
+            .insert(field.name().to_string(), Value::String(value.to_string()));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), Value::Bool(value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.fields
+            .insert(field.name().to_string(), Value::String(value.to_string()));
     }
 }
 
@@ -325,7 +356,7 @@ fn sanitize_filename(input: &str) -> String {
 }
 
 fn chrono_like_now() -> String {
-    format!("{:?}", std::time::SystemTime::now())
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 #[cfg(test)]
@@ -336,5 +367,23 @@ mod tests {
     fn sanitize_filename_replaces_unsafe_chars() {
         assert_eq!(sanitize_filename("NoImages/1"), "NoImages_1");
         assert_eq!(sanitize_filename("Hive Mast"), "Hive_Mast");
+    }
+
+    #[test]
+    fn normalizes_debug_mode_ids() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        assert_eq!(normalized_mode_id(id), Some(id.to_string()));
+        assert_eq!(
+            normalized_mode_id("AutonomyModeId(123e4567-e89b-12d3-a456-426614174000)"),
+            Some(id.to_string())
+        );
+        assert_eq!(normalized_mode_id("request-123"), None);
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339() {
+        let timestamp = chrono_like_now();
+        assert!(timestamp.ends_with('Z'));
+        assert!(chrono::DateTime::parse_from_rfc3339(&timestamp).is_ok());
     }
 }
