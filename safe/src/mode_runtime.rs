@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{error, info_span, warn};
+#[cfg(feature = "env-filter")]
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -20,14 +21,25 @@ use crate::transports::TransportHandle;
 use crate::transports::unix::UnixTransportHandle;
 
 fn init_mode_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
-        .expect("valid tracing filter");
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .with_target(true)
-        .try_init();
+    #[cfg(feature = "env-filter")]
+    {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new("info"))
+            .expect("valid tracing filter");
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(true)
+            .with_target(true)
+            .try_init();
+    }
+    #[cfg(not(feature = "env-filter"))]
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(true)
+            .with_target(true)
+            .try_init();
+    }
 }
 
 pub struct ModeRuntime {

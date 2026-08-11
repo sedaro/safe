@@ -3,12 +3,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use reqwest::header::CONTENT_TYPE;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
 use safe::protocol::{AutonomyModeBoardState, Command, CommandEnvelope, TimedCommand};
 use safe::telemetry_frame::TelemetryFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -285,10 +286,6 @@ impl LlmAdvisorMode {
 
     async fn query_ollama(&self, prompt: &str) -> Result<String> {
         let body = self.build_ollama_request_body(prompt)?;
-        let url = format!(
-            "http://{}:{}{}",
-            self.config.ollama_host, self.config.ollama_port, self.config.ollama_path
-        );
         let request_start = Instant::now();
 
         info!(
@@ -301,28 +298,13 @@ impl LlmAdvisorMode {
             "llm advisor sending constrained ollama request"
         );
 
-        let request_future = async {
-            let response = reqwest::Client::new()
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| anyhow!("ollama HTTP request failed: {e}"))?;
-            let status = response.status();
-            let body_text = response
-                .text()
-                .await
-                .map_err(|e| anyhow!("failed reading ollama response body: {e}"))?;
-            if !status.is_success() {
-                return Err(anyhow!(
-                    "ollama returned HTTP status {}: {}",
-                    status,
-                    clip_chars(&body_text, 400)
-                ));
-            }
-            Result::<String>::Ok(body_text)
-        };
+        let request_future = post_json(
+            &self.config.ollama_host,
+            self.config.ollama_port,
+            &self.config.ollama_path,
+            &body,
+            self.config.max_response_chars,
+        );
 
         let body_text = match timeout(
             Duration::from_millis(self.config.request_timeout_ms),
@@ -708,6 +690,154 @@ fn clip_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
+async fn post_json(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    max_response_chars: usize,
+) -> Result<String> {
+    let connect_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let mut stream = TcpStream::connect((connect_host, port))
+        .await
+        .map_err(|e| anyhow!("Ollama HTTP connection failed: {e}"))?;
+    let host_header = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let headers = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .await
+        .map_err(|e| anyhow!("failed writing Ollama HTTP headers: {e}"))?;
+    stream
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|e| anyhow!("failed writing Ollama HTTP body: {e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| anyhow!("failed finishing Ollama HTTP request: {e}"))?;
+
+    let max_bytes = max_response_chars
+        .saturating_mul(4)
+        .saturating_add(64 * 1024);
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|e| anyhow!("failed reading Ollama HTTP response: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        if response.len().saturating_add(read) > max_bytes {
+            return Err(anyhow!("Ollama HTTP response exceeded configured limit"));
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
+
+    parse_http_response(&response)
+}
+
+fn parse_http_response(response: &[u8]) -> Result<String> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("Ollama returned an invalid HTTP response"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|e| anyhow!("Ollama returned invalid HTTP headers: {e}"))?;
+    let mut lines = headers.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("Ollama returned an invalid HTTP status"))?;
+    if (100..200).contains(&status) && status != 101 {
+        return parse_http_response(&response[header_end + 4..]);
+    }
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| anyhow!("invalid Ollama Content-Length: {e}"))?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+
+    let body = &response[header_end + 4..];
+    let body = if chunked {
+        decode_chunked_body(body)?
+    } else if let Some(length) = content_length {
+        if body.len() < length {
+            return Err(anyhow!("Ollama HTTP response body was truncated"));
+        }
+        body[..length].to_vec()
+    } else {
+        body.to_vec()
+    };
+    let body = String::from_utf8(body)
+        .map_err(|e| anyhow!("Ollama returned a non-UTF-8 response: {e}"))?;
+    if (300..400).contains(&status) {
+        return Err(anyhow!(
+            "Ollama returned HTTP redirect {status}; redirects are not supported"
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(anyhow!(
+            "Ollama returned HTTP status {status}: {}",
+            clip_chars(&body, 400)
+        ));
+    }
+    Ok(body)
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut position = 0;
+    loop {
+        let line_end = body[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| position + offset)
+            .ok_or_else(|| anyhow!("invalid chunked Ollama response"))?;
+        let size = std::str::from_utf8(&body[position..line_end])
+            .ok()
+            .and_then(|line| line.split(';').next())
+            .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())
+            .ok_or_else(|| anyhow!("invalid Ollama HTTP chunk size"))?;
+        position = line_end + 2;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let chunk_end = position.saturating_add(size);
+        if chunk_end.saturating_add(2) > body.len() || &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(anyhow!("truncated chunked Ollama response"));
+        }
+        decoded.extend_from_slice(&body[position..chunk_end]);
+        position = chunk_end + 2;
+    }
+}
+
 #[async_trait]
 impl ModeHandler<LlmAdvisorModeConfig> for LlmAdvisorMode {
     fn set_config(&mut self, config: LlmAdvisorModeConfig) -> Result<()> {
@@ -1009,5 +1139,76 @@ mod tests {
         let value: Value = serde_json::from_str(&body).expect("request should be JSON");
         assert_eq!(value["format"]["required"][0], "anomaly_id");
         assert_eq!(value["options"]["temperature"], 0.0);
+    }
+
+    #[test]
+    fn parses_content_length_http_response() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+        assert_eq!(parse_http_response(response).unwrap(), "{\"ok\":true}");
+    }
+
+    #[test]
+    fn parses_chunked_http_response() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(parse_http_response(response).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn reports_http_error_body() {
+        let response = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 4\r\n\r\ndown";
+        let error = parse_http_response(response).unwrap_err().to_string();
+        assert!(error.contains("503"));
+        assert!(error.contains("down"));
+    }
+
+    #[test]
+    fn skips_informational_http_response() {
+        let response =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(parse_http_response(response).unwrap(), "ok");
+    }
+
+    #[test]
+    fn rejects_http_redirect() {
+        let response =
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n";
+        assert!(
+            parse_http_response(response)
+                .unwrap_err()
+                .to_string()
+                .contains("redirect")
+        );
+    }
+
+    #[tokio::test]
+    async fn posts_json_to_plain_http_server() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /api/generate HTTP/1.1\r\n"));
+            assert!(request.ends_with("{\"prompt\":\"test\"}"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}")
+                .await
+                .unwrap();
+        });
+
+        let response = post_json(
+            "127.0.0.1",
+            port,
+            "/api/generate",
+            "{\"prompt\":\"test\"}",
+            1024,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(response, "{\"ok\":true}");
     }
 }

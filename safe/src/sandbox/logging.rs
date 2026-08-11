@@ -10,7 +10,11 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+#[cfg(feature = "env-filter")]
+use tracing_subscriber::EnvFilter;
+#[cfg(not(feature = "env-filter"))]
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::{fmt::MakeWriter, registry::LookupSpan};
 use uuid::Uuid;
 
@@ -26,9 +30,6 @@ pub struct TelemetryGuards;
 
 /// Initialize tracing with human-readable stdout and structured per-scope files.
 pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_new(cfg.tracing.filter.clone())
-        .or_else(|_| EnvFilter::try_new(cfg.tracing.level.clone()))?;
-
     let base_path = PathBuf::from(&cfg.logging.file_path);
     let logs_dir = base_path
         .parent()
@@ -44,11 +45,30 @@ pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error:
         .with_target(cfg.tracing.with_target)
         .with_writer(std::io::stdout);
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(stdout_layer)
-        .with(per_id_layer)
-        .init();
+    #[cfg(feature = "env-filter")]
+    {
+        let filter = EnvFilter::try_new(cfg.tracing.filter.clone())
+            .or_else(|_| EnvFilter::try_new(cfg.tracing.level.clone()))?;
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(per_id_layer)
+            .init();
+    }
+    #[cfg(not(feature = "env-filter"))]
+    {
+        let filter = cfg
+            .tracing
+            .level
+            .parse::<tracing::Level>()
+            .map(LevelFilter::from_level)
+            .unwrap_or(LevelFilter::INFO);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(per_id_layer)
+            .init();
+    }
 
     tracing::info!("logging initialized");
 

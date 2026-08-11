@@ -1,4 +1,7 @@
-use std::{env::var, path::PathBuf, process::Stdio};
+use std::{path::PathBuf, process::Stdio};
+
+#[cfg(feature = "resource-metrics")]
+use std::env::var;
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -9,6 +12,7 @@ use tokio::{
 };
 use tracing::{Instrument, debug, error, info, trace, warn};
 
+#[cfg(feature = "resource-metrics")]
 use super::observability::metrics_handler;
 use crate::AutonomyModeId;
 
@@ -302,10 +306,12 @@ impl Sandbox for SafeSandbox {
         let work_dir = self.get_work_dir().clone();
 
         let (killshot_tx, mut killshot_rx) = mpsc::channel(1);
+        #[cfg(feature = "resource-metrics")]
         let resource_watcher_killshot_tx = killshot_tx.clone();
         self.killshot = Some(killshot_tx);
 
         let child_uuid = self.id;
+        #[cfg(feature = "resource-metrics")]
         let child_resources = self.config.resources.clone();
 
         info!("New sandbox {child_uuid:?}");
@@ -409,41 +415,43 @@ impl Sandbox for SafeSandbox {
                 }
                 .in_current_span());
 
-                let (resource_tx, mut resource_rx) = mpsc::channel::<(f64, u64, u64)>(10);
+                #[cfg(feature = "resource-metrics")]
+                {
+                    let (resource_tx, mut resource_rx) = mpsc::channel::<(f64, u64, u64)>(10);
 
-                // Spawn off a tokio task to handle the metrics for a sandbox
-                let child_id = child.id().unwrap() as usize;
-                // Spawn blocking??
-                let hardcoded_writable_dir: String = var("SAFE_METRIC_BASE_PATH").unwrap_or_else(|_| "/tmp/safe".into());
-                let hardcoded_writable_dir = PathBuf::from(hardcoded_writable_dir);
-                let work_dir = hardcoded_writable_dir.join(child_uuid.0.to_string());
-                tokio::spawn(async move {
-                    metrics_handler(child_id, child_uuid.0, resource_tx, work_dir).await;
-                }
-                .in_current_span());
+                    let child_id = child.id().unwrap() as usize;
+                    let hardcoded_writable_dir: String = var("SAFE_METRIC_BASE_PATH")
+                        .unwrap_or_else(|_| "/tmp/safe".into());
+                    let hardcoded_writable_dir = PathBuf::from(hardcoded_writable_dir);
+                    let work_dir = hardcoded_writable_dir.join(child_uuid.0.to_string());
+                    tokio::spawn(async move {
+                        metrics_handler(child_id, child_uuid.0, resource_tx, work_dir).await;
+                    }
+                    .in_current_span());
 
-                let resource_watcher_killshot_tx = resource_watcher_killshot_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(msg) = resource_rx.recv().await {
-                        if msg.0 > child_resources.cpu {
-                            resource_watcher_killshot_tx
-                                .send("CPU threshold".into())
-                                .await
-                                .unwrap();
-                        } else if msg.1 > child_resources.memory {
-                            resource_watcher_killshot_tx
-                                .send("Memory threshold".into())
-                                .await
-                                .unwrap();
-                        } else if msg.2 > child_resources.disk {
-                            resource_watcher_killshot_tx
-                                .send("Disk write threshold".into())
-                                .await
-                            .unwrap();
+                    let resource_watcher_killshot_tx = resource_watcher_killshot_tx.clone();
+                    tokio::spawn(async move {
+                        while let Some(msg) = resource_rx.recv().await {
+                            if msg.0 > child_resources.cpu {
+                                resource_watcher_killshot_tx
+                                    .send("CPU threshold".into())
+                                    .await
+                                    .unwrap();
+                            } else if msg.1 > child_resources.memory {
+                                resource_watcher_killshot_tx
+                                    .send("Memory threshold".into())
+                                    .await
+                                    .unwrap();
+                            } else if msg.2 > child_resources.disk {
+                                resource_watcher_killshot_tx
+                                    .send("Disk write threshold".into())
+                                    .await
+                                    .unwrap();
+                            }
                         }
                     }
+                    .in_current_span());
                 }
-                .in_current_span());
 
                 // This waits for either the sandbox to exit by itself OR a
                 // killshot comes on the channel for which we send SIGKILL

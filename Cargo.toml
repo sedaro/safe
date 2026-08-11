@@ -4,8 +4,8 @@ members = [
     "safe-time",
     "safectl",
     "mode-llm-advisor",
-    "mode-electronic-warfare",
 ]
+exclude = ["mode-electronic-warfare"]
 resolver = "2"
 
 [workspace.package]
@@ -25,3 +25,4 @@ debug = false
 strip = true
 panic = "abort"
 codegen-units = 1
+lto = "fat"

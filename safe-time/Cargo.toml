@@ -4,4 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chrono = "0.4.44"
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }

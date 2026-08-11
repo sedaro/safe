@@ -2,7 +2,7 @@ use std::{any::Any, collections::VecDeque, fmt::Display, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::{
+use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };

@@ -38,8 +38,9 @@ existing supervisor records. The current logging implementation does not
 rotate files even though rotation fields are validated in YAML.
 
 The sandbox metrics writer additionally uses
-`SAFE_METRIC_BASE_PATH/<mode-uuid>/metrics-current.json` and
-`metrics.bin`. `safectl top modes` currently searches under
+`SAFE_METRIC_BASE_PATH/<mode-uuid>/metrics-current.json`. Default builds also
+write `metrics.bin`; the size-optimized EDS feature omits that unused protobuf
+output. `safectl top modes` currently searches under
 `<base>/state/modes/`; this path mismatch can make valid metrics invisible.
 
 ## Startup and Recovery

@@ -122,6 +122,9 @@ to use the canonical scoped ID.
 The advisor sends a plain HTTP `POST` to
 `http://<ollama_host>:<ollama_port><ollama_path>` with a JSON body containing:
 
+The endpoint must return the Ollama response directly. HTTP redirects are not
+followed by the size-optimized client.
+
 - `model`, `prompt`, and `stream: false`.
 - A strict JSON response schema requiring `anomaly_id`, `action_id`, `reason`,
   and `evidence_paths`.

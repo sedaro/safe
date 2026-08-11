@@ -5,67 +5,40 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "otel-metrics-bin")]
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{AnyValue, KeyValue, any_value},
-    logs::v1::{LogRecord, SeverityNumber},
     metrics::v1::{
         Gauge, Metric as ProtoMetric, NumberDataPoint, ResourceMetrics as ProtoResourceMetrics,
-        ScopeMetrics as ProtoScopeMetrics, Sum, metric::Data, number_data_point::Value,
+        ScopeMetrics as ProtoScopeMetrics, metric::Data, number_data_point::Value,
     },
 };
+#[cfg(feature = "otel-metrics-bin")]
 use prost::Message;
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+#[cfg(feature = "otel-metrics-bin")]
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::runtime::ProcessResourceSnapshot;
 use crate::{AutonomyModeId, ModeResourceSnapshot};
 
-#[allow(unused)]
-pub fn create_counter(
-    name: &str,
-    desc: &str,
-    unit: &str,
-    value: Value,
-    start_nanos: u64,
-    now_nanos: u64,
-    attributes: &Vec<KeyValue>,
-) -> ProtoMetric {
-    let data_point = NumberDataPoint {
-        start_time_unix_nano: start_nanos,
-        time_unix_nano: now_nanos,
-        value: Some(value),
-        attributes: attributes.clone(),
-        ..Default::default()
-    };
-
-    ProtoMetric {
-        name: name.into(),
-        description: desc.into(),
-        unit: unit.into(),
-        data: Some(Data::Sum(Sum {
-            data_points: vec![data_point],
-            aggregation_temporality: 2, // 2 = CUMULATIVE
-            is_monotonic: true,
-        })),
-        ..Default::default()
-    }
-}
-
+#[cfg(feature = "otel-metrics-bin")]
 pub fn create_gauge(
     name: &str,
     desc: &str,
     unit: &str,
     value: Value,
     now_nanos: u64,
-    attributes: &Vec<KeyValue>,
+    attributes: &[KeyValue],
 ) -> ProtoMetric {
     let data_point = NumberDataPoint {
         time_unix_nano: now_nanos,
         value: Some(value),
-        attributes: attributes.clone(),
+        attributes: attributes.to_vec(),
         ..Default::default()
     };
 
@@ -76,31 +49,6 @@ pub fn create_gauge(
         data: Some(Data::Gauge(Gauge {
             data_points: vec![data_point],
         })),
-        ..Default::default()
-    }
-}
-
-#[allow(unused)]
-pub fn create_log_record(
-    message: &str,
-    severity_num: SeverityNumber,
-    severity_text: &str,
-    now_nanos: u64,
-    attributes: &Vec<KeyValue>,
-) -> LogRecord {
-    LogRecord {
-        time_unix_nano: now_nanos,
-        observed_time_unix_nano: now_nanos,
-        severity_number: severity_num.into(),
-        severity_text: severity_text.into(),
-        body: Some(AnyValue {
-            value: Some(any_value::Value::StringValue(message.into())),
-        }),
-        attributes: attributes.clone(),
-        dropped_attributes_count: 0,
-        flags: 0,
-        trace_id: vec![],
-        span_id: vec![],
         ..Default::default()
     }
 }
@@ -149,14 +97,16 @@ pub async fn metrics_handler(
             .await
             .expect("Failed to create writable directory");
     }
+    #[cfg(feature = "otel-metrics-bin")]
     let metrics_bin_path = writable_dir.join("metrics.bin");
     let metrics_json_path = writable_dir.join("metrics-current.json");
+    #[cfg(feature = "otel-metrics-bin")]
     let mut metrics_file = tokio::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(metrics_bin_path) // TODO: make generic over Tokio write trait
         .await
-        .expect("blah");
+        .expect("open sandbox metrics protobuf");
 
     let mut last_30_min_cpu: VecDeque<f64> = VecDeque::with_capacity(360);
     let mut last_30_min_memory: VecDeque<u64> = VecDeque::with_capacity(360);
@@ -206,98 +156,103 @@ pub async fn metrics_handler(
 
                 debug!("{pid}: {cpu_usage} {memory} {}", disk_usage.written_bytes);
 
-                let now_nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
+                #[cfg(feature = "otel-metrics-bin")]
+                {
+                    let now_nanos = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64;
 
-                let id_attribute = KeyValue {
-                    key: "sandbox_id".into(),
-                    value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(child_uuid.into())),
-                    }),
-                };
+                    let id_attribute = KeyValue {
+                        key: "sandbox_id".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(child_uuid.into())),
+                        }),
+                    };
 
-                let proc_id_attribute = KeyValue {
-                    key: "sandbox_id".into(),
-                    value: Some(AnyValue {
-                        value: Some(any_value::Value::IntValue(pid.as_u32() as i64)),
-                    }),
-                };
+                    let proc_id_attribute = KeyValue {
+                        key: "sandbox_id".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::IntValue(pid.as_u32() as i64)),
+                        }),
+                    };
 
-                let proc_cmd_attribute = KeyValue {
-                    key: "proc_cmd".into(),
-                    value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(
-                            proc.cmd().join(&sep).into_string().unwrap(),
-                        )),
-                    }),
-                };
+                    let proc_cmd_attribute = KeyValue {
+                        key: "proc_cmd".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(
+                                proc.cmd().join(&sep).into_string().unwrap(),
+                            )),
+                        }),
+                    };
 
-                let attributes = vec![id_attribute, proc_cmd_attribute, proc_id_attribute];
+                    let attributes = vec![id_attribute, proc_cmd_attribute, proc_id_attribute];
 
-                let cpu_metric = create_gauge(
-                    "sandbox.cpu.utilization",
-                    "Current CPU utilization",
-                    "%",
-                    Value::AsDouble(cpu_usage),
-                    now_nanos,
-                    &attributes,
-                );
-                let memory_metric = create_gauge(
-                    "sandbox.memory.usage",
-                    "Current memory used",
-                    "B",
-                    Value::AsInt(memory as i64),
-                    now_nanos,
-                    &attributes,
-                );
-                // TODO: I think these were causing issues with the OpenTelemetry collector
-                // and I am not sure they are needed right now for OTEL metrics
-                // let disk_read_metric = create_gauge(
-                //     "sandbox.disk.read",
-                //     "Current disk read",
-                //     "B",
-                //     Value::AsInt(disk_usage.read_bytes as i64),
-                //     now_nanos,
-                //     &attributes,
-                // );
-                // let disk_written_metric = create_gauge(
-                //     "sandbox.written.read",
-                //     "Current disk written",
-                //     "B",
-                //     Value::AsInt(disk_usage.written_bytes as i64),
-                //     now_nanos,
-                //     &attributes,
-                // );
+                    let cpu_metric = create_gauge(
+                        "sandbox.cpu.utilization",
+                        "Current CPU utilization",
+                        "%",
+                        Value::AsDouble(cpu_usage),
+                        now_nanos,
+                        &attributes,
+                    );
+                    let memory_metric = create_gauge(
+                        "sandbox.memory.usage",
+                        "Current memory used",
+                        "B",
+                        Value::AsInt(memory as i64),
+                        now_nanos,
+                        &attributes,
+                    );
+                    // TODO: I think these were causing issues with the OpenTelemetry collector
+                    // and I am not sure they are needed right now for OTEL metrics
+                    // let disk_read_metric = create_gauge(
+                    //     "sandbox.disk.read",
+                    //     "Current disk read",
+                    //     "B",
+                    //     Value::AsInt(disk_usage.read_bytes as i64),
+                    //     now_nanos,
+                    //     &attributes,
+                    // );
+                    // let disk_written_metric = create_gauge(
+                    //     "sandbox.written.read",
+                    //     "Current disk written",
+                    //     "B",
+                    //     Value::AsInt(disk_usage.written_bytes as i64),
+                    //     now_nanos,
+                    //     &attributes,
+                    // );
 
-                let scope_metrics = ProtoScopeMetrics {
-                    scope: None,
-                    metrics: vec![
-                        cpu_metric,
-                        memory_metric,
-                        // disk_read_metric,
-                        // disk_written_metric,
-                    ],
-                    schema_url: String::new(),
-                };
+                    let scope_metrics = ProtoScopeMetrics {
+                        scope: None,
+                        metrics: vec![
+                            cpu_metric,
+                            memory_metric,
+                            // disk_read_metric,
+                            // disk_written_metric,
+                        ],
+                        schema_url: String::new(),
+                    };
 
-                let resource_metrics = ProtoResourceMetrics {
-                    resource: None,
-                    scope_metrics: vec![scope_metrics],
-                    schema_url: String::new(),
-                };
+                    let resource_metrics = ProtoResourceMetrics {
+                        resource: None,
+                        scope_metrics: vec![scope_metrics],
+                        schema_url: String::new(),
+                    };
 
-                let request = ExportMetricsServiceRequest {
-                    resource_metrics: vec![resource_metrics],
-                };
+                    let request = ExportMetricsServiceRequest {
+                        resource_metrics: vec![resource_metrics],
+                    };
 
-                let mut buf = Vec::new();
-                if let Err(e) = request.encode(&mut buf) {
-                    eprintln!("Failed to encode metrics: {}", e);
-                    panic!("wtf");
+                    let mut buf = Vec::new();
+                    request
+                        .encode(&mut buf)
+                        .expect("encode sandbox metrics protobuf");
+                    metrics_file
+                        .write_all(&buf)
+                        .await
+                        .expect("write sandbox metrics protobuf");
                 }
-                metrics_file.write_all(&buf).await.expect("basl");
             }
         }
 

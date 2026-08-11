@@ -2,14 +2,16 @@
 
 pub mod mpsc;
 pub mod tcp;
+#[cfg(test)]
 pub mod tests;
 pub mod traits;
 pub mod unix;
 
+#[cfg(test)]
+pub use crate::transports::tests::TestTransport;
 pub use crate::transports::{
     mpsc::MpscTransport,
     tcp::TcpTransport,
-    tests::TestTransport,
     traits::{ReadHalf, Stream, Transport, TransportHandle, WriteHalf},
     unix::UnixTransport,
 };

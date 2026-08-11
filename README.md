@@ -87,6 +87,19 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+Build the size-optimized static Linux binaries with:
+
+```bash
+cargo build-eds
+```
+
+This alias targets `aarch64-unknown-linux-gnu` and requires a configured target
+linker and sysroot.
+
+The EDS feature retains sandbox resource enforcement and JSON snapshots, but
+omits the unused protobuf `metrics.bin` output and regex-based tracing filters.
+EDS logging uses the configured level, and autonomy modes log at `info`.
+
 To develop an autonomy mode, implement the public `ModeHandler` contract and
 launch it through `run_mode`. Start with
 [`mode-development.md`](./safe/docs/mode-development.md) and

@@ -236,6 +236,23 @@ pub(crate) struct LlmAdvisorModeConfig {
 
 impl LlmAdvisorModeConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.ollama_host.trim().is_empty()
+            || self
+                .ollama_host
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            || self.ollama_port == 0
+        {
+            bail!("Ollama host and port must define a valid HTTP endpoint");
+        }
+        if !self.ollama_path.starts_with('/')
+            || self
+                .ollama_path
+                .bytes()
+                .any(|byte| byte <= b' ' || byte == 0x7f)
+        {
+            bail!("ollama_path must be an absolute HTTP path");
+        }
         if self.nominal_profiles.is_empty() {
             bail!("llm advisor requires at least one nominal profile");
         }
@@ -479,6 +496,17 @@ mod tests {
     fn rejects_noop_as_anomaly_action() {
         let mut config = valid_config();
         config.nominal_profiles[0].rules[0].eligible_actions = vec![AllowedAction::Noop];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_ollama_endpoint() {
+        let mut config = valid_config();
+        config.ollama_host = "localhost\r\nInjected: header".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.ollama_path = "relative path".to_string();
         assert!(config.validate().is_err());
     }
 }
