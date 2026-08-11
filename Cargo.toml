@@ -3,6 +3,7 @@ members = [
     "safe",
     "safe-time",
     "safectl",
+    "mode-llm-advisor",
 ]
 resolver = "2"
 

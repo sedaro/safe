@@ -1,171 +1,133 @@
 # Sedaro Autonomy Framework for Edge (`safe`)
 
-🚧 `safe` is under active development 🚧
+Sedaro Autonomy Framework for Edge (SAFE) is a Rust workspace for running
+telemetry-driven autonomy modes as separate processes and coordinating their
+proposals through a command board. SAFE is under active development.
 
-Sedaro Autonomy Framework for Edge (`safe`) is an open-source flight software mission autonomy framework that integrates Sedaro's Edge Deployable Simulators (EDS's) alongside third-party software to achieve trusted satellite autonomy across the mission lifecycle.
+## Current Scope
 
-![safe](media/safe.png)
+The current checkout provides:
 
-## Yet Another Autonomy Framework?
+- A Flight Director-style SAFE daemon with telemetry-driven mode selection.
+- Immediate and hysteretic activation rules.
+- Out-of-process autonomy modes with Unix-socket IPC, lifecycle messages,
+  heartbeats, restart supervision, and resource monitoring.
+- A command board with configurable gatekeeper adapters.
+- A local JSONL Unix-socket ingress used by `safectl`.
+- `safectl` commands for status, modes, telemetry, logs, board state, and mode
+  resource usage.
+- The `mode-llm-advisor` mode and the `safe-time` utility crate.
 
-You're probably already familiar with the Robot Operating System (ROS) which is an existing autonomy framework. Like most autonomy/robotics frameworks, ROS/ROS2 is primarily just a IPC/message-passing implementation with many developer experience features.  Terrestrially, robotics and autonomy teams either use ROS/ROS2 or they roll their own solution.
+The `Service` topology, integrated Sedaro EDS workflow, and simulation/optimization
+kits described in older project material are not complete features of this
+checkout. See [`Roadmap.md`](./Roadmap.md) for current status and limitations.
 
-`safe` is a purpose built capability that is necessarily distinct from ROS (and ROS competitors).  `safe`'s value proposition within this already mature ecosystem stems from three main principles:
-
-1. 🤖 `safe` isn't a real-time robotics framework.  It's an autonomous mission operations framework.  You aren't making your spacecraft a robot by adopting `safe` - hopefully it is already a robot per your fight software (FSW).  Instead, you're making your mission operations a robot.  You're taking what you already do on the ground in the form of scheduling, anomaly resolution, and maintenance and you're deploying it at the edge.  Fully online mission operations, no overpass required.
-2. 🧑‍💻 `safe` makes using Sedaro simulators and studies capabilities really easy and fast.  You can typically throw together functional decision making capabilities in under 1 hour with the power of the Sedaro Platform.  Terrestrial mission ops today relies heavily on modeling and simulation by humans.  `safe` takes the ground out of the loop.
-3. 📡 `safe` implements host-native C2.  This means that zero new interfaces are required to integrate `safe` onto a host vehicle.  While `safe` is designed to run on board, because `safe` speaks native C2, nothing is stopping you from running `safe` off board in your ops center instead.
-
-## Use Cases
-
-There are two discrete `safe` topologies: Service and Flight Director ("Flight" for short)
-
-### Services
-A `Service` can be asked the question "Is this command sequence safe to execute?" and receive back a "yes/no".
-
-### Flight (i.e. Flight Director)
-
-`Flight` is fed host telemetry and produces vetted command sequences to be executed on the host. If desired, commands from a Flight instance can be validated by a Service.
+SAFE is not a real-time flight software replacement. It consumes telemetry,
+selects and supervises autonomy modes, and records or publishes command-board
+outputs for integration with host software. The current default platform setup
+is a local demonstration adapter, not a flight-ready command-and-control
+integration.
 
 ## Architecture
 
-When paired with Sedaro EDS's, `safe` delivers trusted satellite mission autonomy over long durations without ground contact. `safe` realizes a flexible framework that can be readily applied to a diverse array of missions and edge compute devices.  
+The runtime flow is:
 
-Features:
-1. Autonomy modes offering various levels of intelligence and risk posture interface to core flight software using a built in native C2 interface to consume current system state from telemetry and issue commands to their host vehicle. 
-2. A Router sets the active autonomy mode based on telemetry so that developers and mission planners can design an array of modes that incorporate various autonomy approaches for each mission phase, potential state of the vehicle, and potential state of its operating
-environment. 
-3. Batteries-included developer libraries for multi-simulation, multi-parameter optimization and risk analysis, in addition to turnkey support for the integration of EDS’s, enables streamlined development of `safe` autonomy modes.
+1. A telemetry adapter produces `TelemetryFrame` values.
+2. SAFE records telemetry and evaluates mode activation rules.
+3. The router starts configured mode binaries and forwards telemetry and board
+   snapshots to them.
+4. An active mode proposes `TimedCommand` values or cancels board proposals.
+5. SAFE applies the configured gatekeeper decision to pending proposals.
+6. The platform egress writes command status and scheduled command output.
 
-![arch](media/example.png)
-
-## Example
-
-### Flight
-
-```rust
-struct Telemetry {
-    pointing_error: f64,
-}
-struct Command {
-    set_pid_gains: (f64, f64, f64, f64),
-}
-
-struct AttitudeControlRetuneAutonomyMode;
-impl AutonomyMode<Telemetry, Command> for AttitudeControlRetuneAutonomyMode {
-    fn name(&self) -> String { "Attitude Control Retune".to_string() }
-    fn priority(&self) -> u8 { 0 }
-    fn activation(&self) -> Activation {
-        Activation::Hysteretic {
-            enter: Expr::greater_than(
-                Expr::Term(Variable::Float64(Value::TelemetryRef("pointing_error".to_string()))),
-                Expr::Term(Variable::Float64(Value::Literal(5.0))),
-            ),
-            exit: Expr::not(
-                Expr::greater_than(
-                    Expr::Term(Variable::Float64(Value::TelemetryRef("pointing_error".to_string()))),
-                    Expr::Term(Variable::Float64(Value::Literal(2.5))),
-                )
-            ),
-        }
-    }
-    async fn run(&mut self, mut stream: Box<dyn Stream<AutonomyModeMessage<Telemetry>, RouterMessage<Command>>>) -> Result<()> {
-        let mut nonce: Option<u64> = None;
-        loop {
-            if let Ok(message) = stream.read().await {
-                match message {
-                    AutonomyModeMessage::Active { nonce: new_nonce } => {
-                        nonce = Some(new_nonce);
-                    },
-                    AutonomyModeMessage::Telemetry(telemetry) => {
-                        let eds = SedaroSimulator::new(
-                            std::path::PathBuf::from("path/to/eds"),
-                        ).timeout(Duration::from_secs_f64(5.0));
-                        
-                        // Update EDS model from latest telemetry
-                        init_eds!(eds, telemetry);
-                        
-                        // Run optimization to find new PID controller gains
-                        let gains = optimize1!(eds, "pointing_error", "pid_controller_gains");
-                        
-                        // Run Monte Carlo of EDS by sampling input distributions for uncertain model parameters
-                        let max_speed_obs = GuassianSet::new();
-                        let max_pointing_error_obs = GuassianSet::new();
-                        init_eds!(eds, pid_controller_gains=gains);
-                        uq!(
-                            eds,
-                            inertia_mat_0_0 = NormalDistribution::new(0.005, 8.33333e-05).seed(1),
-                            inertia_mat_1_1 = NormalDistribution::new(0.005, 8.33333e-05).seed(2),
-                            inertia_mat_2_2 = NormalDistribution::new(0.005, 8.33333e-05).seed(3),
-                            x_wheel_inertia = NormalDistribution::new(0.000005, 8.33333e-08).seed(4),
-                            y_wheel_inertia = NormalDistribution::new(0.000005, 8.33333e-08).seed(5),
-                            z_wheel_inertia = NormalDistribution::new(0.000005, 8.33333e-08).seed(6),
-                            max_speed_obs, 
-                            max_pointing_error_obs,
-                        );
-
-                        let max_wheel_speed = max_speed_obs.mean() + 3.0 * max_speed_obs.std_dev();
-                        let max_pointing_error = max_pointing_error_obs.mean() + 3.0 * max_pointing_error_obs.std_dev();
-                        if max_pointing_error < 5.0 && max_wheel_speed < 500.0 {
-                          info!("Analysis indicates system meets performance requirements. Proceeding with new controller gains.");
-                          stream
-                            .write(RouterMessage::Command { 
-                              data: Command { set_pid_gains: gains, },
-                              nonce: nonce.unwrap(),
-                            }).await?;
-                        }
-                    },
-                    AutonomyModeMessage::Inactive => {},
-                }
-            }
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut flight = Flight::new().await;
-    flight.register_autonomy_mode(AttitudeControlRetuneAutonomyMode {}).await.unwrap();
-    flight.run();
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-```
+The default configuration uses an example telemetry generator, a local
+`safectl` Unix socket, and a disabled gatekeeper that automatically approves
+pending batches. Do not use that configuration as a flight safety policy.
 
 ## Getting Started
 
+Run these commands from the repository root. The checked-in `run.sh` exports
+the repository configuration paths and starts SAFE with the example telemetry
+adapter:
+
 ```bash
-cd ./safe
-cargo run
+./run.sh
 ```
 
-For logs, run the following in a different terminal
+The checked-in `safe/autonomy_mode_config.json` is empty, so this starts the
+daemon without autonomy modes. Use the following commands in another terminal
+to inspect the process:
+
 ```bash
-cd ./safectl
-cargo run -- logs
-# or
-cargo run -- logs | jq '.fields.message | select( . != null )'
+cargo run -p safectl -- status
+cargo run -p safectl -- logs
+cargo run -p safectl -- watch telemetry
 ```
 
-For commands, run the following in a different terminal
+Send a payload-only telemetry frame through the local ingress socket:
+
 ```bash
-cd ./safectl
-cargo run -- rx
+cargo run -p safectl -- send telemetry --json '{"telemetry":{"temperature_value_c":34.5}}'
 ```
 
-For send telemetry, run the following in a different terminal
+Payload-only ingress has no `source` and a zero monotonic timestamp. For a
+source-bearing frame, use the full JSON ingress shape documented in
+[`safectl.md`](./safe/docs/safectl.md), or configure an external telemetry
+adapter.
+
+Stop SAFE with `Ctrl-C`. Configuration path resolution, adapters, and runtime
+directories are documented in [`runtime-config.md`](./safe/docs/runtime-config.md).
+
+## Development
+
+The repository pins Rust `1.94.1` in `rust-toolchain.toml`.
+
 ```bash
-cd ./safectl
-cargo run -- tx '{"timestamp": 1625247600, "proximity_m": 200 }'
+cargo build --workspace
+cargo test --workspace
 ```
 
+To develop an autonomy mode, implement the public `ModeHandler` contract and
+launch it through `run_mode`. Start with
+[`mode-development.md`](./safe/docs/mode-development.md) and
+[`mode-protocol.md`](./safe/docs/mode-protocol.md). The LLM advisor has its
+own configuration and fixture documentation in
+[`mode-llm-advisor/README.md`](./mode-llm-advisor/README.md).
 
-## Project Layout
+## Documentation
 
-- [`safe`](./safe/): `safe` implementation
-- [`safectl`](./safectl/): A CLI for interacting with a running `safe` process
-- [`examples`](./examples/): Example autonomy implementations and reference designs
+- [`Runtime configuration`](./safe/docs/runtime-config.md)
+- [`Activation configuration`](./safe/docs/activation-config.md)
+- [`safectl reference`](./safe/docs/safectl.md)
+- [`Mode development`](./safe/docs/mode-development.md)
+- [`Mode protocol`](./safe/docs/mode-protocol.md)
+- [`Runtime operations`](./safe/docs/runtime-operations.md)
+- [`Contributor guide`](./CONTRIBUTING.md)
+- [`Roadmap and limitations`](./Roadmap.md)
+- [`safe-time API`](./safe-time/README.md)
 
+## Workspace Layout
+
+- [`safe/`](./safe/): SAFE library, daemon, runtime, router, transports, and
+  platform adapters.
+- [`safectl/`](./safectl/): CLI for interacting with a running SAFE daemon.
+- [`safe-time/`](./safe-time/): GPS, UTC, MJD, and attitude utility functions.
+- [`mode-llm-advisor/`](./mode-llm-advisor/): static nominal-profile advisor
+  mode and fixtures.
+- [`run.sh`](./run.sh): local development launch script.
+
+## Safety and Deployment Notes
+
+The repository contains unfinished integration paths. In particular, the
+default disabled gatekeeper approves command batches, scheduled commands are
+written to `out/commands.csv`, and direct `ExecuteNow` host dispatch is not
+fully wired through the platform egress. Review
+[`runtime-operations.md`](./safe/docs/runtime-operations.md) before treating
+SAFE output as an operational command stream.
+
+The current implementation uses Tokio, filesystem state, subprocesses, and
+Linux namespace support where available. It is not currently a `no_std` or MCU
+target.
 
 ## License
 
