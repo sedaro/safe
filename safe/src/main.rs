@@ -54,6 +54,7 @@ struct RuntimePaths {
     pid: PathBuf,
     safectl_sock: PathBuf,
     summary: PathBuf,
+    status: PathBuf,
 }
 
 impl RuntimePaths {
@@ -67,6 +68,7 @@ impl RuntimePaths {
         let pid_path = state_dir.join("safe.pid");
         let safectl_sock_path = state_dir.join("safectl.sock");
         let summary_path = base_writable_path.join("out").join("summary.json");
+        let status_path = state_dir.join("status.json");
 
         Self {
             base: base_writable_path,
@@ -77,6 +79,7 @@ impl RuntimePaths {
             pid: pid_path,
             safectl_sock: safectl_sock_path,
             summary: summary_path,
+            status: status_path,
         }
     }
 }
@@ -87,9 +90,6 @@ async fn main() -> anyhow::Result<()> {
     cfg.validate()
         .map_err(|e| format!("config error: {e}"))
         .expect("config invalid");
-
-    // Before tracing, and tracing relies on config
-    println!("Config: {cfg:?}");
 
     let _log_guard = logging::init_tracing(&cfg).expect("logging init");
 

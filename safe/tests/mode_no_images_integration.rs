@@ -61,7 +61,10 @@ async fn no_images_mode_handshake_and_cancel_flow() {
             protocol_version,
         } => {
             assert_eq!(mode, mode_id);
-            assert_eq!(protocol_version, 1);
+            assert_eq!(
+                protocol_version,
+                safe::protocol::AUTONOMY_MODE_PROTOCOL_VERSION
+            );
         }
         _ => panic!("expected hello"),
     }
