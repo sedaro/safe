@@ -4,6 +4,7 @@ members = [
     "safe-time",
     "safectl",
     "mode-llm-advisor",
+    "mode-electronic-warfare",
 ]
 resolver = "2"
 
