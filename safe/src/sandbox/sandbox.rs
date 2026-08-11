@@ -124,22 +124,40 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+fn detected_mode_level(line: &str) -> Option<&'static str> {
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    let level = |token| match token {
+        "TRACE" => Some("TRACE"),
+        "DEBUG" => Some("DEBUG"),
+        "INFO" => Some("INFO"),
+        "WARN" | "WARNING" => Some("WARN"),
+        "ERROR" => Some("ERROR"),
+        _ => None,
+    };
+    if let Some(level) = level(first) {
+        return Some(level);
+    }
+
+    let looks_like_timestamp = first.contains('T')
+        || (first.len() >= 10
+            && first.as_bytes().get(4) == Some(&b'-')
+            && first.as_bytes().get(7) == Some(&b'-'));
+    if looks_like_timestamp {
+        return tokens.take(3).find_map(level);
+    }
+    None
+}
+
 fn log_mode_line(id: &str, stream: &str, line: &str, default_stderr: bool) {
     let line = strip_ansi(line);
-    if line.contains(" ERROR ") {
-        error!(id = %id, "{stream}: {line}");
-    } else if line.contains(" WARN ") {
-        warn!(id = %id, "{stream}: {line}");
-    } else if line.contains(" INFO ") {
-        info!(id = %id, "{stream}: {line}");
-    } else if line.contains(" DEBUG ") {
-        debug!(id = %id, "{stream}: {line}");
-    } else if line.contains(" TRACE ") {
-        trace!(id = %id, "{stream}: {line}");
-    } else if default_stderr {
-        warn!(id = %id, "{stream}: {line}");
-    } else {
-        info!(id = %id, "{stream}: {line}");
+    let level = detected_mode_level(&line).unwrap_or(if default_stderr { "WARN" } else { "INFO" });
+    match level {
+        "ERROR" => error!(mode_id = %id, stream = %stream, "{line}"),
+        "WARN" => warn!(mode_id = %id, stream = %stream, "{line}"),
+        "DEBUG" => debug!(mode_id = %id, stream = %stream, "{line}"),
+        "TRACE" => trace!(mode_id = %id, stream = %stream, "{line}"),
+        _ => info!(mode_id = %id, stream = %stream, "{line}"),
     }
 }
 
@@ -182,6 +200,22 @@ mod tests {
     fn strip_ansi_removes_escape_sequences() {
         let s = "\u{1b}[32mINFO\u{1b}[0m hello";
         assert_eq!(strip_ansi(s), "INFO hello");
+    }
+
+    #[test]
+    fn detects_level_only_in_the_prefix() {
+        assert_eq!(
+            detected_mode_level("2026-01-01T00:00:00Z ERROR target: failed"),
+            Some("ERROR")
+        );
+        assert_eq!(
+            detected_mode_level("2026-01-01 00:00:00 ERROR target: failed"),
+            Some("ERROR")
+        );
+        assert_eq!(
+            detected_mode_level("message contains ERROR but has no level prefix"),
+            None
+        );
     }
 }
 
@@ -329,11 +363,12 @@ impl Sandbox for SafeSandbox {
                     let mut stdout_reader = BufReader::new(stdout).lines();
                     let mut stderr_reader = BufReader::new(stderr).lines();
                     let _ = BufWriter::new(stdin); // TODO: stdin
+                    let mut stdout_open = true;
+                    let mut stderr_open = true;
 
-                    // TODO: maybe do something other than `info!` here?
-                    loop {
+                    while stdout_open || stderr_open {
                         select! {
-                            res = stdout_reader.next_line() => {
+                            res = stdout_reader.next_line(), if stdout_open => {
                                 match res {
                                     Ok(res) => {
                                         match res {
@@ -341,16 +376,17 @@ impl Sandbox for SafeSandbox {
                                                 log_mode_line(&id, "stdout", &line, false);
                                             }
                                             None => {
-                                                break;
+                                                stdout_open = false;
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("{e}");
+                                        error!(stream = "stdout", "mode stdout read failed: {e}");
+                                        stdout_open = false;
                                     }
                                 }
                             }
-                            res = stderr_reader.next_line() => {
+                            res = stderr_reader.next_line(), if stderr_open => {
                                 match res {
                                     Ok(res) => {
                                         match res {
@@ -358,12 +394,13 @@ impl Sandbox for SafeSandbox {
                                                 log_mode_line(&id, "stderr", &line, true);
                                             }
                                             None => {
-                                                break;
+                                                stderr_open = false;
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("{e}");
+                                        error!(stream = "stderr", "mode stderr read failed: {e}");
+                                        stderr_open = false;
                                     }
                                 }
                             }

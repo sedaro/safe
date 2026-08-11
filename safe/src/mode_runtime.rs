@@ -11,14 +11,13 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::protocol::{
-    AutonomyModeBoardState, AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, BoardCmdId,
-    BoardState, CommandEnvelope, ModeToSafe, SafeToMode,
+    AUTONOMY_MODE_PROTOCOL_VERSION, AutonomyModeBoardState, AutonomyModeId, AutonomyModeInput,
+    AutonomyModeLifecycle, AutonomyModeOutput, BoardCmdId, BoardState, CommandEnvelope, ModeToSafe,
+    SafeToMode,
 };
 use crate::telemetry_frame::TelemetryFrame;
 use crate::transports::TransportHandle;
 use crate::transports::unix::UnixTransportHandle;
-
-const PROTOCOL_VERSION: u16 = 1;
 
 fn init_mode_tracing() {
     let filter = EnvFilter::try_from_default_env()
@@ -68,6 +67,10 @@ impl ModeOutputTx {
             reason: reason.into(),
         })
     }
+
+    pub fn lifecycle(&self, state: AutonomyModeLifecycle) -> Result<()> {
+        self.send_output(AutonomyModeOutput::Lifecycle { state })
+    }
 }
 
 impl ModeRuntime {
@@ -114,7 +117,7 @@ pub trait ModeHandler<C>: Send
 where
     C: Send + 'static,
 {
-    fn set_config(&mut self, config: C);
+    fn set_config(&mut self, config: C) -> Result<()>;
 
     async fn on_activate(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
         Ok(())
@@ -154,7 +157,7 @@ where
     let mode_id = resolve_mode_id(mode_id_opt.as_deref())?;
     let working_directory = resolve_working_directory(working_directory_opt.as_deref())?;
     let config = load_mode_config::<C>(config_path.as_deref()).await?;
-    handler.set_config(config);
+    handler.set_config(config)?;
 
     let handle = UnixTransportHandle::<ModeToSafe, SafeToMode>::new(&endpoint);
     let mut stream = TransportHandle::connect(&handle)
@@ -175,13 +178,17 @@ where
     stream
         .write(ModeToSafe::Hello {
             mode: mode_id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: AUTONOMY_MODE_PROTOCOL_VERSION,
         })
         .await
         .map_err(|e| anyhow!(e))?;
 
     let span_id = format!("mode_runtime_{}", mode_id.0);
-    let span = info_span!("autonomy_mode_runtime", id = ?span_id);
+    let span = info_span!(
+        "autonomy_mode_runtime",
+        mode_id = %mode_id.0,
+        runtime_span = %span_id
+    );
     let _guard = span.enter();
 
     let mut runtime = ModeRuntime {
@@ -190,6 +197,9 @@ where
         working_directory,
         output_tx: ModeOutputTx::new(out_tx),
     };
+    runtime.output_tx.lifecycle(AutonomyModeLifecycle::Ready)?;
+
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
 
     async fn send_fault_to_safe(
         stream: &mut Box<dyn crate::transports::Stream<SafeToMode, ModeToSafe>>,
@@ -220,6 +230,7 @@ where
                                 send_fault_to_safe(&mut stream, msg.clone()).await;
                                 return Err(anyhow!(msg));
                             }
+                            runtime.output_tx.lifecycle(AutonomyModeLifecycle::Active)?;
                         }
                         AutonomyModeInput::Deactivate => {
                             runtime.active = false;
@@ -229,6 +240,7 @@ where
                                 send_fault_to_safe(&mut stream, msg.clone()).await;
                                 return Err(anyhow!(msg));
                             }
+                            runtime.output_tx.lifecycle(AutonomyModeLifecycle::Inactive)?;
                         }
                         AutonomyModeInput::Restart => {
                             runtime.active = false;
@@ -238,6 +250,7 @@ where
                                 send_fault_to_safe(&mut stream, msg.clone()).await;
                                 return Err(anyhow!(msg));
                             }
+                            runtime.output_tx.lifecycle(AutonomyModeLifecycle::Active)?;
                             runtime.active = true;
                             if let Err(e) = handler.on_activate(&mut runtime).await {
                                 let msg = format!("on_restart_activate failed: {e:#}");
@@ -269,6 +282,7 @@ where
                                 send_fault_to_safe(&mut stream, msg.clone()).await;
                                 return Err(anyhow!(msg));
                             }
+                            runtime.output_tx.lifecycle(AutonomyModeLifecycle::Stopping)?;
                             flush_pending_outputs(&mut out_rx, &mut stream).await?;
                             break;
                         }
@@ -286,6 +300,12 @@ where
                 };
                 if let Err(e) = stream.write(ModeToSafe::Output(out)).await {
                     error!(reason = %e, "failed sending autonomy mode output to SAFE");
+                    return Err(anyhow!(e));
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(e) = stream.write(ModeToSafe::Output(AutonomyModeOutput::Heartbeat)).await {
+                    error!(reason = %e, "failed sending autonomy mode heartbeat to SAFE");
                     return Err(anyhow!(e));
                 }
             }
@@ -379,23 +399,17 @@ where
 {
     if let Some(path) = config_path {
         let config_content = tokio::fs::read_to_string(path).await?;
-        Ok(parse_mode_config_content(&config_content))
+        parse_mode_config_content(&config_content)
     } else {
         Ok(C::default())
     }
 }
 
-fn parse_mode_config_content<C>(config_content: &str) -> C
+fn parse_mode_config_content<C>(config_content: &str) -> Result<C>
 where
     C: DeserializeOwned + Default,
 {
-    match serde_json::from_str::<C>(config_content) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("mode config parse failed, using defaults: {e}");
-            C::default()
-        }
-    }
+    serde_json::from_str::<C>(config_content).map_err(|e| anyhow!("mode config parse failed: {e}"))
 }
 
 #[cfg(test)]
@@ -442,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_mode_config_content_uses_defaults_on_invalid_json() {
-        let cfg: TestCfg = parse_mode_config_content("{not-valid-json");
-        assert_eq!(cfg, TestCfg::default());
+    fn parse_mode_config_content_rejects_invalid_json() {
+        let cfg: Result<TestCfg> = parse_mode_config_content("{not-valid-json");
+        assert!(cfg.is_err());
     }
 
     #[test]
     fn parse_mode_config_content_parses_valid_json() {
-        let cfg: TestCfg = parse_mode_config_content("{\"alpha\":17}");
+        let cfg: TestCfg = parse_mode_config_content("{\"alpha\":17}").expect("valid config");
         assert_eq!(cfg, TestCfg { alpha: 17 });
     }
 }

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::config::Config;
-use crate::protocol::BoardState;
+use crate::protocol::{BoardCmdId, BoardState};
 use crate::telemetry_frame::TelemetryFrame;
 use crate::{
     HostCommandDispatchRecord, HostCommandRequest, HostCommandStatus, RuntimePaths, SafectlIngress,
@@ -16,6 +16,11 @@ use crate::{
 pub mod gatekeeper;
 pub mod telemetry;
 use telemetry::spawn_telemetry_ingress;
+
+#[derive(Debug, Clone)]
+pub struct BoardPublicationStatus {
+    pub command_ids: Vec<BoardCmdId>,
+}
 
 #[async_trait]
 pub trait IngressSource {
@@ -145,6 +150,7 @@ pub fn spawn_platform_egress(
     runtime_paths: &RuntimePaths,
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
     mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
 ) -> anyhow::Result<()> {
     let command_kind = CommandIngressKind::from_config(&cfg.platform.command_adapter)?;
 
@@ -163,10 +169,19 @@ pub fn spawn_platform_egress(
                 });
                 tokio::spawn(async move {
                     while let Some(board_state) = command_dispatch_rx.recv().await {
-                        if let Err(e) =
-                            write_host_command_dispatch_csv(&dispatch_csv_path, &board_state).await
+                        match write_host_command_dispatch_csv(&dispatch_csv_path, &board_state)
+                            .await
                         {
-                            error!("failed writing host command dispatch csv: {e}");
+                            Ok(()) => {
+                                let _ = board_publication_tx
+                                    .send(BoardPublicationStatus {
+                                        command_ids: board_state.source_of_truth,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("failed writing host command dispatch csv: {e}");
+                            }
                         }
                     }
                 });

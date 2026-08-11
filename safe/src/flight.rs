@@ -175,6 +175,54 @@ impl Flight {
         self.active_autonomy_mode
     }
 
+    pub fn mode_eligibility(&self, mode_id: AutonomyModeId) -> (bool, String) {
+        let Some(mode) = self.autonomy_modes.iter().find(|mode| mode.id == mode_id) else {
+            return (false, "mode is not configured".to_string());
+        };
+        if !mode.enabled {
+            return (false, "mode is disabled".to_string());
+        }
+
+        let resolver = FlightResolver {
+            telemetry_history: &self.telemetry_history,
+            last_planned_autonomy_mode: &self.last_planned_autonomy_mode,
+        };
+        match self.activation_for_mode(mode_id) {
+            None => (true, "no activation rule".to_string()),
+            Some(Activation::Immediate(expr)) => match expr.eval(&resolver) {
+                Ok(true) => (true, "immediate rule is true".to_string()),
+                Ok(false) => (false, "immediate rule is false".to_string()),
+                Err(e) => (false, format!("activation evaluation failed: {e:?}")),
+            },
+            Some(Activation::Hysteretic { enter, .. }) => match enter.eval(&resolver) {
+                Ok(true) => (true, "hysteretic enter rule is true".to_string()),
+                Ok(false) => (false, "hysteretic enter rule is false".to_string()),
+                Err(e) => (false, format!("activation evaluation failed: {e:?}")),
+            },
+        }
+    }
+
+    pub fn active_selection_reason(&self) -> String {
+        let Some(active) = self.active_autonomy_mode else {
+            return "no eligible mode".to_string();
+        };
+        if self.manual_active_override == Some(active) {
+            return "manual override".to_string();
+        }
+        if let Some(Activation::Hysteretic { exit, .. }) = self.activation_for_mode(active) {
+            let resolver = FlightResolver {
+                telemetry_history: &self.telemetry_history,
+                last_planned_autonomy_mode: &self.last_planned_autonomy_mode,
+            };
+            return match exit.eval(&resolver) {
+                Ok(false) => "hysteresis hold".to_string(),
+                Err(_) => "hysteresis hold after evaluation error".to_string(),
+                Ok(true) => "highest-priority eligible mode".to_string(),
+            };
+        }
+        "highest-priority eligible mode".to_string()
+    }
+
     pub fn is_halted(&self) -> bool {
         self.halted
     }

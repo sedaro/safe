@@ -1,0 +1,22 @@
+[package]
+name = "mode-llm-advisor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+safe = { path = "../safe" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["full"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+uuid = "1.23.3"
+
+[[bin]]
+name = "mode_llm_advisor"
+path = "src/main.rs"
