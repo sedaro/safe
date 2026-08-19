@@ -331,20 +331,6 @@ impl SedaroSimulator {
             command_args.push("--start".to_string());
             command_args.push(epoch_mjd.to_string());
         }
-        // let data_path = workspace_dir.join("data");
-        // let init_contents = std::fs::read_to_string(data_path.join("init.json"))?;
-        // let init: HashMap<String, String> = serde_json::from_str(init_contents.as_str())?;
-        // TODO: Get the agent ID from somewhere.
-        // let agent_id = "PTnYWzsc2Nhywc8WVS4blm";
-        // let init_name = init.get(agent_id).with_context(|| {
-        //     format!(
-        //         "init.json does not contain an entry for agent ID '{}'",
-        //         agent_id
-        //     )
-        // })?;
-        // let init_path = data_path.join(format!("{init_name}.bin"));
-        // command_args.push("--init".to_string());
-        // command_args.push(init_path.to_str().unwrap().to_string());
 
         let mut cmd = TokioCommand::new(&executable_path);
         let cmd = cmd
