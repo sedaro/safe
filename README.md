@@ -17,6 +17,8 @@ The current checkout provides:
 - `safectl` commands for status, modes, telemetry, logs, board state, and mode
   resource usage.
 - The `mode-llm-advisor` mode and the `safe-time` utility crate.
+- The `safe-sim` crate for Sedaro EDS simulations, trade studies, and Monte
+  Carlo studies.
 
 The `Service` topology, integrated Sedaro EDS workflow, and simulation/optimization
 kits described in older project material are not complete features of this
@@ -105,6 +107,7 @@ own configuration and fixture documentation in
 - [`Contributor guide`](./CONTRIBUTING.md)
 - [`Roadmap and limitations`](./Roadmap.md)
 - [`safe-time API`](./safe-time/README.md)
+- [`safe-sim studies and simulation API`](./safe-sim/README.md)
 
 ## Workspace Layout
 
@@ -112,6 +115,8 @@ own configuration and fixture documentation in
   platform adapters.
 - [`safectl/`](./safectl/): CLI for interacting with a running SAFE daemon.
 - [`safe-time/`](./safe-time/): GPS, UTC, MJD, and attitude utility functions.
+- [`safe-sim/`](./safe-sim/): Sedaro EDS simulation execution, output decoding,
+  trade studies, and Monte Carlo studies.
 - [`mode-llm-advisor/`](./mode-llm-advisor/): static nominal-profile advisor
   mode and fixtures.
 - [`run.sh`](./run.sh): local development launch script.

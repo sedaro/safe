@@ -1,8 +1,4 @@
-//! EDS simulation execution, output decoding, and reproducible multi-run studies.
-//!
-//! [`TradeStudy`] runs explicit named cases, while [`MonteCarloStudy`] generates cases from
-//! independent probability distributions. Both return an ordered [`StudyResult`] containing the
-//! original case definition and full [`SimulationResult`] for each completed run.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
