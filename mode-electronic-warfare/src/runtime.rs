@@ -252,12 +252,13 @@ impl ElectronicWarfareMode {
 
 #[async_trait]
 impl ModeHandler<ElectronicWarfareModeConfig> for ElectronicWarfareMode {
-    fn set_config(&mut self, config: ElectronicWarfareModeConfig) {
+    fn set_config(&mut self, config: ElectronicWarfareModeConfig) -> anyhow::Result<()> {
         self.config = config;
         self.latest_board_snapshot = AutonomyModeBoardState::default();
         self.has_board_snapshot = false;
         self.last_replan_start = None;
         self.warned_missing_config = false;
+        Ok(())
     }
 
     async fn on_activate(&mut self, runtime: &mut ModeRuntime) -> anyhow::Result<()> {
