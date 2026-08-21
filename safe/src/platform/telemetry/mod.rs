@@ -143,7 +143,7 @@ mod example {
             let t = TelemetryFrame {
                 source: Some("example".to_string()),
                 ts_mono: counter as u64,
-                payload: serde_json::json!({"telemetry": {"batt_v": counter}}),
+                payload: serde_json::json!({"telemetry": {"batt_v": counter, "batt_c": counter}}),
             };
 
             if tx.send(t).await.is_err() {

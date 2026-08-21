@@ -2,9 +2,9 @@ use std::env::var;
 use std::path::{Path, PathBuf};
 
 const RUNTIME_CONFIG_CWD_CANDIDATE: &str = "safe/safe.yaml";
-const RUNTIME_CONFIG_FALLBACK: &str = "/opt/safe/safe.yaml";
+const RUNTIME_CONFIG_FALLBACK: &str = "/tmp/safe/safe.yaml";
 const MODE_CONFIG_CWD_CANDIDATE: &str = "safe/autonomy_mode_config.json";
-const MODE_CONFIG_FALLBACK: &str = "/opt/safe/autonomy_mode_config.json";
+const MODE_CONFIG_FALLBACK: &str = "/tmp/safe/autonomy_mode_config.json";
 
 pub(crate) fn resolve_runtime_config_path() -> PathBuf {
     var("SAFE_RUNTIME_CONFIG")
