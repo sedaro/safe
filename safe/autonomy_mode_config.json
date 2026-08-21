@@ -14,6 +14,11 @@
     "mode_config": {
       "action_catalog": [
         {
+          "id": "point_nadir",
+          "description": "DEMO ONLY: point nadir after a configured thermal, rail, or wheel-speed anomaly.",
+          "preconditions": ["Demo configuration only; not flight-approved."]
+        },
+        {
           "id": "point_sun_yaw",
           "description": "DEMO ONLY: point toward the sun after a configured power, GPS, or mode anomaly.",
           "preconditions": ["Demo configuration only; not flight-approved."]
@@ -24,6 +29,16 @@
           "id": "demo-v1",
           "source": "example",
           "rules": [
+            {
+              "id": "battery_temperature_out_of_nominal",
+              "path": "batt_c",
+              "kind": "number_range",
+              "min": 20.0,
+              "max": 60.0,
+              "min_consecutive_samples": 10,
+              "severity": "high",
+              "eligible_actions": ["point_nadir"]
+            },
             {
               "id": "battery_voltage_out_of_nominal",
               "path": "batt_v",
