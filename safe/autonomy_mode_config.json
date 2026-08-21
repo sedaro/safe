@@ -31,7 +31,7 @@
           "rules": [
             {
               "id": "battery_temperature_out_of_nominal",
-              "path": "batt_c",
+              "path": "telemetry.batt_c",
               "kind": "number_range",
               "min": 20.0,
               "max": 60.0,
@@ -41,7 +41,7 @@
             },
             {
               "id": "battery_voltage_out_of_nominal",
-              "path": "batt_v",
+              "path": "telemetry.batt_v",
               "kind": "number_range",
               "min": 7.5,
               "max": 8.6,
