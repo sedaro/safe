@@ -1,12 +1,12 @@
 [workspace]
 members = [
     "safe",
-    "safe-sim",
     "safe-time",
     "safectl",
     "mode-llm-advisor",
 ]
 excludes = [
+    "safe-sim",
     "mode-electronic-warfare",
 ]
 resolver = "2"
