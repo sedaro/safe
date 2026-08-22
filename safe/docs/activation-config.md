@@ -93,6 +93,22 @@ JSON enum forms below:
 { "Immediate": { "Term": { "Bool": { "Literal": true } } } }
 ```
 
+Use `Timed` to activate a mode from a condition for a bounded window:
+
+```json
+{
+  "Timed": {
+    "condition": { "Term": { "Bool": { "TelemetryRef": "fault.active" } } },
+    "duration_secs": 30
+  }
+}
+```
+
+The timer starts when the mode is selected, and expires independently of
+telemetry arrival. A true condition is latched after expiry; it must become
+false before a later true condition can start a new window. Manual overrides
+continue to pin a mode until explicitly deactivated.
+
 ```json
 {
   "Hysteretic": {

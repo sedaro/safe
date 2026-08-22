@@ -92,9 +92,86 @@ any rule has eligible actions; actionless schema profiles are valid.
 | `max_decision_attempts` | `3` |
 | `max_feedback_chars` | `400` |
 | `require_board_snapshot` | `false` |
+| `decision_trace` | `false` |
 
 `goal` and `analysis_instructions` also have safe default text and may be
 overridden to constrain the decision prompt.
+
+## Live Decision Trace
+
+For a terminal demo, set `decision_trace` to `true` in the mode's
+`mode_config`. The advisor emits a compact, ordered `LLM DEMO` trace for the
+configured candidates, each Ollama request, the model's selected action and
+rationale, validation or repair attempts, and the command-board proposal. The
+trace is an auditable decision summary, not hidden model chain-of-thought.
+
+Use at least two actionable choices to exercise the Ollama path. A single
+candidate with a single eligible action deliberately skips the model and the
+trace says so. This `mode_config` is a compact local-demo example:
+
+```json
+{
+  "decision_trace": true,
+  "action_catalog": [
+    {"id": "point_sun_yaw", "description": "Point solar arrays toward the sun."},
+    {"id": "point_nadir", "description": "Point the payload toward nadir."}
+  ],
+  "nominal_profiles": [
+    {
+      "id": "demo-v1",
+      "source": "demo",
+      "rules": [
+        {
+          "id": "temperature_high",
+          "path": "telemetry.temperature_c",
+          "kind": "number_range",
+          "max": 45.0,
+          "severity": "high",
+          "eligible_actions": ["point_sun_yaw"]
+        },
+        {
+          "id": "mode_invalid",
+          "path": "telemetry.mode",
+          "kind": "enum",
+          "allowed": ["idle", "nominal"],
+          "severity": "medium",
+          "eligible_actions": ["point_nadir", "point_sun_yaw"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Place that object inside an enabled outer mode entry named `LlmAdvisorDemo`
+(with `bin_path` set to `../target/debug/mode_llm_advisor`), build it, and run
+SAFE as usual. In a second terminal, follow only the trace:
+
+```bash
+cargo build -p mode-llm-advisor
+cargo run -p safectl -- logs --mode-name LlmAdvisorDemo --follow --filter "LLM DEMO"
+```
+
+Then send a source-bearing frame that violates both rules:
+
+```bash
+cargo run -p safectl -- send telemetry --json '{"source":"demo","ts_mono":1,"payload":{"telemetry":{"temperature_c":52.0,"mode":"fault"}}}'
+```
+
+With the mode active, this produces candidate, request, response, validation,
+and proposal lines in order, for example:
+
+```text
+LLM DEMO | 2 detected candidate(s); 2 have configured actions
+LLM DEMO | demo-v1-temperature_high | telemetry.temperature_c=52.0 | expected at most 45 | actions: point_sun_yaw
+LLM DEMO | attempt 1/3 | asking mistral:7b to select one action from 2 configured candidate(s)
+LLM DEMO | attempt 1/3 | model selected demo-v1-temperature_high -> point_sun_yaw | rationale: Temperature is above the configured limit.
+LLM DEMO | attempt 1/3 | accepted demo-v1-temperature_high -> point_sun_yaw; evidence path is allowed
+LLM DEMO | submitted point_sun_yaw for demo-v1-temperature_high (telemetry.temperature_c) to the SAFE command board
+```
+
+Use this only in controlled demos because it retains candidate values and the
+model's stated rationale in the mode log.
 
 ## Decision Behavior
 

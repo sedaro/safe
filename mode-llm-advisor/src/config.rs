@@ -224,6 +224,8 @@ pub(crate) struct LlmAdvisorModeConfig {
     pub(crate) max_feedback_chars: usize,
     #[serde(default = "default_require_board_snapshot")]
     pub(crate) require_board_snapshot: bool,
+    #[serde(default)]
+    pub(crate) decision_trace: bool,
     #[serde(default = "default_goal")]
     pub(crate) goal: String,
     #[serde(default = "default_analysis_instructions")]
@@ -345,6 +347,7 @@ impl Default for LlmAdvisorModeConfig {
             max_decision_attempts: default_max_decision_attempts(),
             max_feedback_chars: default_max_feedback_chars(),
             require_board_snapshot: default_require_board_snapshot(),
+            decision_trace: false,
             goal: default_goal(),
             analysis_instructions: default_analysis_instructions(),
             action_catalog: Vec::new(),
@@ -457,6 +460,39 @@ mod tests {
     #[test]
     fn accepts_valid_static_nominal_profile() {
         valid_config().validate().expect("config should validate");
+    }
+
+    #[test]
+    fn decision_trace_is_disabled_unless_requested() {
+        let config = valid_config();
+        assert!(!config.decision_trace);
+
+        let config: LlmAdvisorModeConfig = serde_json::from_value(serde_json::json!({
+            "decision_trace": true,
+            "action_catalog": [
+                {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
+            ],
+            "nominal_profiles": [
+                {
+                    "id": "example-v1",
+                    "source": "example",
+                    "rules": [
+                        {
+                            "id": "temperature_out_of_nominal",
+                            "path": "telemetry.temperature_c",
+                            "kind": "number_range",
+                            "max": 45.0,
+                            "eligible_actions": ["point_sun_yaw"]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("decision trace config should parse");
+        assert!(config.decision_trace);
+        config
+            .validate()
+            .expect("decision trace config should validate");
     }
 
     #[test]

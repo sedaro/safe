@@ -65,6 +65,13 @@ enum RuleEvaluation {
 }
 
 impl LlmAdvisorMode {
+    fn log_decision_trace(&self, stage: &str, detail: impl std::fmt::Display) {
+        if self.config.decision_trace {
+            let detail = trace_text(&detail.to_string());
+            info!(decision_trace = true, stage, "LLM DEMO | {detail}");
+        }
+    }
+
     fn log_planning_error(
         &self,
         hook: &str,
@@ -187,9 +194,24 @@ impl LlmAdvisorMode {
                     anyhow!("attempt {attempt}/{max_attempts} build_prompt failed: {e:#}")
                 })?;
 
+            self.log_decision_trace(
+                "request",
+                format!(
+                    "attempt {attempt}/{max_attempts} | asking {} to select one action from {} configured candidate(s)",
+                    self.config.model,
+                    envelope.candidates.len(),
+                ),
+            );
+
             let response_text = match self.query_ollama(&prompt).await {
                 Ok(response) => response,
                 Err(err) if attempt < max_attempts => {
+                    self.log_decision_trace(
+                        "retry",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | model request failed; retrying: {err:#}"
+                        ),
+                    );
                     warn!(
                         attempt,
                         max_attempts,
@@ -200,6 +222,12 @@ impl LlmAdvisorMode {
                     continue;
                 }
                 Err(err) => {
+                    self.log_decision_trace(
+                        "failure",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | model request failed with no retries left: {err:#}"
+                        ),
+                    );
                     return Err(anyhow!(
                         "attempt {attempt}/{max_attempts} query failed: {err:#}"
                     ));
@@ -209,8 +237,23 @@ impl LlmAdvisorMode {
             warn!("LLM response: {response_text}");
 
             let decision = match self.parse_advisor_decision(&response_text) {
-                Ok(decision) => decision,
+                Ok(decision) => {
+                    self.log_decision_trace(
+                        "response",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | model selected {} -> {} | rationale: {}",
+                            decision.anomaly_id, decision.action_id, decision.reason,
+                        ),
+                    );
+                    decision
+                }
                 Err(err) if attempt < max_attempts => {
+                    self.log_decision_trace(
+                        "repair",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | model reply was not valid decision JSON; requesting repair: {err:#}"
+                        ),
+                    );
                     warn!(
                         attempt,
                         max_attempts,
@@ -224,11 +267,25 @@ impl LlmAdvisorMode {
                     ));
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    self.log_decision_trace(
+                        "failure",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | model reply was not valid decision JSON: {err:#}"
+                        ),
+                    );
+                    return Err(err);
+                }
             };
 
             if let Err(err) = self.evaluate_decision(&decision, &envelope.candidates) {
                 if attempt < max_attempts {
+                    self.log_decision_trace(
+                        "repair",
+                        format!(
+                            "attempt {attempt}/{max_attempts} | selection was outside the configured candidates or actions; requesting repair: {err:#}"
+                        ),
+                    );
                     warn!(
                         attempt,
                         max_attempts,
@@ -239,8 +296,20 @@ impl LlmAdvisorMode {
                         Some(self.build_repair_feedback("evaluate_decision", &err, &response_text));
                     continue;
                 }
+                self.log_decision_trace(
+                    "failure",
+                    format!("attempt {attempt}/{max_attempts} | selection was rejected: {err:#}"),
+                );
                 return Err(err);
             }
+
+            self.log_decision_trace(
+                "validation",
+                format!(
+                    "attempt {attempt}/{max_attempts} | accepted {} -> {}; evidence path is allowed",
+                    decision.anomaly_id, decision.action_id,
+                ),
+            );
 
             info!(
                 attempt,
@@ -600,6 +669,15 @@ impl LlmAdvisorMode {
             reason = %reason,
             "llm advisor emitted profile-backed anomaly action"
         );
+        self.log_decision_trace(
+            "proposal",
+            format!(
+                "submitted {} for {} ({}) to the SAFE command board",
+                action.as_str(),
+                candidate.anomaly_id,
+                candidate.path,
+            ),
+        );
         Ok(())
     }
 
@@ -626,6 +704,36 @@ impl LlmAdvisorMode {
             .filter(|candidate| !candidate.eligible_actions.is_empty())
             .cloned()
             .collect::<Vec<_>>();
+
+        if self.config.decision_trace {
+            self.log_decision_trace(
+                "candidates",
+                format!(
+                    "{} detected candidate(s); {} have configured actions",
+                    self.current_candidates.len(),
+                    actionable.len(),
+                ),
+            );
+            for candidate in &actionable {
+                let actions = candidate
+                    .eligible_actions
+                    .iter()
+                    .map(|action| action.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.log_decision_trace(
+                    "candidate",
+                    format!(
+                        "{} | {}={} | expected {} | actions: {}",
+                        candidate.anomaly_id,
+                        candidate.path,
+                        clip_chars(&candidate.observed.to_string(), 120),
+                        candidate.expectation,
+                        actions,
+                    ),
+                );
+            }
+        }
         if actionable.is_empty() {
             warn!(
                 candidate_count = self.current_candidates.len(),
@@ -638,6 +746,14 @@ impl LlmAdvisorMode {
         if actionable.len() == 1 && actionable[0].eligible_actions.len() == 1 {
             let candidate = &actionable[0];
             let action = candidate.eligible_actions[0];
+            self.log_decision_trace(
+                "decision",
+                format!(
+                    "LLM skipped | {} has exactly one configured action: {}",
+                    candidate.anomaly_id,
+                    action.as_str(),
+                ),
+            );
             self.emit_action(
                 runtime,
                 candidate,
@@ -706,6 +822,22 @@ fn clip_chars(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max_chars).collect()
+}
+
+fn trace_text(input: &str) -> String {
+    let mut output = String::new();
+    for character in input.chars().take(1_000) {
+        match character {
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                output.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output
 }
 
 #[async_trait]
@@ -933,6 +1065,14 @@ mod tests {
                 "preface {\"anomaly_id\":\"mode_invalid\",\"action_id\":\"point_nadir\",\"reason\":\"x\",\"evidence_paths\":[\"telemetry.mode\"]}"
             )
             .is_err());
+    }
+
+    #[test]
+    fn decision_trace_text_is_single_line_and_bounded() {
+        let input = format!("line one\nline two\t{}", "x".repeat(1_000));
+        let trace = trace_text(&input);
+        assert_eq!(trace, format!("line one\\nline two\\t{}", "x".repeat(982)));
+        assert!(!trace.contains('\n'));
     }
 
     #[test]
