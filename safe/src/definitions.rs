@@ -283,6 +283,7 @@ impl Expr {
 pub enum Activation {
     Immediate(Expr),
     Hysteretic { enter: Expr, exit: Expr },
+    Timed { condition: Expr, duration_secs: u64 },
     // TODO: Implement some form of interrupt that can break out of any other mode, even if hysteretic and exit criteria not met
     // Requirement: Don't let Modes filibuster
     // TODO: Add hysteresis based on time, possible via a built in Variable of elapsed_time_active_s

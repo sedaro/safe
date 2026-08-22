@@ -563,6 +563,44 @@ fn recalc_hysteretic_mode_holds_until_exit_true() {
 }
 
 #[test]
+fn recalc_timed_activation_expires_and_requires_condition_clear() {
+    let mut f = mk_flight();
+    f.set_autonomy_modes(vec![mode_meta(1, 1, true), mode_meta(2, 10, true)]);
+    f.set_autonomy_mode_activations(vec![
+        AutonomyModeActivation {
+            id: mk_mode_id(1),
+            activation: None,
+        },
+        AutonomyModeActivation {
+            id: mk_mode_id(2),
+            activation: Some(Activation::Timed {
+                condition: flag_true_expr(),
+                duration_secs: 1,
+            }),
+        },
+    ]);
+
+    f.note_telemetry(&telemetry_with_flag(true));
+    f.recalculate_active_autonomy_mode_at(0);
+    assert_eq!(f.get_active_autonomy_mode(), Some(mk_mode_id(2)));
+
+    f.recalculate_active_autonomy_mode_at(999);
+    assert_eq!(f.get_active_autonomy_mode(), Some(mk_mode_id(2)));
+
+    f.recalculate_active_autonomy_mode_at(1000);
+    assert_eq!(f.get_active_autonomy_mode(), Some(mk_mode_id(1)));
+
+    f.recalculate_active_autonomy_mode_at(2000);
+    assert_eq!(f.get_active_autonomy_mode(), Some(mk_mode_id(1)));
+
+    f.note_telemetry(&telemetry_with_flag(false));
+    f.recalculate_active_autonomy_mode_at(3000);
+    f.note_telemetry(&telemetry_with_flag(true));
+    f.recalculate_active_autonomy_mode_at(3000);
+    assert_eq!(f.get_active_autonomy_mode(), Some(mk_mode_id(2)));
+}
+
+#[test]
 fn recalc_manual_override_pins_until_cleared() {
     let mut f = mk_flight();
     f.set_autonomy_modes(vec![mode_meta(1, 1, true), mode_meta(2, 10, true)]);
