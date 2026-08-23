@@ -34,7 +34,6 @@ impl StatisticalDistribution<f64> for NormalDistribution {
 pub struct GuassianSet {
     pub values: Vec<f64>,
 }
-// TODO: Brad to review
 impl GuassianSet {
     pub fn new() -> Self {
         GuassianSet { values: Vec::new() }
