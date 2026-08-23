@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "domains": [
+        "github.com"
+      ],
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "path_overrides": [
+        { "path": "/sedaro/safe.git/git-upload-pack", "methods": ["GET", "HEAD", "POST"] },
+        { "path": "/sedaro/safe.git/git-receive-pack", "methods": ["GET", "HEAD", "POST"] }
+      ]
+    },
+    {
+      "domains": [
+        "*.nixos.org",
+        "*.githubusercontent.com",
+        "*.github.com",
+        "github.com",
+        "*.crates.io",
+        "*.rust-lang.org",
+        "pypi.org",
+        "*.pypi.org",
+        "files.pythonhosted.org",
+        "*.pythonhosted.org",
+        "registry.npmjs.org",
+        "*.npmjs.org",
+        "registry.yarnpkg.com",
+        "*.yarnpkg.com",
+        "google.com",
+        "*.google.com"
+      ],
+      "methods": [
+        "GET",
+        "HEAD"
+      ]
+    },
+    {
+      "domains": [
+        "*.openai.com"
+      ],
+      "methods": [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "TRACE",
+        "CONNECT"
+      ]
+    }
+  ],
+  "auth_by_domain": {
+    "github.com": [
+      {
+        "runtime_env": "GITHUB_GIT_TOKEN_ENC",
+        "source_env": "GITHUB_PAT_ENC",
+        "inject_header": "Authorization",
+        "header_prefix": "Basic ",
+        "header_encoding": "base64"
+      },
+      {
+        "runtime_env": "GITHUB_TOKEN",
+        "source_env": "GITHUB_PAT",
+        "inject_header": "Authorization",
+        "header_prefix": "Bearer "
+      }
+    ],
+    "api.openai.com": [
+      {
+        "runtime_env": "OPENAI_API_KEY",
+        "source_env": "OPENAI_API_KEY",
+        "inject_header": "Authorization",
+        "header_prefix": "Bearer "
+      }
+    ]
+  }
+}
