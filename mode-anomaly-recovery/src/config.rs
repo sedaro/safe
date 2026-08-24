@@ -239,10 +239,10 @@ pub(crate) struct LlmAdvisorModeConfig {
 impl LlmAdvisorModeConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.nominal_profiles.is_empty() {
-            bail!("llm advisor requires at least one nominal profile");
+            bail!("anomaly recovery requires at least one nominal profile");
         }
         if self.action_catalog.is_empty() {
-            bail!("llm advisor requires an action_catalog");
+            bail!("anomaly recovery requires an action_catalog");
         }
         if self.request_timeout_ms == 0 {
             bail!("request_timeout_ms must be greater than zero");

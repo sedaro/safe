@@ -487,7 +487,7 @@ impl ElectronicWarfareMode {
             .patch_multi(patches);
         let workspace = simulator.workspace_dir().with_context(|| {
             format!(
-                "failed to resolve electronic-warfare EDS workspace from '{}'",
+                "failed to resolve coorbital-evasion EDS workspace from '{}'",
                 self.config.eds_path.display()
             )
         })?;
@@ -496,7 +496,7 @@ impl ElectronicWarfareMode {
             .await
             .with_context(|| {
                 format!(
-                    "electronic-warfare simulation failed (workspace='{}')",
+                    "coorbital-evasion simulation failed (workspace='{}')",
                     workspace.display()
                 )
             })?;
