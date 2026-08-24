@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{PathBuf, absolute};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep, timeout};
@@ -19,11 +19,21 @@ use crate::transports::{Transport, UnixTransport};
 use crate::{AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, ModeToSafe, SafeToMode};
 use crate::{BoardState, RuntimePaths};
 
+pub fn canonical_path<'de, D>(de: D) -> std::result::Result<PathBuf, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = PathBuf::deserialize(de)?;
+    std::fs::canonicalize(&raw)
+        .map_err(|e| serde::de::Error::custom(format!("{}: {e}", raw.display())))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutonomyModeConfig {
     pub id: AutonomyModeId,
     pub priority: u8,
     pub enabled: bool,
+    #[serde(deserialize_with = "canonical_path")]
     pub bin_path: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
