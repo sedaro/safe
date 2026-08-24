@@ -20,6 +20,7 @@ Useful focused commands are:
 ```bash
 cargo test -p safe
 cargo test -p safectl
+cargo test -p safe-llm-adapter
 cargo test -p safe-time
 cargo test -p mode-anomaly-recovery
 cargo test -p mode-anomaly-recovery --test static_profile_integration

@@ -19,7 +19,7 @@ exists in the checkout from planned work and known limitations.
   external gatekeeper JSONL integration.
 - Local `safectl` JSONL ingress and operational status files.
 - Static nominal-profile LLM advisor with deterministic single-action behavior,
-  constrained Ollama decisions, and integration tests.
+  constrained pluggable-adapter decisions, and integration tests.
 - GPS, UTC, MJD, leap-table, and Euler-213 quaternion utilities.
 
 ## Partial or Demonstration-Only
