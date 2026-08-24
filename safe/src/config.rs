@@ -186,7 +186,7 @@ impl Default for SerializedDefaults {
                 external_gatekeeper_command: None,
             },
             base_paths: BasePathsConfigDefaults {
-                base_working_directory: "/opt/safe".into(),
+                base_working_directory: "/tmp/safe".into(),
                 base_writable_directory: "/tmp/safe".into(),
             },
             gatekeeper: default_gatekeeper_config(),

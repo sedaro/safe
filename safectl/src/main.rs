@@ -305,7 +305,7 @@ fn default_runtime_config_path() -> String {
     if cwd_candidate.exists() {
         return cwd_candidate.to_string_lossy().to_string();
     }
-    "/opt/safe/safe.yaml".to_string()
+    "/tmp/safe/safe.yaml".to_string()
 }
 
 fn resolve_runtime_config_path() -> String {
@@ -319,7 +319,7 @@ fn default_mode_config_path() -> String {
     if cwd_candidate.exists() {
         return cwd_candidate.to_string_lossy().to_string();
     }
-    "/opt/safe/autonomy_mode_config.json".to_string()
+    "/tmp/safe/autonomy_mode_config.json".to_string()
 }
 
 async fn load_runtime_config() -> anyhow::Result<RuntimeConfigView> {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -275,6 +275,7 @@ pub struct SafeTEA {
     runtime_config_contents: String,
     status_tick: time::Interval,
     summary: SafeTEASummary,
+    activation_clock_start: Instant,
 }
 
 fn default_true() -> bool {
@@ -387,6 +388,14 @@ impl AutonomyModeRuntimeConfig {
             if !seen_names.insert(config.name.clone()) {
                 anyhow::bail!("Duplicate autonomy mode name found: {}", config.name);
             }
+            if let Some(Activation::Timed { duration_secs, .. }) = &config.activation
+                && *duration_secs == 0
+            {
+                anyhow::bail!(
+                    "Timed activation for {} must have duration_secs > 0",
+                    config.name
+                );
+            }
             info!("Autonomy mode: {config:?}");
             let id = AutonomyModeRuntimeConfig::mode_id_from_name(&config.name);
             mode_meta.push(AutonomyModeMeta {
@@ -458,7 +467,8 @@ impl SafeTEA {
                             self.flight.note_telemetry(t);
                             self.latest_telemetry = Some(t.clone());
                             let previous_active = self.flight.get_active_autonomy_mode();
-                            self.flight.recalculate_active_autonomy_mode();
+                            self.flight
+                                .recalculate_active_autonomy_mode_at(self.activation_now_ms());
                             if let Some(router) = self.router.as_mut() {
                                 router
                                     .set_active(
@@ -599,6 +609,7 @@ impl SafeTEA {
             runtime_config_contents,
             status_tick: time::interval(Duration::from_secs(1)),
             summary,
+            activation_clock_start: Instant::now(),
         };
 
         safetea
@@ -634,6 +645,10 @@ impl SafeTEA {
             .expect("write initial status");
 
         safetea
+    }
+
+    fn activation_now_ms(&self) -> u64 {
+        self.activation_clock_start.elapsed().as_millis() as u64
     }
 
     pub async fn send_board_snapshot_to_all(&mut self) {
@@ -1078,7 +1093,7 @@ impl SafeTEA {
 
                                     self.flight.set_autonomy_modes(new_meta);
                                     self.flight.set_autonomy_mode_activations(new_activations);
-                                    self.flight.recalculate_active_autonomy_mode();
+                                    self.flight.recalculate_active_autonomy_mode_at(self.activation_now_ms());
                                     if let Some(router) = self.router.as_ref() {
                                         router.set_active(None, self.flight.get_active_autonomy_mode()).await;
                                         router.send_board_snapshot_to_all(self.board.clone()).await;
@@ -1222,7 +1237,9 @@ impl SafeTEA {
                 if let Msg::TelemetryReceived(t) = &ev.msg {
                     self.flight.note_telemetry(t);
                     self.latest_telemetry = Some(t.clone());
-                    let previous_active = self.flight.recalculate_active_autonomy_mode();
+                    let previous_active = self
+                        .flight
+                        .recalculate_active_autonomy_mode_at(self.activation_now_ms());
                     if let Some(router) = self.router.as_ref() {
                         router
                             .set_active(previous_active, self.flight.get_active_autonomy_mode())
@@ -1328,7 +1345,9 @@ impl SafeTEA {
                                         self.flight.clear_active_autonomy_mode();
                                     }
                                     let previous = self.flight.get_active_autonomy_mode();
-                                    self.flight.recalculate_active_autonomy_mode();
+                                    self.flight.recalculate_active_autonomy_mode_at(
+                                        self.activation_now_ms(),
+                                    );
                                     router
                                         .set_active(
                                             previous,
@@ -1378,7 +1397,9 @@ impl SafeTEA {
                                         self.flight.clear_active_autonomy_mode();
                                     }
                                     let previous = self.flight.get_active_autonomy_mode();
-                                    self.flight.recalculate_active_autonomy_mode();
+                                    self.flight.recalculate_active_autonomy_mode_at(
+                                        self.activation_now_ms(),
+                                    );
                                     router
                                         .set_active(
                                             previous,
