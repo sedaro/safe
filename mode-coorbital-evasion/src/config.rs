@@ -14,7 +14,7 @@ pub(crate) type GroundThreatLocation = [f64; 3];
 pub(crate) type SpaceThreatEpochState = (f64, [f64; 3], [f64; 3]);
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ElectronicWarfareModeConfig {
+pub(crate) struct CoorbitalEvasionModeConfig {
     #[serde(default)]
     pub(crate) eds_path: PathBuf,
     #[serde(default = "default_gnc_time_step_limits")]
@@ -84,7 +84,7 @@ pub(crate) struct ElectronicWarfareModeConfig {
     pub(crate) sun_yaw_mode_id: String,
 }
 
-impl Default for ElectronicWarfareModeConfig {
+impl Default for CoorbitalEvasionModeConfig {
     fn default() -> Self {
         Self {
             eds_path: PathBuf::new(),
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn redesigned_defaults_use_separate_pointing_schedule_fields() {
-        let config = ElectronicWarfareModeConfig::default();
+        let config = CoorbitalEvasionModeConfig::default();
         assert_eq!(config.fov_half_angle_deg, 30.0);
         assert_eq!(config.fov_guard_angle_deg, 1.0);
         assert_eq!(config.max_slew_rate_rad_s, 0.010_472);

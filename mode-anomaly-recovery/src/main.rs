@@ -4,10 +4,10 @@ mod types;
 
 use safe::mode_runtime::run_mode;
 
-use crate::config::LlmAdvisorModeConfig;
-use crate::types::LlmAdvisorMode;
+use crate::config::AnomalyRecoveryModeConfig;
+use crate::types::AnomalyRecoveryMode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_mode::<LlmAdvisorModeConfig, _>(LlmAdvisorMode::new()).await
+    run_mode::<AnomalyRecoveryModeConfig, _>(AnomalyRecoveryMode::new()).await
 }

@@ -6,7 +6,7 @@ use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
 use safe_telemetry::model::Telemetry;
 
 use crate::types::{
-    ElectronicWarfareMode, ElectronicWarfarePlan, GeometrySample, ModelCommand, ModeledTarget,
+    CoorbitalEvasionMode, CoorbitalEvasionPlan, GeometrySample, ModelCommand, ModeledTarget,
     PlanningOutcome, PointingTarget, ScheduleScore, ScheduledPointing, UnsafePeriod,
 };
 
@@ -548,7 +548,7 @@ fn lift_commands(samples: &[GeometrySample], commands: &[ModelCommand]) -> Vec<S
     result
 }
 
-impl ElectronicWarfareMode {
+impl CoorbitalEvasionMode {
     fn validate_config(&self) -> anyhow::Result<()> {
         if self.config.threat_ids.is_empty() {
             anyhow::bail!("mode_config.threat_ids must contain at least one threat ID");
@@ -707,7 +707,7 @@ impl ElectronicWarfareMode {
             fov_half_angle_rad,
         );
 
-        Ok(PlanningOutcome::Schedule(ElectronicWarfarePlan {
+        Ok(PlanningOutcome::Schedule(CoorbitalEvasionPlan {
             earliest_command_mjd: baseline[earliest].time_mjd,
             horizon_end_mjd,
             commands,

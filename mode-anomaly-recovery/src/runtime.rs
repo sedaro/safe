@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::config::{AllowedAction, LlmAdvisorModeConfig, NominalRule, NominalRuleKind};
-use crate::types::{AnomalyCandidate, LlmAdvisorMode, TelemetrySample};
+use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 #[derive(Debug, Clone, Serialize)]
 struct DecisionEnvelope {
@@ -64,7 +64,7 @@ enum RuleEvaluation {
     Invalid(String),
 }
 
-impl LlmAdvisorMode {
+impl AnomalyRecoveryMode {
     fn log_decision_trace(&self, stage: &str, detail: impl std::fmt::Display) {
         if self.config.decision_trace {
             let detail = trace_text(&detail.to_string());
@@ -841,8 +841,8 @@ fn trace_text(input: &str) -> String {
 }
 
 #[async_trait]
-impl ModeHandler<LlmAdvisorModeConfig> for LlmAdvisorMode {
-    fn set_config(&mut self, config: LlmAdvisorModeConfig) -> Result<()> {
+impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
+    fn set_config(&mut self, config: AnomalyRecoveryModeConfig) -> Result<()> {
         config.validate()?;
         info!(
             host = %config.ollama_host,
@@ -938,9 +938,9 @@ mod tests {
     const PROFILE_FIXTURE: &str = include_str!("../testdata/static_nominal_profile.json");
     const TELEMETRY_FIXTURE: &str = include_str!("../testdata/static_nominal_telemetry.jsonl");
 
-    fn configured_mode() -> LlmAdvisorMode {
+    fn configured_mode() -> AnomalyRecoveryMode {
         let config = serde_json::from_str(PROFILE_FIXTURE).expect("fixture should parse");
-        let mut mode = LlmAdvisorMode::new();
+        let mut mode = AnomalyRecoveryMode::new();
         mode.set_config(config).expect("fixture should validate");
         mode
     }

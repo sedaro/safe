@@ -11,13 +11,13 @@ use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd, utc_mjd_to_gps};
 use safe_telemetry::model::Telemetry;
 use tracing::{debug, info, warn};
 
-use crate::config::ElectronicWarfareModeConfig;
+use crate::config::CoorbitalEvasionModeConfig;
 use crate::types::{
-    ElectronicWarfareMode, ElectronicWarfarePlan, PlanningOutcome, PointingTarget,
+    CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget,
     ScheduledPointing,
 };
 
-impl ElectronicWarfareMode {
+impl CoorbitalEvasionMode {
     fn can_replan_now(&self) -> bool {
         self.last_replan_start
             .map(|last| last.elapsed() >= Duration::from_secs(self.config.min_replan_interval_secs))
@@ -73,7 +73,7 @@ impl ElectronicWarfareMode {
         )
     }
 
-    fn selected_target_at(plan: &ElectronicWarfarePlan, time_mjd: f64) -> Option<&PointingTarget> {
+    fn selected_target_at(plan: &CoorbitalEvasionPlan, time_mjd: f64) -> Option<&PointingTarget> {
         plan.commands
             .iter()
             .take_while(|command| command.time_mjd <= time_mjd)
@@ -84,7 +84,7 @@ impl ElectronicWarfareMode {
     fn reconciliation_actions(
         &self,
         mode_id: AutonomyModeId,
-        plan: &ElectronicWarfarePlan,
+        plan: &CoorbitalEvasionPlan,
     ) -> (Vec<BoardCmdId>, Vec<ScheduledPointing>) {
         let mut cancel = Vec::new();
         for (id, (from, timed_command, _ts_mono)) in &self.latest_board_snapshot.proposals {
@@ -142,7 +142,7 @@ impl ElectronicWarfareMode {
     async fn emit_plan(
         &self,
         runtime: &mut ModeRuntime,
-        plan: &ElectronicWarfarePlan,
+        plan: &CoorbitalEvasionPlan,
     ) -> anyhow::Result<()> {
         let (cancel, propose) = self.reconciliation_actions(runtime.mode_id(), plan);
         for id in &cancel {
@@ -226,14 +226,14 @@ impl ElectronicWarfareMode {
             return;
         }
         if self.config.eds_path.as_os_str().is_empty() {
-            warn!("ElectronicWarfare mode_config.eds_path is not configured; simulation disabled");
+            warn!("CoorbitalEvasion mode_config.eds_path is not configured; simulation disabled");
         }
         if self.config.field_of_view_id.is_empty() {
-            warn!("ElectronicWarfare mode_config.field_of_view_id is empty");
+            warn!("CoorbitalEvasion mode_config.field_of_view_id is empty");
         }
         if self.config.threat_ids.is_empty() {
             warn!(
-                "ElectronicWarfare mode_config.threat_ids is empty; no threats will be evaluated"
+                "CoorbitalEvasion mode_config.threat_ids is empty; no threats will be evaluated"
             );
         }
         self.warned_missing_config = true;
@@ -251,8 +251,8 @@ impl ElectronicWarfareMode {
 }
 
 #[async_trait]
-impl ModeHandler<ElectronicWarfareModeConfig> for ElectronicWarfareMode {
-    fn set_config(&mut self, config: ElectronicWarfareModeConfig) -> anyhow::Result<()> {
+impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
+    fn set_config(&mut self, config: CoorbitalEvasionModeConfig) -> anyhow::Result<()> {
         self.config = config;
         self.latest_board_snapshot = AutonomyModeBoardState::default();
         self.has_board_snapshot = false;
@@ -320,8 +320,8 @@ mod tests {
     use super::*;
     use crate::types::{ScheduleScore, ValidationReport};
 
-    fn plan(commands: Vec<ScheduledPointing>) -> ElectronicWarfarePlan {
-        ElectronicWarfarePlan {
+    fn plan(commands: Vec<ScheduledPointing>) -> CoorbitalEvasionPlan {
+        CoorbitalEvasionPlan {
             earliest_command_mjd: 60_000.0,
             horizon_end_mjd: 60_001.0,
             commands,
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn quaternion_equivalence_is_sign_invariant() {
-        let mode = ElectronicWarfareMode::new();
+        let mode = CoorbitalEvasionMode::new();
         let target = PointingTarget::Quaternion(UnitQuaternion::identity());
         assert!(mode.command_matches_target(
             &Command::PointQuaternion {
@@ -374,7 +374,7 @@ mod tests {
     fn reconciliation_cancels_conflicts_and_obsolete_own_proposals_only() {
         let own = AutonomyModeId(Uuid::nil());
         let other = AutonomyModeId(Uuid::new_v4());
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         add_board_command(
             &mut board,
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn reconciliation_does_not_repropose_equivalent_nadir() {
         let own = AutonomyModeId(Uuid::nil());
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         add_board_command(
             &mut board,
@@ -453,7 +453,7 @@ mod tests {
     fn reconciliation_preserves_redundant_accepted_target() {
         let own = AutonomyModeId(Uuid::nil());
         let other = AutonomyModeId(Uuid::new_v4());
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         add_board_command(
             &mut board,
@@ -478,7 +478,7 @@ mod tests {
     fn unrelated_pending_proposal_does_not_suppress_emission() {
         let own = AutonomyModeId(Uuid::nil());
         let other = AutonomyModeId(Uuid::new_v4());
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         add_board_command(
             &mut board,

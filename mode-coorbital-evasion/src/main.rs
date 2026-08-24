@@ -6,10 +6,10 @@ mod types;
 
 use safe::mode_runtime::run_mode;
 
-use crate::config::ElectronicWarfareModeConfig;
-use crate::types::ElectronicWarfareMode;
+use crate::config::CoorbitalEvasionModeConfig;
+use crate::types::CoorbitalEvasionMode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_mode::<ElectronicWarfareModeConfig, _>(ElectronicWarfareMode::new()).await
+    run_mode::<CoorbitalEvasionModeConfig, _>(CoorbitalEvasionMode::new()).await
 }

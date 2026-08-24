@@ -1,4 +1,4 @@
-# LLM Advisor Static Nominal Profiles
+# Anomaly Recovery Static Nominal Profiles
 
 `mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
 configured static nominal profiles locally and emits profile-backed commands.
@@ -143,13 +143,13 @@ trace says so. This `mode_config` is a compact local-demo example:
 }
 ```
 
-Place that object inside an enabled outer mode entry named `LlmAdvisorDemo`
+Place that object inside an enabled outer mode entry named `AnomalyRecoveryDemo`
 (with `bin_path` set to `../target/debug/mode_anomaly_recovery`), build it, and run
 SAFE as usual. In a second terminal, follow only the trace:
 
 ```bash
 cargo build -p mode-anomaly-recovery
-cargo run -p safectl -- logs --mode-name LlmAdvisorDemo --follow --filter "LLM DEMO"
+cargo run -p safectl -- logs --mode-name AnomalyRecoveryDemo --follow --filter "LLM DEMO"
 ```
 
 Then send a source-bearing frame that violates both rules:
@@ -229,7 +229,7 @@ A minimal outer SAFE mode entry is:
 ```json
 [
   {
-    "name": "LlmAdvisorExample",
+    "name": "AnomalyRecoveryExample",
     "priority": 10,
     "enabled": false,
     "bin_path": "../target/debug/mode_anomaly_recovery",
