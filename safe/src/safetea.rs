@@ -20,7 +20,7 @@ use crate::platform::gatekeeper::{
 };
 use crate::platform::{BoardPublicationStatus, spawn_platform_egress, spawn_platform_ingress};
 use crate::router::AutonomyModeConfig;
-use crate::router::Router;
+use crate::router::{Router, canonical_path};
 use crate::runtime::{
     BoardCommandState, BoardCommandStatus, DaemonStatus, ModeOperationalStatus, OperationalStatus,
     TelemetryStatus, TelemetryStatusFrame,
@@ -294,6 +294,7 @@ pub(crate) struct AutonomyModeRuntimeConfig {
     priority: u8,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(deserialize_with = "canonical_path")]
     bin_path: PathBuf,
     #[serde(default)]
     args: Vec<String>,
@@ -409,15 +410,11 @@ impl AutonomyModeRuntimeConfig {
                 activation: config.activation.clone(),
             });
             if config.enabled {
-                let bin_path = match config_base_dir {
-                    Some(base) => resolve_path_from_base(base, &config.bin_path),
-                    None => config.bin_path.clone(),
-                };
                 mode_configs.push(AutonomyModeConfig {
                     id,
                     priority: config.priority,
                     enabled: config.enabled,
-                    bin_path,
+                    bin_path: config.bin_path.clone(),
                     args: config.args,
                     sandbox_resources: config.sandbox_resources,
                     persist_work_dir: config.persist_work_dir,

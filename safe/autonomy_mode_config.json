@@ -3,7 +3,7 @@
     "name": "LlmAdvisor",
     "priority": 2,
     "enabled": true,
-    "bin_path": "../target/debug/mode_llm_advisor",
+    "bin_path": "target/debug/mode_llm_advisor",
     "args": [],
     "sandbox_resources": {
       "cpu": 250.0,
