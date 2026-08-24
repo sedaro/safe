@@ -6,6 +6,7 @@ use std::sync::{
 };
 
 use safe::protocol::AutonomyModeBoardState;
+use safe_llm_adapter::{AdapterRegistry, LlmAdapter};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -39,6 +40,8 @@ pub(crate) struct RuleState {
 
 pub(crate) struct AnomalyRecoveryMode {
     pub(crate) config: AnomalyRecoveryModeConfig,
+    pub(crate) adapter_registry: AdapterRegistry,
+    pub(crate) adapter: Option<Box<dyn LlmAdapter>>,
     pub(crate) latest_telemetry: Option<TelemetrySample>,
     pub(crate) current_candidates: Vec<AnomalyCandidate>,
     pub(crate) rule_states: HashMap<String, RuleState>,
@@ -52,9 +55,11 @@ pub(crate) struct AnomalyRecoveryMode {
 }
 
 impl AnomalyRecoveryMode {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(adapter_registry: AdapterRegistry) -> Self {
         Self {
             config: AnomalyRecoveryModeConfig::default(),
+            adapter_registry,
+            adapter: None,
             latest_telemetry: None,
             current_candidates: Vec::new(),
             rule_states: HashMap::new(),
