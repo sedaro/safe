@@ -1,6 +1,6 @@
-# LLM Advisor Static Nominal Profiles
+# Anomaly Recovery Static Nominal Profiles
 
-`mode-llm-advisor` is an out-of-process SAFE autonomy mode. It evaluates
+`mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
 configured static nominal profiles locally and emits profile-backed commands.
 It contacts Ollama only when local evaluation leaves more than one actionable
 choice.
@@ -143,13 +143,13 @@ trace says so. This `mode_config` is a compact local-demo example:
 }
 ```
 
-Place that object inside an enabled outer mode entry named `LlmAdvisorDemo`
-(with `bin_path` set to `../target/debug/mode_llm_advisor`), build it, and run
+Place that object inside an enabled outer mode entry named `AnomalyRecoveryDemo`
+(with `bin_path` set to `../target/debug/mode_anomaly_recovery`), build it, and run
 SAFE as usual. In a second terminal, follow only the trace:
 
 ```bash
-cargo build -p mode-llm-advisor
-cargo run -p safectl -- logs --mode-name LlmAdvisorDemo --follow --filter "LLM DEMO"
+cargo build -p mode-anomaly-recovery
+cargo run -p safectl -- logs --mode-name AnomalyRecoveryDemo --follow --filter "LLM DEMO"
 ```
 
 Then send a source-bearing frame that violates both rules:
@@ -229,10 +229,10 @@ A minimal outer SAFE mode entry is:
 ```json
 [
   {
-    "name": "LlmAdvisorExample",
+    "name": "AnomalyRecoveryExample",
     "priority": 10,
     "enabled": false,
-    "bin_path": "../target/debug/mode_llm_advisor",
+    "bin_path": "../target/debug/mode_anomaly_recovery",
     "args": [],
     "sandbox_resources": {
       "cpu": 25.0,
@@ -271,7 +271,7 @@ A minimal outer SAFE mode entry is:
 
 The path is relative to `safe/autonomy_mode_config.json` when that is the
 configuration file. Build the binary first with
-`cargo build -p mode-llm-advisor`. The example is disabled intentionally; enable
+`cargo build -p mode-anomaly-recovery`. The example is disabled intentionally; enable
 it only after configuring a gatekeeper and mission-approved limits.
 
 For a source-bearing telemetry frame through `safectl`, use a direct telemetry
@@ -294,5 +294,5 @@ The generic fixtures are:
 Run the advisor unit and integration tests with:
 
 ```bash
-cargo test -p mode-llm-advisor
+cargo test -p mode-anomaly-recovery
 ```

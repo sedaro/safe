@@ -4,7 +4,7 @@ use nalgebra::{UnitQuaternion, Vector3};
 use safe::protocol::AutonomyModeBoardState;
 use safe_telemetry::model::Telemetry;
 
-use crate::config::ElectronicWarfareModeConfig;
+use crate::config::CoorbitalEvasionModeConfig;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ThreatGeometry {
@@ -77,7 +77,7 @@ pub(crate) struct ValidationReport {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ElectronicWarfarePlan {
+pub(crate) struct CoorbitalEvasionPlan {
     pub(crate) earliest_command_mjd: f64,
     pub(crate) horizon_end_mjd: f64,
     pub(crate) commands: Vec<ScheduledPointing>,
@@ -88,11 +88,11 @@ pub(crate) struct ElectronicWarfarePlan {
 #[derive(Debug, Clone)]
 pub(crate) enum PlanningOutcome {
     NoBoardChange,
-    Schedule(ElectronicWarfarePlan),
+    Schedule(CoorbitalEvasionPlan),
 }
 
-pub(crate) struct ElectronicWarfareMode {
-    pub(crate) config: ElectronicWarfareModeConfig,
+pub(crate) struct CoorbitalEvasionMode {
+    pub(crate) config: CoorbitalEvasionModeConfig,
     pub(crate) latest_telemetry: Option<Telemetry>,
     pub(crate) latest_board_snapshot: AutonomyModeBoardState,
     pub(crate) has_board_snapshot: bool,
@@ -100,10 +100,10 @@ pub(crate) struct ElectronicWarfareMode {
     pub(crate) warned_missing_config: bool,
 }
 
-impl ElectronicWarfareMode {
+impl CoorbitalEvasionMode {
     pub(crate) fn new() -> Self {
         Self {
-            config: ElectronicWarfareModeConfig::default(),
+            config: CoorbitalEvasionModeConfig::default(),
             latest_telemetry: None,
             latest_board_snapshot: AutonomyModeBoardState::default(),
             has_board_snapshot: false,

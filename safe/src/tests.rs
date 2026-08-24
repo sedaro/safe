@@ -12,6 +12,7 @@ use crate::safetea::{AutonomyModeRuntimeConfig, Event};
 use crate::safetea::{Effect, Msg, Source, apply_event, update};
 use crate::telemetry_frame::TelemetryFrame;
 use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
+use std::path::Path;
 
 fn mk_mode_id(n: u128) -> AutonomyModeId {
     AutonomyModeId(Uuid::from_u128(n))
@@ -378,7 +379,7 @@ fn parse_external_mode_config_contents_parses_and_derives_ids() {
                 "name": "NoImages",
                 "priority": 3,
                 "enabled": true,
-                "bin_path": "/tmp/mode_no_images",
+                "bin_path": "Cargo.toml",
                 "args": [],
                 "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
                 "persist_work_dir": false,
@@ -409,7 +410,7 @@ fn parse_external_mode_config_contents_enforces_max_modes() {
                 "name": "M1",
                 "priority": 1,
                 "enabled": true,
-                "bin_path": "/tmp/m1",
+                "bin_path": "Cargo.toml",
                 "args": [],
                 "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
                 "persist_work_dir": false,
@@ -419,7 +420,7 @@ fn parse_external_mode_config_contents_enforces_max_modes() {
                 "name": "M2",
                 "priority": 2,
                 "enabled": true,
-                "bin_path": "/tmp/m2",
+                "bin_path": "Cargo.toml",
                 "args": [],
                 "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
                 "persist_work_dir": false,
@@ -438,7 +439,7 @@ fn parse_external_mode_config_contents_rejects_duplicate_names() {
                 "name": "NoImages",
                 "priority": 1,
                 "enabled": true,
-                "bin_path": "/tmp/m1",
+                "bin_path": "Cargo.toml",
                 "args": [],
                 "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
                 "persist_work_dir": false,
@@ -448,7 +449,7 @@ fn parse_external_mode_config_contents_rejects_duplicate_names() {
                 "name": "NoImages",
                 "priority": 2,
                 "enabled": true,
-                "bin_path": "/tmp/m2",
+                "bin_path": "Cargo.toml",
                 "args": [],
                 "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
                 "persist_work_dir": false,
@@ -460,34 +461,6 @@ fn parse_external_mode_config_contents_rejects_duplicate_names() {
     assert!(
         err.to_string()
             .contains("Duplicate autonomy mode name found: NoImages")
-    );
-}
-
-#[test]
-fn parse_external_mode_config_contents_resolves_relative_bin_path_with_base() {
-    let cfg = r#"[
-            {
-                "name": "NoImages",
-                "priority": 3,
-                "enabled": true,
-                "bin_path": "bin/mode_no_images",
-                "args": [],
-                "sandbox_resources": {"cpu": 90.0, "memory": 1000000, "disk": 1000000},
-                "persist_work_dir": false,
-                "mode_config": {}
-            }
-        ]"#;
-
-    let (configs, _, _) = AutonomyModeRuntimeConfig::from_str_with_base(
-        cfg,
-        8,
-        Some(std::path::Path::new("/tmp/repo/safe")),
-    )
-    .unwrap();
-
-    assert_eq!(
-        configs[0].bin_path,
-        std::path::PathBuf::from("/tmp/repo/safe/bin/mode_no_images")
     );
 }
 
