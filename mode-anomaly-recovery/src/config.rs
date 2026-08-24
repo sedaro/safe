@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use anyhow::{Result, anyhow, bail};
+use safe_llm_adapter::AdapterSelection;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -199,25 +201,61 @@ pub(crate) struct NominalProfile {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnomalyRecoveryModeConfig {
-    #[serde(default = "default_ollama_host")]
-    pub(crate) ollama_host: String,
-    #[serde(default = "default_ollama_port")]
-    pub(crate) ollama_port: u16,
-    #[serde(default = "default_ollama_path")]
-    pub(crate) ollama_path: String,
-    #[serde(default = "default_model")]
+pub(crate) struct LlmConfig {
+    pub(crate) adapter: AdapterSelection,
     pub(crate) model: String,
     #[serde(default = "default_request_timeout_ms")]
     pub(crate) request_timeout_ms: u64,
+    #[serde(default = "default_response_temperature")]
+    pub(crate) response_temperature: f64,
+    #[serde(default = "default_max_output_tokens")]
+    pub(crate) max_output_tokens: u32,
+}
+
+impl LlmConfig {
+    fn validate(&self) -> Result<()> {
+        if self.adapter.kind.trim().is_empty() {
+            bail!("llm.adapter.kind must not be empty");
+        }
+        if self.model.trim().is_empty() {
+            bail!("llm.model must not be empty");
+        }
+        if self.request_timeout_ms == 0 {
+            bail!("llm.request_timeout_ms must be greater than zero");
+        }
+        if !self.response_temperature.is_finite() || self.response_temperature < 0.0 {
+            bail!("llm.response_temperature must be finite and non-negative");
+        }
+        if self.max_output_tokens == 0 {
+            bail!("llm.max_output_tokens must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            adapter: AdapterSelection {
+                kind: "ollama".to_string(),
+                config: json!({"endpoint": "http://127.0.0.1:11434/api/generate"}),
+            },
+            model: default_model(),
+            request_timeout_ms: default_request_timeout_ms(),
+            response_temperature: default_response_temperature(),
+            max_output_tokens: default_max_output_tokens(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnomalyRecoveryModeConfig {
+    pub(crate) llm: LlmConfig,
     #[serde(default = "default_max_prompt_chars")]
     pub(crate) max_prompt_chars: usize,
     #[serde(default = "default_max_response_chars")]
     pub(crate) max_response_chars: usize,
-    #[serde(default = "default_response_temperature")]
-    pub(crate) response_temperature: f64,
-    #[serde(default = "default_num_predict")]
-    pub(crate) num_predict: u32,
     #[serde(default = "default_max_decision_attempts")]
     pub(crate) max_decision_attempts: u8,
     #[serde(default = "default_max_feedback_chars")]
@@ -244,17 +282,12 @@ impl AnomalyRecoveryModeConfig {
         if self.action_catalog.is_empty() {
             bail!("anomaly recovery requires an action_catalog");
         }
-        if self.request_timeout_ms == 0 {
-            bail!("request_timeout_ms must be greater than zero");
-        }
+        self.llm.validate()?;
         if self.max_prompt_chars == 0 || self.max_response_chars == 0 {
             bail!("prompt and response character limits must be greater than zero");
         }
-        if !self.response_temperature.is_finite() || self.response_temperature < 0.0 {
-            bail!("response_temperature must be finite and non-negative");
-        }
-        if self.num_predict == 0 || self.max_decision_attempts == 0 {
-            bail!("num_predict and max_decision_attempts must be greater than zero");
+        if self.max_decision_attempts == 0 {
+            bail!("max_decision_attempts must be greater than zero");
         }
 
         let mut action_ids = HashSet::new();
@@ -335,15 +368,9 @@ impl AnomalyRecoveryModeConfig {
 impl Default for AnomalyRecoveryModeConfig {
     fn default() -> Self {
         Self {
-            ollama_host: default_ollama_host(),
-            ollama_port: default_ollama_port(),
-            ollama_path: default_ollama_path(),
-            model: default_model(),
-            request_timeout_ms: default_request_timeout_ms(),
+            llm: LlmConfig::default(),
             max_prompt_chars: default_max_prompt_chars(),
             max_response_chars: default_max_response_chars(),
-            response_temperature: default_response_temperature(),
-            num_predict: default_num_predict(),
             max_decision_attempts: default_max_decision_attempts(),
             max_feedback_chars: default_max_feedback_chars(),
             require_board_snapshot: default_require_board_snapshot(),
@@ -371,18 +398,6 @@ fn default_min_consecutive_samples() -> usize {
     1
 }
 
-fn default_ollama_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_ollama_port() -> u16 {
-    11434
-}
-
-fn default_ollama_path() -> String {
-    "/api/generate".to_string()
-}
-
 fn default_model() -> String {
     "mistral:7b".to_string()
 }
@@ -403,7 +418,7 @@ fn default_response_temperature() -> f64 {
     0.0
 }
 
-fn default_num_predict() -> u32 {
+fn default_max_output_tokens() -> u32 {
     256
 }
 
@@ -434,6 +449,13 @@ mod tests {
 
     fn valid_config() -> AnomalyRecoveryModeConfig {
         serde_json::from_value(serde_json::json!({
+            "llm": {
+                "adapter": {
+                    "kind": "ollama",
+                    "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}
+                },
+                "model": "mistral:7b"
+            },
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
             ],
@@ -468,6 +490,13 @@ mod tests {
         assert!(!config.decision_trace);
 
         let config: AnomalyRecoveryModeConfig = serde_json::from_value(serde_json::json!({
+            "llm": {
+                "adapter": {
+                    "kind": "ollama",
+                    "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}
+                },
+                "model": "mistral:7b"
+            },
             "decision_trace": true,
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
@@ -516,5 +545,14 @@ mod tests {
         let mut config = valid_config();
         config.nominal_profiles[0].rules[0].eligible_actions = vec![AllowedAction::Noop];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_ollama_configuration() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/static_nominal_profile.json"))
+                .expect("fixture should parse");
+        value["ollama_host"] = serde_json::json!("127.0.0.1");
+        assert!(serde_json::from_value::<AnomalyRecoveryModeConfig>(value).is_err());
     }
 }

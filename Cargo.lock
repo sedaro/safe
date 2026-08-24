@@ -1228,8 +1228,8 @@ version = "1.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
- "reqwest",
  "safe",
+ "safe-llm-adapter",
  "serde",
  "serde_json",
  "tempfile",
@@ -1983,6 +1983,17 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "safe-llm-adapter"
+version = "1.2.3"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

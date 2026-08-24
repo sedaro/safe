@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "safe",
+    "safe-llm-adapter",
     "safe-time",
     "safectl",
     "mode-anomaly-recovery",
