@@ -4,7 +4,7 @@ use safe::protocol::AutonomyModeBoardState;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::{AllowedAction, AnomalySeverity, LlmAdvisorModeConfig};
+use crate::config::{AllowedAction, AnomalySeverity, AnomalyRecoveryModeConfig};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TelemetrySample {
@@ -32,8 +32,8 @@ pub(crate) struct RuleState {
     pub(crate) consecutive_violations: usize,
 }
 
-pub(crate) struct LlmAdvisorMode {
-    pub(crate) config: LlmAdvisorModeConfig,
+pub(crate) struct AnomalyRecoveryMode {
+    pub(crate) config: AnomalyRecoveryModeConfig,
     pub(crate) latest_telemetry: Option<TelemetrySample>,
     pub(crate) current_candidates: Vec<AnomalyCandidate>,
     pub(crate) rule_states: HashMap<String, RuleState>,
@@ -43,10 +43,10 @@ pub(crate) struct LlmAdvisorMode {
     pub(crate) warned_missing_board_snapshot: bool,
 }
 
-impl LlmAdvisorMode {
+impl AnomalyRecoveryMode {
     pub(crate) fn new() -> Self {
         Self {
-            config: LlmAdvisorModeConfig::default(),
+            config: AnomalyRecoveryModeConfig::default(),
             latest_telemetry: None,
             current_candidates: Vec::new(),
             rule_states: HashMap::new(),

@@ -11,14 +11,14 @@ use simvm::sv::combine::TRD;
 use simvm::sv::data::Data;
 
 use crate::types::{
-    EdsPointingSchedule, ElectronicWarfareMode, GeometrySample, ModeScheduleEntry, PointingTarget,
+    EdsPointingSchedule, CoorbitalEvasionMode, GeometrySample, ModeScheduleEntry, PointingTarget,
     QuaternionScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport,
 };
 
 const POINTING_MODE_SCHEDULE_TYPE: &str = "[(f64, str)]";
 const POINTING_QUATERNION_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64, f64))]";
 
-impl ElectronicWarfareMode {
+impl CoorbitalEvasionMode {
     fn add_command_to_schedule(
         &self,
         schedule: &mut EdsPointingSchedule,
@@ -487,7 +487,7 @@ impl ElectronicWarfareMode {
             .patch_multi(patches);
         let workspace = simulator.workspace_dir().with_context(|| {
             format!(
-                "failed to resolve electronic-warfare EDS workspace from '{}'",
+                "failed to resolve coorbital-evasion EDS workspace from '{}'",
                 self.config.eds_path.display()
             )
         })?;
@@ -496,7 +496,7 @@ impl ElectronicWarfareMode {
             .await
             .with_context(|| {
                 format!(
-                    "electronic-warfare simulation failed (workspace='{}')",
+                    "coorbital-evasion simulation failed (workspace='{}')",
                     workspace.display()
                 )
             })?;
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn accepted_mixed_schedule_preserves_latest_pre_epoch_target() {
         let start = 60_000.0;
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         let from = AutonomyModeId(Uuid::nil());
         let commands = [
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn empty_accepted_schedule_starts_nadir() {
-        let mode = ElectronicWarfareMode::new();
+        let mode = CoorbitalEvasionMode::new();
         let schedule = mode.accepted_pointing_schedule(60_000.0, 60_001.0);
         assert_eq!(
             schedule.mode_schedule,
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn future_only_accepted_schedule_starts_nadir() {
         let start = 60_000.0;
-        let mut mode = ElectronicWarfareMode::new();
+        let mut mode = CoorbitalEvasionMode::new();
         let mut board = AutonomyModeBoardState::default();
         let id = BoardCmdId("future".to_string());
         board.proposals.insert(
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn selected_schedule_keeps_only_pre_command_accepted_entries() {
-        let mode = ElectronicWarfareMode::new();
+        let mode = CoorbitalEvasionMode::new();
         let accepted = EdsPointingSchedule {
             mode_schedule: vec![(1.0, "sun".to_string()), (2.0, "thruster".to_string())],
             quaternion_schedule: Vec::new(),

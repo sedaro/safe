@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::config::{AllowedAction, LlmAdvisorModeConfig, NominalRule, NominalRuleKind};
-use crate::types::{AnomalyCandidate, LlmAdvisorMode, TelemetrySample};
+use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 #[derive(Debug, Clone, Serialize)]
 struct DecisionEnvelope {
@@ -64,7 +64,7 @@ enum RuleEvaluation {
     Invalid(String),
 }
 
-impl LlmAdvisorMode {
+impl AnomalyRecoveryMode {
     fn log_decision_trace(&self, stage: &str, detail: impl std::fmt::Display) {
         if self.config.decision_trace {
             let detail = trace_text(&detail.to_string());
@@ -88,7 +88,7 @@ impl LlmAdvisorMode {
             source = ?source,
             ts_mono = ?ts_mono,
             reason = %format!("{err:#}"),
-            "llm advisor planning failed without emitting a command"
+            "anomaly recovery planning failed without emitting a command"
         );
     }
 
@@ -216,7 +216,7 @@ impl LlmAdvisorMode {
                         attempt,
                         max_attempts,
                         reason = %format!("{err:#}"),
-                        "llm advisor request failed; retrying"
+                        "anomaly recovery request failed; retrying"
                     );
                     feedback = None;
                     continue;
@@ -258,7 +258,7 @@ impl LlmAdvisorMode {
                         attempt,
                         max_attempts,
                         reason = %format!("{err:#}"),
-                        "llm advisor response failed parsing; requesting repair"
+                        "anomaly recovery response failed parsing; requesting repair"
                     );
                     feedback = Some(self.build_repair_feedback(
                         "parse_advisor_decision",
@@ -290,7 +290,7 @@ impl LlmAdvisorMode {
                         attempt,
                         max_attempts,
                         reason = %format!("{err:#}"),
-                        "llm advisor response failed validation; requesting repair"
+                        "anomaly recovery response failed validation; requesting repair"
                     );
                     feedback =
                         Some(self.build_repair_feedback("evaluate_decision", &err, &response_text));
@@ -316,12 +316,12 @@ impl LlmAdvisorMode {
                 max_attempts,
                 anomaly_id = %decision.anomaly_id,
                 action_id = %decision.action_id,
-                "llm advisor selected a configured anomaly action"
+                "anomaly recovery selected a configured anomaly action"
             );
             return Ok(decision);
         }
 
-        Err(anyhow!("llm advisor exhausted decision attempts"))
+        Err(anyhow!("anomaly recovery exhausted decision attempts"))
     }
 
     fn build_ollama_request_body(&self, prompt: &str) -> Result<String> {
@@ -367,7 +367,7 @@ impl LlmAdvisorMode {
             model = %self.config.model,
             timeout_ms = self.config.request_timeout_ms,
             prompt_chars = prompt.chars().count(),
-            "llm advisor sending constrained ollama request"
+            "anomaly recovery sending constrained ollama request"
         );
 
         let request_future = async {
@@ -407,7 +407,7 @@ impl LlmAdvisorMode {
         info!(
             elapsed_ms = request_start.elapsed().as_millis() as u64,
             response_chars = body_text.chars().count(),
-            "llm advisor completed ollama request"
+            "anomaly recovery completed ollama request"
         );
 
         let response: OllamaResponse = serde_json::from_str(&body_text)
@@ -419,7 +419,7 @@ impl LlmAdvisorMode {
             done = response.done,
             done_reason = ?response.done_reason,
             eval_count = ?response.eval_count,
-            "llm advisor parsed ollama completion metadata"
+            "anomaly recovery parsed ollama completion metadata"
         );
 
         let response_text = response.response.trim();
@@ -549,7 +549,7 @@ impl LlmAdvisorMode {
             self.last_plan_signature = None;
             warn!(
                 ts_mono = telemetry.ts_mono,
-                "llm advisor received telemetry without a source"
+                "anomaly recovery received telemetry without a source"
             );
             return;
         };
@@ -558,7 +558,7 @@ impl LlmAdvisorMode {
             warn!(
                 source,
                 ts_mono = telemetry.ts_mono,
-                "llm advisor has no nominal profile for telemetry source"
+                "anomaly recovery has no nominal profile for telemetry source"
             );
             return;
         };
@@ -667,7 +667,7 @@ impl LlmAdvisorMode {
             action_id = action.as_str(),
             evidence_path = %candidate.path,
             reason = %reason,
-            "llm advisor emitted profile-backed anomaly action"
+            "anomaly recovery emitted profile-backed anomaly action"
         );
         self.log_decision_trace(
             "proposal",
@@ -684,7 +684,7 @@ impl LlmAdvisorMode {
     async fn plan_current_candidates(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
         if self.config.require_board_snapshot && !self.has_board_snapshot {
             if !self.warned_missing_board_snapshot {
-                warn!("llm advisor waiting for initial board snapshot before planning");
+                warn!("anomaly recovery waiting for initial board snapshot before planning");
                 self.warned_missing_board_snapshot = true;
             }
             return Ok(());
@@ -841,8 +841,8 @@ fn trace_text(input: &str) -> String {
 }
 
 #[async_trait]
-impl ModeHandler<LlmAdvisorModeConfig> for LlmAdvisorMode {
-    fn set_config(&mut self, config: LlmAdvisorModeConfig) -> Result<()> {
+impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
+    fn set_config(&mut self, config: AnomalyRecoveryModeConfig) -> Result<()> {
         config.validate()?;
         info!(
             host = %config.ollama_host,
@@ -852,7 +852,7 @@ impl ModeHandler<LlmAdvisorModeConfig> for LlmAdvisorMode {
             timeout_ms = config.request_timeout_ms,
             profiles = config.nominal_profiles.len(),
             actions = config.action_catalog.len(),
-            "llm advisor static nominal profile config loaded"
+            "anomaly recovery static nominal profile config loaded"
         );
         self.config = config;
         self.latest_telemetry = None;
@@ -938,9 +938,9 @@ mod tests {
     const PROFILE_FIXTURE: &str = include_str!("../testdata/static_nominal_profile.json");
     const TELEMETRY_FIXTURE: &str = include_str!("../testdata/static_nominal_telemetry.jsonl");
 
-    fn configured_mode() -> LlmAdvisorMode {
+    fn configured_mode() -> AnomalyRecoveryMode {
         let config = serde_json::from_str(PROFILE_FIXTURE).expect("fixture should parse");
-        let mut mode = LlmAdvisorMode::new();
+        let mut mode = AnomalyRecoveryMode::new();
         mode.set_config(config).expect("fixture should validate");
         mode
     }

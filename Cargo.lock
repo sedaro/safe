@@ -1223,7 +1223,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mode-llm-advisor"
+name = "mode-anomaly-recovery"
 version = "1.2.3"
 dependencies = [
  "anyhow",

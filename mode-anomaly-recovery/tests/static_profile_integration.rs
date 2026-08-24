@@ -32,7 +32,7 @@ fn high_temperature_frame(ts_mono: u64) -> TelemetryFrame {
 async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
     let mode_id = AutonomyModeId(Uuid::from_u128(1));
     let temp_dir = tempdir().expect("temporary directory");
-    let socket_path = temp_dir.path().join("mode_llm_advisor.sock");
+    let socket_path = temp_dir.path().join("mode_anomaly_recovery.sock");
     let config_path = temp_dir.path().join("mode_config.json");
     tokio::fs::write(&config_path, PROFILE_FIXTURE)
         .await
@@ -42,7 +42,7 @@ async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
         UnixTransport::<ModeToSafe, SafeToMode>::new(socket_path.to_string_lossy().as_ref())
             .await
             .expect("create mode socket");
-    let mode_bin = std::env::var_os("CARGO_BIN_EXE_mode_llm_advisor")
+    let mode_bin = std::env::var_os("CARGO_BIN_EXE_mode_anomaly_recovery")
         .expect("cargo should provide the advisor binary");
     let mut child = TokioCommand::new(mode_bin)
         .arg("--endpoint")

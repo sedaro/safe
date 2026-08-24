@@ -1,5 +1,5 @@
 [package]
-name = "mode-electronic-warfare"
+name = "mode-coorbital-evasion"
 version.workspace = true
 edition.workspace = true
 
@@ -20,5 +20,5 @@ tracing = "0.1.44"
 uuid = { version = "1.23.1", features = ["v4"] }
 
 [[bin]]
-name = "mode_electronic_warfare"
+name = "mode_coorbital_evasion"
 path = "src/main.rs"

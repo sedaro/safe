@@ -199,7 +199,7 @@ pub(crate) struct NominalProfile {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LlmAdvisorModeConfig {
+pub(crate) struct AnomalyRecoveryModeConfig {
     #[serde(default = "default_ollama_host")]
     pub(crate) ollama_host: String,
     #[serde(default = "default_ollama_port")]
@@ -236,13 +236,13 @@ pub(crate) struct LlmAdvisorModeConfig {
     pub(crate) nominal_profiles: Vec<NominalProfile>,
 }
 
-impl LlmAdvisorModeConfig {
+impl AnomalyRecoveryModeConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.nominal_profiles.is_empty() {
-            bail!("llm advisor requires at least one nominal profile");
+            bail!("anomaly recovery requires at least one nominal profile");
         }
         if self.action_catalog.is_empty() {
-            bail!("llm advisor requires an action_catalog");
+            bail!("anomaly recovery requires an action_catalog");
         }
         if self.request_timeout_ms == 0 {
             bail!("request_timeout_ms must be greater than zero");
@@ -332,7 +332,7 @@ impl LlmAdvisorModeConfig {
     }
 }
 
-impl Default for LlmAdvisorModeConfig {
+impl Default for AnomalyRecoveryModeConfig {
     fn default() -> Self {
         Self {
             ollama_host: default_ollama_host(),
@@ -388,7 +388,7 @@ fn default_model() -> String {
 }
 
 fn default_request_timeout_ms() -> u64 {
-    10_000
+    20_000
 }
 
 fn default_max_prompt_chars() -> usize {
@@ -432,7 +432,7 @@ fn default_analysis_instructions() -> String {
 mod tests {
     use super::*;
 
-    fn valid_config() -> LlmAdvisorModeConfig {
+    fn valid_config() -> AnomalyRecoveryModeConfig {
         serde_json::from_value(serde_json::json!({
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
@@ -467,7 +467,7 @@ mod tests {
         let config = valid_config();
         assert!(!config.decision_trace);
 
-        let config: LlmAdvisorModeConfig = serde_json::from_value(serde_json::json!({
+        let config: AnomalyRecoveryModeConfig = serde_json::from_value(serde_json::json!({
             "decision_trace": true,
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
