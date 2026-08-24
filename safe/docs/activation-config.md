@@ -49,7 +49,7 @@ Example entry:
   "name": "ExampleMode",
   "priority": 10,
   "enabled": true,
-  "bin_path": "../target/debug/mode_llm_advisor",
+  "bin_path": "../target/debug/mode_anomaly_recovery",
   "args": [],
   "sandbox_resources": {
     "cpu": 25.0,
@@ -81,7 +81,7 @@ Example entry:
 }
 ```
 
-The example is a schema example only. `mode_llm_advisor` requires its own
+The example is a schema example only. `mode_anomaly_recovery` requires its own
 validated `mode_config`; see its README for a complete advisor configuration.
 
 ## Activation Types

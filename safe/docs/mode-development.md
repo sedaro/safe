@@ -153,7 +153,7 @@ an integration test. The advisor integration test demonstrates the complete
 handshake and command-output flow:
 
 ```bash
-cargo test -p mode-llm-advisor --test static_profile_integration
+cargo test -p mode-anomaly-recovery --test static_profile_integration
 ```
 
 Do not use the empty checked-in autonomy-mode configuration as a mode test. Add

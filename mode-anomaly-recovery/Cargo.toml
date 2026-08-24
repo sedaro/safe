@@ -1,5 +1,5 @@
 [package]
-name = "mode-llm-advisor"
+name = "mode-anomaly-recovery"
 version.workspace = true
 edition.workspace = true
 
@@ -18,5 +18,5 @@ tempfile = "3.27.0"
 uuid = "1.23.3"
 
 [[bin]]
-name = "mode_llm_advisor"
+name = "mode_anomaly_recovery"
 path = "src/main.rs"

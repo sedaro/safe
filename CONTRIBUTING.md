@@ -21,8 +21,8 @@ Useful focused commands are:
 cargo test -p safe
 cargo test -p safectl
 cargo test -p safe-time
-cargo test -p mode-llm-advisor
-cargo test -p mode-llm-advisor --test static_profile_integration
+cargo test -p mode-anomaly-recovery
+cargo test -p mode-anomaly-recovery --test static_profile_integration
 ```
 
 The CI workflow runs `cargo build --workspace --verbose` and

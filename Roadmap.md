@@ -6,7 +6,7 @@ exists in the checkout from planned work and known limitations.
 ## Implemented in This Checkout
 
 - Rust workspace packages for `safe`, `safectl`, `safe-time`, and
-  `mode-llm-advisor`.
+  `mode-anomaly-recovery`.
 - SAFE daemon startup, persisted flight state, event/output JSONL logs, and
   startup recovery.
 - Telemetry-driven immediate and hysteretic mode selection.

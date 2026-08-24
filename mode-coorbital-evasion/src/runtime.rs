@@ -149,7 +149,7 @@ impl ElectronicWarfareMode {
             runtime
                 .cancel_board(
                     id.clone(),
-                    "electronic-warfare selected pointing schedule supersedes this command",
+                    "coorbital-evasion selected pointing schedule supersedes this command",
                 )
                 .await?;
         }
@@ -185,7 +185,7 @@ impl ElectronicWarfareMode {
         debug!(
             canceled = cancel.len(),
             proposed = propose.len(),
-            "reconciled electronic-warfare schedule"
+            "reconciled coorbital-evasion schedule"
         );
         Ok(())
     }
@@ -208,7 +208,7 @@ impl ElectronicWarfareMode {
                 exposed_threat_ids = ?plan.validation.exposed_threat_ids,
                 first_exposed_mjd = plan.validation.first_exposed_mjd,
                 last_exposed_mjd = plan.validation.last_exposed_mjd,
-                "selected electronic-warfare schedule remains exposed in finite-dynamics validation; emitting best effort"
+                "selected coorbital-evasion schedule remains exposed in finite-dynamics validation; emitting best effort"
             );
         }
         self.emit_plan(runtime, &plan).await?;
@@ -216,7 +216,7 @@ impl ElectronicWarfareMode {
             pointing_commands = plan.commands.len(),
             modeled_exposure_secs = plan.modeled_score.exposure_secs,
             validated_exposure_secs = plan.validation.score.exposure_secs,
-            "electronic-warfare pointing plan evaluated"
+            "coorbital-evasion pointing plan evaluated"
         );
         Ok(())
     }
@@ -245,7 +245,7 @@ impl ElectronicWarfareMode {
         }
         self.last_replan_start = Some(Instant::now());
         if let Err(error) = self.maybe_plan(runtime, telemetry).await {
-            warn!("electronic-warfare planning failed: {error:#}");
+            warn!("coorbital-evasion planning failed: {error:#}");
         }
     }
 }
@@ -264,7 +264,7 @@ impl ModeHandler<ElectronicWarfareModeConfig> for ElectronicWarfareMode {
     async fn on_activate(&mut self, runtime: &mut ModeRuntime) -> anyhow::Result<()> {
         self.warn_missing_config_once();
         if !self.has_board_snapshot {
-            info!("electronic-warfare mode waiting for initial board snapshot");
+            info!("coorbital-evasion mode waiting for initial board snapshot");
             return Ok(());
         }
         if let Some(telemetry) = self.latest_telemetry.clone() {
@@ -281,7 +281,7 @@ impl ModeHandler<ElectronicWarfareModeConfig> for ElectronicWarfareMode {
         let telemetry = match frame.decode_payload::<Telemetry>() {
             Ok(telemetry) => telemetry,
             Err(error) => {
-                warn!("electronic-warfare received incompatible telemetry: {error}");
+                warn!("coorbital-evasion received incompatible telemetry: {error}");
                 return Ok(());
             }
         };

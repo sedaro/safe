@@ -3,11 +3,11 @@ members = [
     "safe",
     "safe-time",
     "safectl",
-    "mode-llm-advisor",
+    "mode-anomaly-recovery",
 ]
 excludes = [
     "safe-sim",
-    "mode-electronic-warfare",
+    "mode-coorbital-evasion",
 ]
 resolver = "2"
 

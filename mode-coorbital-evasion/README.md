@@ -1,6 +1,6 @@
-# Electronic Warfare Autonomy Mode
+# Co-Orbital Threat Evasion Autonomy Mode
 
-This document describes the electronic warfare autonomy mode. The mode commands spacecraft attitude to minimize exposure to known threats while maintaining alignment with Nadir. It uses a satellite EDS for simulation, planning, and validation.
+This document describes the co-orbital threat evasion autonomy mode. The mode commands spacecraft attitude to minimize exposure to known threats while maintaining alignment with Nadir. It uses a satellite EDS for simulation, planning, and validation.
 
 ## Current Implementation
 
