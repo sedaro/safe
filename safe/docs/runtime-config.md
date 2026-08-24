@@ -11,7 +11,7 @@ The runtime YAML path is resolved in this order:
 1. `SAFE_RUNTIME_CONFIG`.
 2. `SAFE_RUNTIME_CONFIG_PATH`.
 3. `safe/safe.yaml` relative to the current working directory, if it exists.
-4. `/opt/safe/safe.yaml`.
+4. `/tmp/safe/safe.yaml`.
 
 `SAFE_RUNTIME_CONFIG` takes precedence when both environment variables are set.
 
@@ -20,7 +20,7 @@ The autonomy-mode JSON path is resolved in this order:
 1. `SAFE_AUTONOMY_MODE_CONFIG_PATH`.
 2. `safe/autonomy_mode_config.json` relative to the current working directory,
    if it exists.
-3. `/opt/safe/autonomy_mode_config.json`.
+3. `/tmp/safe/autonomy_mode_config.json`.
 
 Run SAFE from the repository root or use explicit paths. The repository
 [`run.sh`](../../run.sh) sets both paths for local development.
@@ -55,7 +55,7 @@ limits:
   max_autonomy_modes: 10
 
 base_paths:
-  base_working_directory: "/opt/safe"
+  base_working_directory: "/tmp/safe"
   base_writable_directory: "/tmp/safe"
 
 platform:
@@ -81,7 +81,7 @@ gatekeeper: {}
 | `logging.file_path` | `/tmp/safe/logs/app.log` | Its parent directory is used for `default.log` and per-mode logs. |
 | `logging.rotation.*` | `100`, `10`, `false` | Validated values, but file rotation is not currently implemented. |
 | `limits.max_autonomy_modes` | `10` | Maximum number of JSON mode entries, including disabled entries. |
-| `base_paths.base_working_directory` | `/opt/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
+| `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
 | `platform.command_adapter` | `safectl_unix_json` | The currently supported command ingress/egress adapter. |

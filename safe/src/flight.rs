@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -30,6 +30,8 @@ pub struct Flight {
     autonomy_mode_activations: Vec<AutonomyModeActivation>,
     #[serde(skip)]
     telemetry_history: VecDeque<TelemetryFrame>,
+    #[serde(skip)]
+    timed_activation_started_at_ms: HashMap<AutonomyModeId, u64>,
     last_planned_autonomy_mode: Option<AutonomyModeId>,
 }
 
@@ -45,6 +47,7 @@ impl Default for Flight {
             autonomy_modes: vec![],
             autonomy_mode_activations: vec![],
             telemetry_history: VecDeque::new(),
+            timed_activation_started_at_ms: HashMap::new(),
             last_planned_autonomy_mode: None,
         }
     }
@@ -60,10 +63,18 @@ impl Flight {
     }
 
     pub fn set_autonomy_modes(&mut self, modes: Vec<AutonomyModeMeta>) {
+        let valid_ids: HashSet<_> = modes
+            .iter()
+            .filter(|mode| mode.enabled)
+            .map(|mode| mode.id)
+            .collect();
+        self.timed_activation_started_at_ms
+            .retain(|id, _| valid_ids.contains(id));
         self.autonomy_modes = modes;
     }
 
     pub fn set_autonomy_mode_activations(&mut self, activations: Vec<AutonomyModeActivation>) {
+        self.timed_activation_started_at_ms.clear();
         self.autonomy_mode_activations = activations;
     }
 
@@ -111,8 +122,11 @@ impl Flight {
     }
 
     pub fn recalculate_active_autonomy_mode(&mut self) -> Option<AutonomyModeId> {
+        self.recalculate_active_autonomy_mode_at(0)
+    }
+
+    pub fn recalculate_active_autonomy_mode_at(&mut self, now_ms: u64) -> Option<AutonomyModeId> {
         let previous_active = self.active_autonomy_mode;
-        let candidate_modes = &self.autonomy_modes;
 
         if let Some(manual_mode) = self.manual_active_override {
             let is_enabled = self
@@ -130,45 +144,124 @@ impl Flight {
         }
 
         let resolver = FlightResolver {
-            telemetry_history: &self.telemetry_history,
-            last_planned_autonomy_mode: &self.last_planned_autonomy_mode,
+            telemetry_history: self.telemetry_history.clone(),
+            last_planned_autonomy_mode: self.last_planned_autonomy_mode,
         };
 
         if let Some(current_id) = self.active_autonomy_mode
             && let Some(current_mode) = self.autonomy_modes.iter().find(|m| m.id == current_id)
             && current_mode.enabled
-            && let Some(Activation::Hysteretic { exit, .. }) = self.activation_for_mode(current_id)
+            && let Some(activation) = self.activation_for_mode(current_id).cloned()
         {
-            match exit.eval(&resolver) {
-                Ok(false) => {
-                    return previous_active;
-                }
-                Ok(true) => {}
-                Err(e) => {
-                    warn!(
-                        "Failed to evaluate hysteretic exit for mode {:?}: {:?}. Keeping current mode.",
-                        current_id, e
-                    );
-                    return previous_active;
-                }
+            match activation {
+                Activation::Hysteretic { exit, .. } => match exit.eval(&resolver) {
+                    Ok(false) => return previous_active,
+                    Ok(true) => {}
+                    Err(e) => {
+                        warn!(
+                            "Failed to evaluate hysteretic exit for mode {:?}: {:?}. Keeping current mode.",
+                            current_id, e
+                        );
+                        return previous_active;
+                    }
+                },
+                Activation::Timed { .. }
+                    if !self.timed_activation_is_active(current_id, &resolver, now_ms) => {}
+                Activation::Timed { .. } => return previous_active,
+                Activation::Immediate(_) => {}
             }
         }
 
-        self.active_autonomy_mode = candidate_modes
+        let mut selected = None;
+        let mut selected_priority = None;
+        let candidate_modes: Vec<_> = self
+            .autonomy_modes
             .iter()
             .filter(|mode| mode.enabled)
-            .filter(|mode| self.activation_enter_satisfied(mode.id, &resolver))
-            .max_by_key(|p| p.priority)
-            .map(|p| p.id);
+            .map(|mode| (mode.id, mode.priority))
+            .collect();
+        for (mode_id, priority) in candidate_modes {
+            if self.activation_enter_satisfied_at(mode_id, &resolver, now_ms)
+                && selected_priority.is_none_or(|current| priority >= current)
+            {
+                selected = Some(mode_id);
+                selected_priority = Some(priority);
+            }
+        }
+        self.active_autonomy_mode = selected;
 
-        if (self.active_autonomy_mode != previous_active) {
+        if let Some(id) = selected {
+            if matches!(self.activation_for_mode(id), Some(Activation::Timed { .. })) {
+                self.timed_activation_started_at_ms
+                    .entry(id)
+                    .or_insert(now_ms);
+            }
+        }
+
+        if self.active_autonomy_mode != previous_active {
             warn!(
                 "Active autonomy mode changed from {:?} to {:?}",
                 previous_active, self.active_autonomy_mode
             );
         }
-
         previous_active
+    }
+
+    fn timed_activation_is_active(
+        &mut self,
+        mode_id: AutonomyModeId,
+        resolver: &impl Resolvable,
+        now_ms: u64,
+    ) -> bool {
+        let Some(Activation::Timed {
+            condition,
+            duration_secs,
+        }) = self.activation_for_mode(mode_id)
+        else {
+            return true;
+        };
+        if !self.eval_activation_expr(mode_id, "timed.condition", condition, resolver) {
+            self.timed_activation_started_at_ms.remove(&mode_id);
+            return false;
+        }
+        let Some(started_at) = self.timed_activation_started_at_ms.get(&mode_id).copied() else {
+            return false;
+        };
+        now_ms.saturating_sub(started_at) < duration_secs.saturating_mul(1000)
+    }
+
+    fn activation_enter_satisfied_at(
+        &mut self,
+        mode_id: AutonomyModeId,
+        resolver: &impl Resolvable,
+        now_ms: u64,
+    ) -> bool {
+        match self.activation_for_mode(mode_id).cloned() {
+            None => true,
+            Some(Activation::Immediate(expr)) => {
+                self.eval_activation_expr(mode_id, "immediate", &expr, resolver)
+            }
+            Some(Activation::Hysteretic { enter, .. }) => {
+                self.eval_activation_expr(mode_id, "hysteretic.enter", &enter, resolver)
+            }
+            Some(Activation::Timed {
+                condition,
+                duration_secs,
+            }) => {
+                let condition_true =
+                    self.eval_activation_expr(mode_id, "timed.condition", &condition, resolver);
+                if !condition_true {
+                    self.timed_activation_started_at_ms.remove(&mode_id);
+                    return false;
+                }
+                match self.timed_activation_started_at_ms.get(&mode_id).copied() {
+                    Some(started_at) => {
+                        now_ms.saturating_sub(started_at) < duration_secs.saturating_mul(1000)
+                    }
+                    None => true,
+                }
+            }
+        }
     }
 
     pub fn get_active_autonomy_mode(&self) -> Option<AutonomyModeId> {
@@ -184,8 +277,8 @@ impl Flight {
         }
 
         let resolver = FlightResolver {
-            telemetry_history: &self.telemetry_history,
-            last_planned_autonomy_mode: &self.last_planned_autonomy_mode,
+            telemetry_history: self.telemetry_history.clone(),
+            last_planned_autonomy_mode: self.last_planned_autonomy_mode,
         };
         match self.activation_for_mode(mode_id) {
             None => (true, "no activation rule".to_string()),
@@ -197,6 +290,11 @@ impl Flight {
             Some(Activation::Hysteretic { enter, .. }) => match enter.eval(&resolver) {
                 Ok(true) => (true, "hysteretic enter rule is true".to_string()),
                 Ok(false) => (false, "hysteretic enter rule is false".to_string()),
+                Err(e) => (false, format!("activation evaluation failed: {e:?}")),
+            },
+            Some(Activation::Timed { condition, .. }) => match condition.eval(&resolver) {
+                Ok(true) => (true, "timed condition is true".to_string()),
+                Ok(false) => (false, "timed condition is false".to_string()),
                 Err(e) => (false, format!("activation evaluation failed: {e:?}")),
             },
         }
@@ -211,8 +309,8 @@ impl Flight {
         }
         if let Some(Activation::Hysteretic { exit, .. }) = self.activation_for_mode(active) {
             let resolver = FlightResolver {
-                telemetry_history: &self.telemetry_history,
-                last_planned_autonomy_mode: &self.last_planned_autonomy_mode,
+                telemetry_history: self.telemetry_history.clone(),
+                last_planned_autonomy_mode: self.last_planned_autonomy_mode,
             };
             return match exit.eval(&resolver) {
                 Ok(false) => "hysteresis hold".to_string(),
@@ -296,6 +394,9 @@ impl Flight {
             Some(Activation::Hysteretic { enter, .. }) => {
                 self.eval_activation_expr(mode_id, "hysteretic.enter", enter, resolver)
             }
+            Some(Activation::Timed { condition, .. }) => {
+                self.eval_activation_expr(mode_id, "timed.condition", condition, resolver)
+            }
         }
     }
 
@@ -324,12 +425,12 @@ impl Flight {
     }
 }
 
-struct FlightResolver<'a> {
-    telemetry_history: &'a VecDeque<TelemetryFrame>,
-    last_planned_autonomy_mode: &'a Option<AutonomyModeId>,
+struct FlightResolver {
+    telemetry_history: VecDeque<TelemetryFrame>,
+    last_planned_autonomy_mode: Option<AutonomyModeId>,
 }
 
-impl FlightResolver<'_> {
+impl FlightResolver {
     fn latest_telemetry(&self) -> Option<&TelemetryFrame> {
         self.telemetry_history.back()
     }
@@ -359,7 +460,7 @@ impl FlightResolver<'_> {
     }
 }
 
-impl Resolvable for FlightResolver<'_> {
+impl Resolvable for FlightResolver {
     fn get_variable(&self, _name: &str) -> Option<Variable> {
         None
     }
