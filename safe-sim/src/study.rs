@@ -674,14 +674,13 @@ mod tests {
     #[tokio::test]
     async fn malformed_target_output_is_a_run_failure() {
         let workspace = fake_eds(
-            "printf '%s\\n' '{\"data\":{\"config\":\"\",\"stream_id\":\"x\",\"type\":\"(\"},\"event\":\"config\",\"stream_id\":\"x\"}' > broken.jsonl",
+            "for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\" && printf '%s\\n' '{\"data\":{\"config\":\"\",\"stream_id\":\"x\",\"type\":\"(\"},\"event\":\"config\",\"stream_id\":\"x\"}' > \"$arg/broken.jsonl\"; fi; previous=\"$arg\"; done",
         );
         let study = TradeStudy::new(simulator(&workspace), 1.0).case(StudyCase::new("broken"));
 
         let result = study.run().await.unwrap();
 
         assert!(matches!(result.runs[0].outcome, StudyRunOutcome::Failed(_)));
-        assert!(workspace.path().join("broken.jsonl").exists());
     }
 
     /// Verifies that cancellation drops the child process and preserves partial-study metadata.
