@@ -107,6 +107,7 @@ own configuration and fixture documentation in
 - [`Roadmap and limitations`](./Roadmap.md)
 - [`safe-time API`](./safe-time/README.md)
 - [`safe-sim studies and simulation API`](./safe-sim/README.md)
+- [`Generic EDS gatekeeper`](./safe-gatekeeper/README.md)
 
 
 ## Workspace Layout
@@ -117,6 +118,8 @@ own configuration and fixture documentation in
 - [`safe-time/`](./safe-time/): GPS, UTC, MJD, and attitude utility functions.
 - [`safe-sim/`](./safe-sim/): Sedaro EDS simulation execution, output decoding,
   trade studies, and Monte Carlo studies.
+- [`safe-gatekeeper/`](./safe-gatekeeper/): Generic EDS-backed command-batch
+  safety evaluation using mission-provided simulation inputs.
 
 
 ## License
