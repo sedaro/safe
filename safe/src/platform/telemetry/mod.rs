@@ -5,6 +5,7 @@ use crate::telemetry_frame::TelemetryFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryIngressKind {
+    Disabled,
     Example,
     External,
 }
@@ -12,6 +13,7 @@ pub enum TelemetryIngressKind {
 impl TelemetryIngressKind {
     pub fn from_config(name: &str) -> anyhow::Result<Self> {
         match name {
+            "disabled" => Ok(Self::Disabled),
             "example" => Ok(Self::Example),
             "external" => Ok(Self::External),
             _ => anyhow::bail!("unsupported telemetry ingress adapter: {name}"),
@@ -26,6 +28,7 @@ pub fn spawn_telemetry_ingress(
     let telemetry_kind = TelemetryIngressKind::from_config(&cfg.platform.telemetry_adapter)?;
 
     match telemetry_kind {
+        TelemetryIngressKind::Disabled => {}
         TelemetryIngressKind::Example => {
             tokio::spawn(example::example_telemetry_reader(telemetry_tx));
         }
@@ -145,5 +148,13 @@ mod tests {
     #[test]
     fn bash_mock_adapter_is_no_longer_supported() {
         assert!(TelemetryIngressKind::from_config("bash_mock").is_err());
+    }
+
+    #[test]
+    fn disabled_adapter_is_supported() {
+        assert_eq!(
+            TelemetryIngressKind::from_config("disabled").unwrap(),
+            TelemetryIngressKind::Disabled
+        );
     }
 }

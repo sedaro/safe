@@ -101,7 +101,7 @@ gatekeeper: {}
 | `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
-| `platform.telemetry_adapter` | `example` | Selects `example` or `external`. |
+| `platform.telemetry_adapter` | `example` | Selects `disabled`, `example`, or `external`. |
 | `platform.command_adapter` | `safectl_unix_json` | Selects the command ingress adapter. |
 | `platform.egress_adapter` | `safectl_filesystem` | Selects `safectl_filesystem` or `external` platform egress. |
 | `platform.gatekeeper_adapter` | `disabled` | Selects `disabled` or `external`. Disabled automatically approves batches. |
@@ -154,6 +154,9 @@ by the runtime:
 used as a supported configuration switch.
 
 ## Telemetry Adapters
+
+`disabled` starts no built-in telemetry producer. Use this when telemetry will
+arrive only through `safectl send telemetry` or another explicit sender.
 
 `example` emits one frame per second with source `example` and counters under
 `payload.telemetry.batt_v` and `payload.telemetry.batt_c`.
