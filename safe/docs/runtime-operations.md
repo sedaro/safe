@@ -63,6 +63,14 @@ ignored during recovery. Invalid JSONL lines are skipped during replay. Keep
 `flight.json`, `events.jsonl`, and `outputs.jsonl` together when backing up or
 restoring runtime state.
 
+SAFE compacts the recovery journals after either their configured byte or record
+limit is reached. It first atomically saves `flight.json`, then clears
+`events.jsonl`; events already represented by the checkpoint are ignored during
+recovery. `outputs.jsonl` is atomically replaced by a current `BoardState`
+snapshot, followed by later effects. This bounds historical journal growth and
+replay time. It does not bound the snapshot itself: with no limit on outstanding
+commands, the current board can grow beyond `persistence.outputs_max_bytes`.
+
 ## Event, Board, and Output Flow
 
 Telemetry and external control requests become events. Mode commands become

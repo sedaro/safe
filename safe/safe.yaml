@@ -21,6 +21,12 @@ logging:
 limits:
   max_autonomy_modes: 10
 
+persistence:
+  events_max_bytes: 16777216
+  events_max_records: 10000
+  outputs_max_bytes: 16777216
+  outputs_max_records: 10000
+
 base_paths:
   base_writable_directory: /tmp/safe
 
