@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -36,7 +36,13 @@ pub fn init_tracing(cfg: &Config) -> Result<TelemetryGuards, Box<dyn std::error:
         .to_path_buf();
     std::fs::create_dir_all(&logs_dir)?;
 
-    let router = PerIdMakeWriter::new(logs_dir, "default.log");
+    let router = PerIdMakeWriter::new(
+        logs_dir,
+        "default.log",
+        cfg.logging.rotation.max_file_size_mb,
+        cfg.logging.rotation.max_files,
+        cfg.logging.rotation.daily,
+    )?;
     let per_id_layer = PerIdFileLayer::new(router, cfg.tracing.with_target);
 
     let stdout_layer = fmt::layer()
@@ -65,17 +71,32 @@ struct PerIdState {
     logs_dir: PathBuf,
     fallback_file: String,
     files: HashMap<String, std::fs::File>,
+    max_file_bytes: u64,
+    max_files: usize,
+    daily: bool,
 }
 
 impl PerIdMakeWriter {
-    fn new(logs_dir: PathBuf, fallback_file: impl Into<String>) -> Self {
-        Self {
+    fn new(
+        logs_dir: PathBuf,
+        fallback_file: impl Into<String>,
+        max_file_size_mb: u64,
+        max_files: usize,
+        daily: bool,
+    ) -> io::Result<Self> {
+        let max_file_bytes = max_file_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "log file size overflows")
+        })?;
+        Ok(Self {
             state: Arc::new(Mutex::new(PerIdState {
                 logs_dir,
                 fallback_file: fallback_file.into(),
                 files: HashMap::new(),
+                max_file_bytes,
+                max_files,
+                daily,
             })),
-        }
+        })
     }
 
     fn writer_for_id(&self, id: Option<&str>) -> PerIdWriter {
@@ -96,9 +117,9 @@ impl<'a> MakeWriter<'a> for PerIdMakeWriter {
 
 impl PerIdMakeWriter {
     fn write_line_for(&self, id: Option<&str>, line: &str) -> io::Result<()> {
-        let mut writer = self.writer_for_id(id);
-        writer.write_all(line.as_bytes())?;
-        writer.flush()
+        let key = sanitize_filename(id.unwrap_or("default"));
+        let mut state = self.state.lock().expect("poisoned mutex");
+        state.write_line(&key, line.as_bytes()).map(|_| ())
     }
 }
 
@@ -110,24 +131,7 @@ pub struct PerIdWriter {
 impl Write for PerIdWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut state = self.state.lock().expect("poisoned mutex");
-
-        let file_name = if self.key == "default" {
-            state.fallback_file.clone()
-        } else {
-            format!("{}.log", self.key)
-        };
-
-        if !state.files.contains_key(&file_name) {
-            let path = state.logs_dir.join(&file_name);
-            let file = OpenOptions::new().create(true).append(true).open(path)?;
-            state.files.insert(file_name.clone(), file);
-        }
-
-        state
-            .files
-            .get_mut(&file_name)
-            .expect("inserted file missing")
-            .write(buf)
+        state.write_line(&self.key, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -145,6 +149,123 @@ impl Write for PerIdWriter {
             Ok(())
         }
     }
+}
+
+impl PerIdState {
+    fn file_name(&self, key: &str) -> String {
+        if key == "default" {
+            self.fallback_file.clone()
+        } else {
+            format!("{key}.log")
+        }
+    }
+
+    fn write_line(&mut self, key: &str, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.max_file_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("log record exceeds {} byte file limit", self.max_file_bytes),
+            ));
+        }
+
+        let file_name = self.file_name(key);
+        self.prune_archives(&file_name)?;
+        let path = self.logs_dir.join(&file_name);
+        let metadata = std::fs::metadata(&path).ok();
+        let current_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let existing_day = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .map(|timestamp| timestamp.date_naive());
+        let today = Utc::now().date_naive();
+
+        if should_rotate(
+            current_len,
+            bytes.len() as u64,
+            self.max_file_bytes,
+            existing_day,
+            today,
+            self.daily,
+        ) {
+            self.rotate(&file_name)?;
+        }
+
+        if !self.files.contains_key(&file_name) {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            self.files.insert(file_name.clone(), file);
+        }
+
+        let file = self
+            .files
+            .get_mut(&file_name)
+            .expect("inserted file missing");
+        file.write_all(bytes)?;
+        file.flush()?;
+        Ok(bytes.len())
+    }
+
+    fn rotate(&mut self, file_name: &str) -> io::Result<()> {
+        self.files.remove(file_name);
+        self.prune_archives(file_name)?;
+
+        let active = self.logs_dir.join(file_name);
+        if !active.exists() {
+            return Ok(());
+        }
+        if self.max_files == 1 {
+            std::fs::remove_file(active)?;
+            return Ok(());
+        }
+
+        let oldest = self
+            .logs_dir
+            .join(format!("{file_name}.{}", self.max_files - 1));
+        if oldest.exists() {
+            std::fs::remove_file(oldest)?;
+        }
+        for index in (1..self.max_files - 1).rev() {
+            let from = self.logs_dir.join(format!("{file_name}.{index}"));
+            if from.exists() {
+                std::fs::rename(
+                    from,
+                    self.logs_dir.join(format!("{file_name}.{}", index + 1)),
+                )?;
+            }
+        }
+        std::fs::rename(active, self.logs_dir.join(format!("{file_name}.1")))
+    }
+
+    fn prune_archives(&self, file_name: &str) -> io::Result<()> {
+        for entry in std::fs::read_dir(&self.logs_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(index) = name
+                .strip_prefix(&format!("{file_name}."))
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if index >= self.max_files {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn should_rotate(
+    current_len: u64,
+    incoming_len: u64,
+    max_file_bytes: u64,
+    existing_day: Option<chrono::NaiveDate>,
+    today: chrono::NaiveDate,
+    daily: bool,
+) -> bool {
+    current_len > 0
+        && ((daily && existing_day.is_some_and(|day| day != today))
+            || incoming_len > max_file_bytes.saturating_sub(current_len))
 }
 
 /// A dedicated layer that writes each event to a structured per-scope file.
@@ -385,5 +506,68 @@ mod tests {
         let timestamp = chrono_like_now();
         assert!(timestamp.ends_with('Z'));
         assert!(chrono::DateTime::parse_from_rfc3339(&timestamp).is_ok());
+    }
+
+    #[test]
+    fn rotates_before_exceeding_file_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let router =
+            PerIdMakeWriter::new(tempdir.path().to_path_buf(), "default.log", 1, 2, false).unwrap();
+        let record = vec![b'x'; 1024 * 1024];
+
+        router
+            .write_line_for(None, std::str::from_utf8(&record).unwrap())
+            .unwrap();
+        router.write_line_for(None, "next\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(tempdir.path().join("default.log.1"))
+                .unwrap()
+                .len(),
+            1024 * 1024
+        );
+        assert_eq!(
+            std::fs::read_to_string(tempdir.path().join("default.log")).unwrap(),
+            "next\n"
+        );
+    }
+
+    #[test]
+    fn retains_at_most_configured_files_per_stream() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let router =
+            PerIdMakeWriter::new(tempdir.path().to_path_buf(), "default.log", 1, 2, false).unwrap();
+        let record = "x".repeat(1024 * 1024);
+
+        router.write_line_for(None, &record).unwrap();
+        router.write_line_for(None, &record).unwrap();
+        router.write_line_for(None, &record).unwrap();
+
+        assert!(tempdir.path().join("default.log").exists());
+        assert!(tempdir.path().join("default.log.1").exists());
+        assert!(!tempdir.path().join("default.log.2").exists());
+    }
+
+    #[test]
+    fn rejects_records_larger_than_file_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let router =
+            PerIdMakeWriter::new(tempdir.path().to_path_buf(), "default.log", 1, 1, false).unwrap();
+
+        let error = router
+            .write_line_for(None, &"x".repeat(1024 * 1024 + 1))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tempdir.path().join("default.log").exists());
+    }
+
+    #[test]
+    fn daily_rotation_only_applies_to_nonempty_files() {
+        let today = Utc::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+
+        assert!(should_rotate(1, 1, 10, Some(yesterday), today, true));
+        assert!(!should_rotate(0, 1, 10, Some(yesterday), today, true));
     }
 }
