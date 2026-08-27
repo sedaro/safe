@@ -76,6 +76,17 @@ Send a telemetry frame through the local ingress socket:
 cargo run -p safectl -- send telemetry --json '{"telemetry":{"batt_v":34.5}}'
 ```
 
+Generate orbit-derived test telemetry from a saved CelesTrak TLE response:
+
+```bash
+cargo run -p safectl -- send-tle --norad-id 25544 --tle-file /path/to/iss.tle --frames 60
+```
+
+`send-tle` propagates the TLE with SGP4 and emits TEME position/velocity plus a
+deterministic, explicitly synthetic eclipse, power, battery, and thermal model.
+Omit `--tle-file` to fetch the current TLE from CelesTrak when network access is
+available. Use `--speed` to advance simulation time faster than wall-clock time.
+
 Stop SAFE with `Ctrl-C`. Configuration path resolution, adapters, and runtime
 directories are documented in [`runtime-config.md`](./safe/docs/runtime-config.md).
 
