@@ -17,6 +17,13 @@ impl Drop for SafeProcess {
     }
 }
 
+impl SafeProcess {
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn external_egress_acknowledgement_marks_seeded_commands_published() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -52,12 +59,39 @@ fn external_egress_clear_request_cancels_only_the_requested_command() {
     assert!(safe.0.try_wait().unwrap().is_none());
 }
 
+#[test]
+fn compacted_output_journal_restores_board_after_restart() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut safe = start_safe_with_egress(&tempdir, true);
+
+    wait_for_board_entry(
+        &tempdir.path().join("state/status.json"),
+        COMMAND_ID,
+        "rejected",
+    );
+    wait_for_output_snapshot(&tempdir.path().join("state/outputs.jsonl"));
+    safe.stop();
+
+    let mut restarted = start_safe_with_egress(&tempdir, true);
+    let board = wait_for_board_entry(
+        &tempdir.path().join("state/status.json"),
+        COMMAND_ID,
+        "rejected",
+    );
+
+    assert_eq!(board["decision_reason"], "host schedule cleared");
+    assert!(restarted.0.try_wait().unwrap().is_none());
+}
+
 fn start_safe_with_egress(tempdir: &tempfile::TempDir, clear_board: bool) -> SafeProcess {
     let base = tempdir.path();
     let state = base.join("state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(base.join("modes.json"), "[]").unwrap();
-    seed_approved_board(&state.join("outputs.jsonl"));
+    let outputs = state.join("outputs.jsonl");
+    if !outputs.exists() {
+        seed_approved_board(&outputs);
+    }
 
     let response = if clear_board {
         r#"printf '%s\n' '{"kind":"board_published","command_ids":["1:00000000-0000-0000-0000-000000000001:0","2:00000000-0000-0000-0000-000000000001:0"]}' '{"kind":"clear_board_commands","command_ids":["1:00000000-0000-0000-0000-000000000001:0"],"reason":"host schedule cleared"}'"#
@@ -77,7 +111,7 @@ fn start_safe_with_egress(tempdir: &tempfile::TempDir, clear_board: bool) -> Saf
     std::fs::write(
         &config_path,
         format!(
-            "base_paths:\n  base_working_directory: {base}\n  base_writable_directory: {base}\nlogging:\n  file_path: {base}/logs/safe.log\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  egress_adapter: external\n  external_egress_command: \"bash {script}\"\n  gatekeeper_adapter: disabled\n",
+            "base_paths:\n  base_working_directory: {base}\n  base_writable_directory: {base}\nlogging:\n  file_path: {base}/logs/safe.log\npersistence:\n  events_max_bytes: 1048576\n  events_max_records: 1000\n  outputs_max_bytes: 1048576\n  outputs_max_records: 1\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  egress_adapter: external\n  external_egress_command: \"bash {script}\"\n  gatekeeper_adapter: disabled\n",
             base = base.display(),
             script = script_path.display(),
         ),
@@ -163,5 +197,23 @@ fn wait_for_board_entry(status_path: &Path, command_id: &str, expected_state: &s
     panic!(
         "timed out waiting for {expected_state} board entry at {}",
         status_path.display()
+    );
+}
+
+fn wait_for_output_snapshot(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(record) = serde_json::from_str::<Value>(contents.trim())
+            && record.get("Snapshot").is_some()
+        {
+            return;
+        }
+        sleep(Duration::from_millis(25));
+    }
+
+    panic!(
+        "timed out waiting for output journal snapshot at {}",
+        path.display()
     );
 }
