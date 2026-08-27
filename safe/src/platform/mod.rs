@@ -1,17 +1,15 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::protocol::{BoardCmdId, BoardState};
 use crate::telemetry_frame::TelemetryFrame;
-use crate::{
-    HostCommandDispatchRecord, HostCommandRequest, HostCommandStatus, RuntimePaths, SafectlIngress,
-    TimedCommand,
-};
+use crate::{HostCommandRequest, HostCommandStatus, RuntimePaths, SafectlIngress, TimedCommand};
 
 pub mod gatekeeper;
 pub mod telemetry;
@@ -20,6 +18,35 @@ use telemetry::spawn_telemetry_ingress;
 #[derive(Debug, Clone)]
 pub struct BoardPublicationStatus {
     pub command_ids: Vec<BoardCmdId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformEgressKind {
+    SafectlFilesystem,
+    External,
+}
+
+impl PlatformEgressKind {
+    pub fn from_config(name: &str) -> anyhow::Result<Self> {
+        match name {
+            "safectl_filesystem" => Ok(Self::SafectlFilesystem),
+            "external" => Ok(Self::External),
+            _ => anyhow::bail!("unsupported platform egress adapter: {name}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PlatformEgressWireInput {
+    HostCommandStatus { status: HostCommandStatus },
+    BoardSnapshot { board: BoardState },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PlatformEgressWireOutput {
+    BoardPublished { command_ids: Vec<BoardCmdId> },
 }
 
 #[async_trait]
@@ -152,49 +179,162 @@ pub fn spawn_platform_egress(
     mut command_dispatch_rx: mpsc::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
 ) -> anyhow::Result<()> {
-    let command_kind = CommandIngressKind::from_config(&cfg.platform.command_adapter)?;
+    let egress_kind = PlatformEgressKind::from_config(&cfg.platform.egress_adapter)?;
 
-    match command_kind {
-        CommandIngressKind::SafectlUnixJson => {
-            #[cfg(feature = "platform-safectl-json")]
-            {
-                let status_path = runtime_paths.state.join("host_command_status.jsonl");
-                let dispatch_csv_path = runtime_paths.base.join("out").join("commands.csv");
-                tokio::spawn(async move {
-                    while let Some(status) = status_rx.recv().await {
+    match egress_kind {
+        PlatformEgressKind::SafectlFilesystem => {
+            let status_path = runtime_paths.state.join("host_command_status.jsonl");
+            let dispatch_csv_path = runtime_paths.base.join("out").join("commands.csv");
+            tokio::spawn(filesystem_egress_adapter(
+                status_path,
+                dispatch_csv_path,
+                status_rx,
+                command_dispatch_rx,
+                board_publication_tx,
+            ));
+        }
+        PlatformEgressKind::External => {
+            let command = cfg
+                .platform
+                .external_egress_command
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "platform egress adapter external selected, but platform.external_egress_command is not configured"
+                ))?;
+            tokio::spawn(async move {
+                if let Err(e) = external_egress_adapter(
+                    command,
+                    status_rx,
+                    command_dispatch_rx,
+                    board_publication_tx,
+                )
+                .await
+                {
+                    error!("external platform egress adapter stopped: {e}");
+                }
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn filesystem_egress_adapter(
+    status_path: PathBuf,
+    dispatch_csv_path: PathBuf,
+    mut status_rx: mpsc::Receiver<HostCommandStatus>,
+    mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
+) -> anyhow::Result<()> {
+    let mut status_open = true;
+    let mut command_dispatch_open = true;
+    loop {
+        if !status_open && !command_dispatch_open {
+            break;
+        }
+        tokio::select! {
+            status = status_rx.recv(), if status_open => {
+                match status {
+                    Some(status) => {
                         if let Err(e) = append_host_status_jsonl(&status_path, &status).await {
                             error!("failed writing host command status: {e}");
                         }
                     }
-                });
-                tokio::spawn(async move {
-                    while let Some(board_state) = command_dispatch_rx.recv().await {
-                        match write_host_command_dispatch_csv(&dispatch_csv_path, &board_state)
-                            .await
-                        {
-                            Ok(()) => {
-                                let _ = board_publication_tx
-                                    .send(BoardPublicationStatus {
-                                        command_ids: board_state.source_of_truth,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                error!("failed writing host command dispatch csv: {e}");
+                    None => status_open = false,
+                }
+            }
+            board_state = command_dispatch_rx.recv(), if command_dispatch_open => {
+                match board_state {
+                    Some(board_state) => match write_host_command_dispatch_csv(&dispatch_csv_path, &board_state).await {
+                        Ok(()) => {
+                            if board_publication_tx.send(BoardPublicationStatus {
+                                command_ids: board_state.source_of_truth,
+                            }).await.is_err() {
+                                break;
                             }
                         }
-                    }
-                });
-            }
-            #[cfg(not(feature = "platform-safectl-json"))]
-            {
-                anyhow::bail!(
-                    "command adapter safectl_unix_json selected, but feature platform-safectl-json is disabled"
-                );
+                        Err(e) => error!("failed writing host command dispatch csv: {e}"),
+                    },
+                    None => command_dispatch_open = false,
+                }
             }
         }
     }
+    Ok(())
+}
 
+async fn external_egress_adapter(
+    command: String,
+    mut status_rx: mpsc::Receiver<HostCommandStatus>,
+    mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
+) -> anyhow::Result<()> {
+    info!(%command, "platform egress adapter `external` started");
+
+    let mut child = Command::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("external egress process has no stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("external egress process has no stdout"))?;
+
+    let mut writer = stdin;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut status_open = true;
+    let mut command_dispatch_open = true;
+    loop {
+        if !status_open && !command_dispatch_open {
+            break;
+        }
+        tokio::select! {
+            status = status_rx.recv(), if status_open => {
+                match status {
+                    Some(status) => write_egress_message(&mut writer, PlatformEgressWireInput::HostCommandStatus { status }).await?,
+                    None => status_open = false,
+                }
+            }
+            board = command_dispatch_rx.recv(), if command_dispatch_open => {
+                match board {
+                    Some(board) => write_egress_message(&mut writer, PlatformEgressWireInput::BoardSnapshot { board }).await?,
+                    None => command_dispatch_open = false,
+                }
+            }
+            line = lines.next_line() => {
+                let Some(line) = line? else { break; };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<PlatformEgressWireOutput>(trimmed) {
+                    Ok(PlatformEgressWireOutput::BoardPublished { command_ids }) => {
+                        if board_publication_tx.send(BoardPublicationStatus { command_ids }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => error!("invalid external egress json value: {e}; line={trimmed}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn write_egress_message(
+    writer: &mut tokio::process::ChildStdin,
+    message: PlatformEgressWireInput,
+) -> anyhow::Result<()> {
+    let line = serde_json::to_string(&message)?;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -306,6 +446,102 @@ mod tests {
     use super::*;
     use crate::protocol::Command;
     use crate::protocol::TimedCommand;
+    use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn platform_egress_kind_parses_supported_adapters() {
+        assert_eq!(
+            PlatformEgressKind::from_config("safectl_filesystem").unwrap(),
+            PlatformEgressKind::SafectlFilesystem
+        );
+        assert_eq!(
+            PlatformEgressKind::from_config("external").unwrap(),
+            PlatformEgressKind::External
+        );
+        assert!(PlatformEgressKind::from_config("unknown").is_err());
+    }
+
+    #[test]
+    fn platform_egress_wire_messages_round_trip() {
+        let message = PlatformEgressWireInput::HostCommandStatus {
+            status: HostCommandStatus {
+                request_id: "request-1".to_string(),
+                state: crate::HostCommandStatusState::Accepted,
+                detail: "command accepted".to_string(),
+                ts_mono: 42,
+            },
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"kind\":\"host_command_status\""));
+        let decoded: PlatformEgressWireInput = serde_json::from_str(&json).unwrap();
+        match decoded {
+            PlatformEgressWireInput::HostCommandStatus { status } => {
+                assert_eq!(status.request_id, "request-1");
+                assert_eq!(status.ts_mono, 42);
+            }
+            PlatformEgressWireInput::BoardSnapshot { .. } => panic!("unexpected board snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_egress_publishes_only_acknowledged_command_ids() {
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = mpsc::channel(1);
+        let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let adapter = tokio::spawn(external_egress_adapter(
+            r#"while IFS= read -r _; do printf '%s\n' '{"kind":"board_published","command_ids":["test-id"]}'; done"#.to_string(),
+            status_rx,
+            board_rx,
+            publication_tx,
+        ));
+
+        board_tx.send(BoardState::default()).await.unwrap();
+        let publication = timeout(Duration::from_secs(1), publication_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publication.command_ids,
+            vec![BoardCmdId("test-id".to_string())]
+        );
+
+        drop(status_tx);
+        drop(board_tx);
+        timeout(Duration::from_secs(1), adapter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_egress_does_not_publish_without_an_acknowledgement() {
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = mpsc::channel(1);
+        let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let adapter = tokio::spawn(external_egress_adapter(
+            "cat >/dev/null".to_string(),
+            status_rx,
+            board_rx,
+            publication_tx,
+        ));
+
+        board_tx.send(BoardState::default()).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), publication_rx.recv())
+                .await
+                .is_err()
+        );
+
+        drop(status_tx);
+        drop(board_tx);
+        timeout(Duration::from_secs(1), adapter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn append_host_command_dispatch_csv_writes_header_and_rows() {

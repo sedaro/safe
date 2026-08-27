@@ -109,12 +109,16 @@ pub struct PlatformConfig {
     pub telemetry_adapter: String,
     #[serde(default = "default_command_adapter")]
     pub command_adapter: String,
+    #[serde(default = "default_egress_adapter")]
+    pub egress_adapter: String,
     #[serde(default = "default_gatekeeper_adapter")]
     pub gatekeeper_adapter: String,
     #[serde(default)]
     pub bash_mock_telemetry_command: Option<String>,
     #[serde(default)]
     pub external_telemetry_command: Option<String>,
+    #[serde(default)]
+    pub external_egress_command: Option<String>,
     #[serde(default)]
     pub external_gatekeeper_command: Option<String>,
 }
@@ -125,6 +129,10 @@ fn default_telemetry_adapter() -> String {
 
 fn default_command_adapter() -> String {
     "safectl_unix_json".to_string()
+}
+
+fn default_egress_adapter() -> String {
+    "safectl_filesystem".to_string()
 }
 
 fn default_gatekeeper_adapter() -> String {
@@ -180,9 +188,11 @@ impl Default for SerializedDefaults {
             platform: PlatformConfigDefaults {
                 telemetry_adapter: default_telemetry_adapter(),
                 command_adapter: default_command_adapter(),
+                egress_adapter: default_egress_adapter(),
                 gatekeeper_adapter: default_gatekeeper_adapter(),
                 bash_mock_telemetry_command: None,
                 external_telemetry_command: None,
+                external_egress_command: None,
                 external_gatekeeper_command: None,
             },
             base_paths: BasePathsConfigDefaults {
@@ -241,9 +251,11 @@ struct LimitsConfigDefaults {
 struct PlatformConfigDefaults {
     telemetry_adapter: String,
     command_adapter: String,
+    egress_adapter: String,
     gatekeeper_adapter: String,
     bash_mock_telemetry_command: Option<String>,
     external_telemetry_command: Option<String>,
+    external_egress_command: Option<String>,
     external_gatekeeper_command: Option<String>,
 }
 
