@@ -182,6 +182,21 @@ After delivering commands from a board snapshot, the child must return:
 SAFE marks only the acknowledged command IDs as `Published`. A successful
 stdin write alone does not mark a command published.
 
+This repository includes an example compatible executable. Build it with:
+
+```bash
+cargo build -p safe --bin platform-egress-example
+```
+
+It reproduces the filesystem adapter's status JSONL and scheduled-command CSV
+outputs under its `--base-path` (default: `/tmp/safe`):
+
+```yaml
+platform:
+  egress_adapter: external
+  external_egress_command: "/path/to/platform-egress-example --base-path /tmp/safe"
+```
+
 The disabled gatekeeper consumes pending-batch requests and immediately emits
 approval. The external gatekeeper receives JSONL on stdin and must write JSONL
 approval or rejection messages on stdout. SAFE sets `SAFE_GATEKEEPER_CONFIG_JSON`
