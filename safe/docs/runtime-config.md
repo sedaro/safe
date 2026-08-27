@@ -54,6 +54,12 @@ logging:
 limits:
   max_autonomy_modes: 10
 
+persistence:
+  events_max_bytes: 16777216
+  events_max_records: 10000
+  outputs_max_bytes: 16777216
+  outputs_max_records: 10000
+
 base_paths:
   base_working_directory: "/tmp/safe"
   base_writable_directory: "/tmp/safe"
@@ -85,6 +91,10 @@ gatekeeper: {}
 | `logging.rotation.max_files` | `10` | Maximum retained files per stream, including the active file. Older numbered archives are removed. |
 | `logging.rotation.daily` | `false` | Rotate a non-empty active log when its UTC calendar day changes. Size rotation always applies. |
 | `limits.max_autonomy_modes` | `10` | Maximum number of JSON mode entries, including disabled entries. |
+| `persistence.events_max_bytes` | `16777216` | Compact the event recovery journal after it reaches this byte count. |
+| `persistence.events_max_records` | `10000` | Compact the event recovery journal after this many records. |
+| `persistence.outputs_max_bytes` | `16777216` | Compact the output recovery journal after it reaches this byte count. |
+| `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
@@ -97,9 +107,9 @@ gatekeeper: {}
 | `platform.external_gatekeeper_command` | none | Shell command implementing the external gatekeeper JSONL protocol. |
 | `gatekeeper` | `{}` | Arbitrary JSON passed to an external gatekeeper as an environment variable. |
 
-SAFE validates that `max_autonomy_modes`, `rotation.max_files`, and
-`rotation.max_file_size_mb` are greater than zero, and that the configured log
-size can be represented in bytes. Each log stream retains at most
+SAFE validates that `max_autonomy_modes`, all persistence limits,
+`rotation.max_files`, and `rotation.max_file_size_mb` are greater than zero,
+and that the configured log size can be represented in bytes. Each log stream retains at most
 `rotation.max_files * rotation.max_file_size_mb` MiB. This bound is per stream,
 not a global limit for the logging directory. It does not validate that
 configured adapter commands or executable paths exist until they are started.
