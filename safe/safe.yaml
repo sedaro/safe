@@ -25,6 +25,8 @@ base_paths:
   base_writable_directory: /tmp/safe
 
 platform:
+  egress_adapter: safectl_filesystem
+  external_egress_command: null
   gatekeeper_adapter: disabled
   external_gatekeeper_command: null
 
