@@ -20,6 +20,16 @@ pub struct BoardPublicationStatus {
     pub command_ids: Vec<BoardCmdId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BoardClearRequest {
+    pub command_ids: Vec<BoardCmdId>,
+    pub reason: String,
+}
+
+pub fn platform_egress_id() -> crate::AutonomyModeId {
+    crate::AutonomyModeId(uuid::Uuid::from_u128(u128::MAX))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformEgressKind {
     SafectlFilesystem,
@@ -46,7 +56,13 @@ enum PlatformEgressWireInput {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PlatformEgressWireOutput {
-    BoardPublished { command_ids: Vec<BoardCmdId> },
+    BoardPublished {
+        command_ids: Vec<BoardCmdId>,
+    },
+    ClearBoardCommands {
+        command_ids: Vec<BoardCmdId>,
+        reason: String,
+    },
 }
 
 #[async_trait]
@@ -178,6 +194,7 @@ pub fn spawn_platform_egress(
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
     mut command_dispatch_rx: mpsc::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
+    board_clear_tx: mpsc::Sender<BoardClearRequest>,
 ) -> anyhow::Result<()> {
     let egress_kind = PlatformEgressKind::from_config(&cfg.platform.egress_adapter)?;
 
@@ -207,6 +224,7 @@ pub fn spawn_platform_egress(
                     status_rx,
                     command_dispatch_rx,
                     board_publication_tx,
+                    board_clear_tx,
                 )
                 .await
                 {
@@ -268,6 +286,7 @@ async fn external_egress_adapter(
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
     mut command_dispatch_rx: mpsc::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
+    board_clear_tx: mpsc::Sender<BoardClearRequest>,
 ) -> anyhow::Result<()> {
     info!(%command, "platform egress adapter `external` started");
 
@@ -316,6 +335,11 @@ async fn external_egress_adapter(
                 match serde_json::from_str::<PlatformEgressWireOutput>(trimmed) {
                     Ok(PlatformEgressWireOutput::BoardPublished { command_ids }) => {
                         if board_publication_tx.send(BoardPublicationStatus { command_ids }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(PlatformEgressWireOutput::ClearBoardCommands { command_ids, reason }) => {
+                        if board_clear_tx.send(BoardClearRequest { command_ids, reason }).await.is_err() {
                             break;
                         }
                     }
@@ -462,6 +486,14 @@ mod tests {
     }
 
     #[test]
+    fn platform_egress_id_is_all_ones() {
+        assert_eq!(
+            platform_egress_id().to_string(),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        );
+    }
+
+    #[test]
     fn platform_egress_wire_messages_round_trip() {
         let message = PlatformEgressWireInput::HostCommandStatus {
             status: HostCommandStatus {
@@ -489,11 +521,13 @@ mod tests {
         let (status_tx, status_rx) = mpsc::channel(1);
         let (board_tx, board_rx) = mpsc::channel(1);
         let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             r#"while IFS= read -r _; do printf '%s\n' '{"kind":"board_published","command_ids":["test-id"]}'; done"#.to_string(),
             status_rx,
             board_rx,
             publication_tx,
+            clear_tx,
         ));
 
         board_tx.send(BoardState::default()).await.unwrap();
@@ -520,11 +554,13 @@ mod tests {
         let (status_tx, status_rx) = mpsc::channel(1);
         let (board_tx, board_rx) = mpsc::channel(1);
         let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             "cat >/dev/null".to_string(),
             status_rx,
             board_rx,
             publication_tx,
+            clear_tx,
         ));
 
         board_tx.send(BoardState::default()).await.unwrap();
@@ -533,6 +569,37 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        drop(status_tx);
+        drop(board_tx);
+        timeout(Duration::from_secs(1), adapter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_egress_forwards_clear_requests() {
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = mpsc::channel(1);
+        let (publication_tx, _publication_rx) = mpsc::channel(1);
+        let (clear_tx, mut clear_rx) = mpsc::channel(1);
+        let adapter = tokio::spawn(external_egress_adapter(
+            r#"while IFS= read -r _; do printf '%s\n' '{"kind":"clear_board_commands","command_ids":["test-id"],"reason":"host schedule cleared"}'; done"#.to_string(),
+            status_rx,
+            board_rx,
+            publication_tx,
+            clear_tx,
+        ));
+
+        board_tx.send(BoardState::default()).await.unwrap();
+        let clear = timeout(Duration::from_secs(1), clear_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(clear.command_ids, vec![BoardCmdId("test-id".to_string())]);
+        assert_eq!(clear.reason, "host schedule cleared");
 
         drop(status_tx);
         drop(board_tx);
