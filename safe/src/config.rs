@@ -62,6 +62,15 @@ impl Config {
         if self.logging.rotation.max_file_size_mb == 0 {
             return Err("logging.rotation.max_file_size_mb must be > 0".into());
         }
+        if self
+            .logging
+            .rotation
+            .max_file_size_mb
+            .checked_mul(1024 * 1024)
+            .is_none()
+        {
+            return Err("logging.rotation.max_file_size_mb is too large".into());
+        }
         Ok(())
     }
 }
@@ -290,5 +299,15 @@ mod tests {
 
         let cfg = Config::load().unwrap();
         assert_eq!(cfg.base_paths.base_writable_directory, "/tmp/a");
+    }
+
+    #[test]
+    fn rejects_log_size_that_overflows_bytes() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        config.logging.rotation.max_file_size_mb = u64::MAX;
+
+        assert!(config.validate().is_err());
     }
 }
