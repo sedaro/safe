@@ -1970,7 +1970,6 @@ dependencies = [
  "opentelemetry-proto",
  "proptest",
  "prost",
- "reqwest",
  "safe-time",
  "serde",
  "serde_json",
