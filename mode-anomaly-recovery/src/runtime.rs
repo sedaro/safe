@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use safe::http_client;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
 use safe::protocol::{AutonomyModeBoardState, Command, CommandEnvelope, TimedCommand};
 use safe::telemetry_frame::TelemetryFrame;
@@ -13,6 +12,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::http_client;
 use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 #[derive(Debug, Clone, Serialize)]
