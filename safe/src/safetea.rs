@@ -18,7 +18,10 @@ use crate::flight::{AutonomyModeActivation, Flight};
 use crate::platform::gatekeeper::{
     GatekeeperAdapterInput, GatekeeperAdapterOutput, spawn_gatekeeper_adapter,
 };
-use crate::platform::{BoardPublicationStatus, spawn_platform_egress, spawn_platform_ingress};
+use crate::platform::{
+    BoardClearRequest, BoardPublicationStatus, platform_egress_id, spawn_platform_egress,
+    spawn_platform_ingress,
+};
 use crate::router::AutonomyModeConfig;
 use crate::router::{Router, canonical_path};
 use crate::runtime::{
@@ -250,6 +253,7 @@ pub struct SafeTEASummary {
 
 pub struct SafeTEA {
     board: BoardState,
+    board_clear_rx: mpsc::Receiver<BoardClearRequest>,
     board_publication_rx: mpsc::Receiver<BoardPublicationStatus>,
     cfg: Config,
     config_reload_tick: time::Interval,
@@ -559,6 +563,7 @@ impl SafeTEA {
             mpsc::channel::<BoardState>(1024);
         let (board_publication_tx, board_publication_rx) =
             mpsc::channel::<BoardPublicationStatus>(1024);
+        let (board_clear_tx, board_clear_rx) = mpsc::channel::<BoardClearRequest>(1024);
         spawn_platform_ingress(
             &cfg,
             &runtime_paths,
@@ -572,6 +577,7 @@ impl SafeTEA {
             host_status_rx,
             host_command_dispatch_rx,
             board_publication_tx,
+            board_clear_tx,
         )
         .expect("platform egress");
 
@@ -581,6 +587,7 @@ impl SafeTEA {
         let next_seq = flight.peak_next_seq();
         let mut safetea = Self {
             board,
+            board_clear_rx,
             board_publication_rx,
             cfg,
             config_reload_tick: time::interval(Duration::from_secs(1)),
@@ -892,6 +899,25 @@ impl SafeTEA {
                             .extend(publication.command_ids);
                         if let Err(e) = self.write_operational_status().await {
                             error!("failed writing operational status: {e}");
+                        }
+                    }
+                }
+
+                maybe_clear = self.board_clear_rx.recv() => {
+                    if let Some(clear) = maybe_clear {
+                        for id in clear.command_ids {
+                            self.q.push_back(Event {
+                                seq: self.next_seq,
+                                ts_mono: self.logical_ts,
+                                source: Source::System,
+                                msg: Msg::BoardCommandCanceled {
+                                    id,
+                                    reason: clear.reason.clone(),
+                                    by: platform_egress_id(),
+                                },
+                            });
+                            self.next_seq += 1;
+                            self.logical_ts += 1;
                         }
                     }
                 }

@@ -182,6 +182,19 @@ After delivering commands from a board snapshot, the child must return:
 SAFE marks only the acknowledged command IDs as `Published`. A successful
 stdin write alone does not mark a command published.
 
+An external egress may request that SAFE remove commands from the board by
+writing this message to stdout:
+
+```json
+{"kind":"clear_board_commands","command_ids":["42:00000000-0000-0000-0000-000000000001:0"],"reason":"host schedule cleared"}
+```
+
+SAFE persists a cancellation event for each requested ID. These cancellations
+are attributed to the platform egress actor
+`ffffffff-ffff-ffff-ffff-ffffffffffff`; the gatekeeper remains the all-zero
+actor. This only clears SAFE's board and does not itself cancel commands that
+the host has already accepted.
+
 This repository includes an example compatible executable. Build it with:
 
 ```bash

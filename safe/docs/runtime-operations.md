@@ -81,6 +81,10 @@ writes status updates and complete board snapshots as JSONL to its stdin; the
 binary must return `board_published` JSONL acknowledgements on stdout before
 SAFE marks those commands published.
 
+An external egress may also return `clear_board_commands` with command IDs and
+a reason. SAFE persists those removals as board cancellations attributed to the
+all-ones platform egress actor.
+
 `TimedCommand::Now` and `TimedCommand::NOOP` are currently omitted from
 `commands.csv`. The direct `ExecuteNow` path is recorded in SAFE effects, but
 the host command dispatch integration is incomplete. A CLI status of
