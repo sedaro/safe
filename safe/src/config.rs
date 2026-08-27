@@ -17,6 +17,7 @@ pub struct Config {
     pub sockets: SocketsConfig,
     pub logging: LoggingConfig,
     pub limits: LimitsConfig,
+    pub persistence: PersistenceConfig,
     pub platform: PlatformConfig,
     pub base_paths: BasePathsConfig,
     #[serde(default = "default_gatekeeper_config")]
@@ -71,6 +72,13 @@ impl Config {
         {
             return Err("logging.rotation.max_file_size_mb is too large".into());
         }
+        if self.persistence.events_max_bytes == 0
+            || self.persistence.outputs_max_bytes == 0
+            || self.persistence.events_max_records == 0
+            || self.persistence.outputs_max_records == 0
+        {
+            return Err("persistence journal limits must be greater than zero".into());
+        }
         Ok(())
     }
 }
@@ -110,6 +118,14 @@ pub struct RotationConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     pub max_autonomy_modes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersistenceConfig {
+    pub events_max_bytes: u64,
+    pub events_max_records: usize,
+    pub outputs_max_bytes: u64,
+    pub outputs_max_records: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,6 +176,7 @@ struct SerializedDefaults {
     sockets: SocketsConfigDefaults,
     logging: LoggingConfigDefaults,
     limits: LimitsConfigDefaults,
+    persistence: PersistenceConfigDefaults,
     platform: PlatformConfigDefaults,
     base_paths: BasePathsConfigDefaults,
     gatekeeper: serde_json::Value,
@@ -193,6 +210,12 @@ impl Default for SerializedDefaults {
             },
             limits: LimitsConfigDefaults {
                 max_autonomy_modes: 10,
+            },
+            persistence: PersistenceConfigDefaults {
+                events_max_bytes: 16 * 1024 * 1024,
+                events_max_records: 10_000,
+                outputs_max_bytes: 16 * 1024 * 1024,
+                outputs_max_records: 10_000,
             },
             platform: PlatformConfigDefaults {
                 telemetry_adapter: default_telemetry_adapter(),
@@ -254,6 +277,14 @@ struct RotationConfigDefaults {
 #[derive(serde::Serialize)]
 struct LimitsConfigDefaults {
     max_autonomy_modes: usize,
+}
+
+#[derive(serde::Serialize)]
+struct PersistenceConfigDefaults {
+    events_max_bytes: u64,
+    events_max_records: usize,
+    outputs_max_bytes: u64,
+    outputs_max_records: usize,
 }
 
 #[derive(serde::Serialize)]
