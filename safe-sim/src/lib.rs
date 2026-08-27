@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use simvm::sv::data::Data;
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use simvm::sv::{combine::TR, combine::TRD, parse::Parse};
 use tokio::{process::Command as TokioCommand, time::timeout};
@@ -97,7 +98,7 @@ impl SimulationResult {
         let mut jsonl_paths = Vec::new();
         let mut seen = HashSet::new();
 
-        let mut candidate_dirs = vec![
+        let candidate_dirs = vec![
             target_dir.to_path_buf(),
             target_dir.join("local").join("output"),
             target_dir.join("output"),
@@ -153,6 +154,27 @@ impl SimulationResult {
     pub fn total_frames(&self) -> usize {
         self.frames_by_file.values().map(|v| v.len()).sum()
     }
+
+    /// Returns numeric values for one field in a collected output file.
+    ///
+    /// Keeping dynamic EDS value decoding behind this API prevents callers
+    /// such as the gatekeeper from depending directly on the simulation VM's
+    /// internal data representation.
+    pub fn numeric_field_values(&self, target_file: &str, field: &str) -> Vec<f64> {
+        let frames = self.frames_by_file.get(target_file).or_else(|| {
+            self.frames_by_file
+                .iter()
+                .find(|(name, _)| name.ends_with(target_file))
+                .map(|(_, frames)| frames)
+        });
+
+        frames
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| frame.get_by_field(field).ok())
+            .filter_map(|datum| datum.data.as_f64().ok())
+            .collect()
+    }
 }
 
 /// Configures and launches simulations from an EDS workspace.
@@ -185,7 +207,7 @@ impl Clone for SedaroSimulator {
 }
 
 /// Describes one EDS initial-state patch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EdsPatch {
     /// The ID of the agent where the patched field exists
     pub agent_id: String,
