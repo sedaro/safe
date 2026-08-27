@@ -6,7 +6,6 @@ edition.workspace = true
 [features]
 default = ["platform-safectl-json"]
 otel-metrics = ["dep:opentelemetry-proto", "dep:prost"]
-platform-bash-mock = []
 platform-safectl-json = []
 
 [dependencies]

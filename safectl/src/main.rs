@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 mod logs;
 mod output;
+mod tle;
 
 use logs::{LogOutputFormat, run_logs};
 use output::{
@@ -183,6 +184,36 @@ enum Commands {
         /// Optional JSON payload. Accepts full ingress JSON or payload-only JSON for selected kind.
         #[arg(long)]
         json: Option<String>,
+    },
+    /// Propagate a public TLE into deterministic orbit and bus telemetry.
+    SendTle {
+        /// NORAD catalog number used for the source label and CelesTrak request.
+        #[arg(long)]
+        norad_id: u64,
+
+        /// Read a three-line or two-line TLE response from a file instead of the network.
+        #[arg(long, conflicts_with = "tle_url")]
+        tle_file: Option<PathBuf>,
+
+        /// Fetch a TLE from this URL. The default is CelesTrak's GP endpoint.
+        #[arg(long)]
+        tle_url: Option<String>,
+
+        /// RFC3339 simulation start time. Defaults to the current UTC time.
+        #[arg(long)]
+        start_at: Option<String>,
+
+        /// Simulated seconds between frames.
+        #[arg(long, default_value_t = 1.0)]
+        step_secs: f64,
+
+        /// Simulated seconds advanced for each wall-clock second.
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+
+        /// Stop after this many frames. Omit to run until interrupted.
+        #[arg(long)]
+        frames: Option<u64>,
     },
     Watch {
         #[command(subcommand)]
@@ -1568,6 +1599,20 @@ async fn main() -> anyhow::Result<()> {
             json,
         }) => {
             run_send_with_helper(kind, op, mode, command, json).await?;
+        }
+        Some(Commands::SendTle {
+            norad_id,
+            tle_file,
+            tle_url,
+            start_at,
+            step_secs,
+            speed,
+            frames,
+        }) => {
+            tle::run_sender(
+                norad_id, tle_file, tle_url, start_at, step_secs, speed, frames,
+            )
+            .await?;
         }
         Some(Commands::Watch { command }) => match command {
             WatchObject::Messages { tail, follow, kind } => {
