@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::{fs, time};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::RuntimePaths;
@@ -30,7 +30,7 @@ use crate::runtime::{
 };
 use crate::sandbox::sandbox::SandboxResources;
 use crate::telemetry_frame::TelemetryFrame;
-use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
+use crate::utils::{append_jsonl, atomic_write_file, load_or_default_json, save_json_atomic};
 use crate::{
     AutonomyModeId, AutonomyModeInput, AutonomyModeMeta, AutonomyModeOutput, BoardCmdId,
     BoardEvent, BoardState, Command, CommandEnvelope, ExternalCommand, HostCommandDispatchRecord,
@@ -88,6 +88,12 @@ pub enum Effect {
     Halt(String),
     ExecuteCommand(TimedCommand),
     Board(BoardEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutputJournalRecord {
+    Snapshot { board: BoardState },
+    Effect { effect: Effect },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,7 +208,11 @@ pub(crate) async fn apply_event(
 
     if emit_outputs {
         for fx in &effects {
-            append_jsonl(outputs_path, fx).await?;
+            append_jsonl(
+                outputs_path,
+                &OutputJournalRecord::Effect { effect: fx.clone() },
+            )
+            .await?;
         }
     }
 
@@ -225,9 +235,14 @@ pub async fn rebuild_board_from_outputs(
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str(&line) {
-            Ok(fx) => {
-                if let Effect::Board(bev) = fx {
+        let record = serde_json::from_str::<OutputJournalRecord>(&line).or_else(|_| {
+            serde_json::from_str::<Effect>(&line)
+                .map(|effect| OutputJournalRecord::Effect { effect })
+        });
+        match record {
+            Ok(OutputJournalRecord::Snapshot { board: snapshot }) => board = snapshot,
+            Ok(OutputJournalRecord::Effect { effect }) => {
+                if let Effect::Board(bev) = effect {
                     board.apply(&bev);
                 }
             }
@@ -235,6 +250,36 @@ pub async fn rebuild_board_from_outputs(
         }
     }
     Ok(board)
+}
+
+pub(crate) async fn journal_record_count(path: &Path) -> anyhow::Result<usize> {
+    let file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut lines = BufReader::new(file).lines();
+    let mut count = 0;
+    while let Some(line) = lines.next_line().await? {
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+pub(crate) async fn journal_exceeds_limits(
+    path: &Path,
+    record_count: usize,
+    max_bytes: u64,
+    max_records: usize,
+) -> anyhow::Result<bool> {
+    let byte_limit_reached = match fs::metadata(path).await {
+        Ok(metadata) => metadata.len() >= max_bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(byte_limit_reached || record_count >= max_records)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,11 +303,13 @@ pub struct SafeTEA {
     cfg: Config,
     config_reload_tick: time::Interval,
     external_command_rx: mpsc::Receiver<HostCommandRequest>,
+    event_records: usize,
     gatekeeper_input_tx: mpsc::Sender<GatekeeperAdapterInput>,
     gatekeeper_output_rx: mpsc::Receiver<GatekeeperAdapterOutput>,
     gatekeeper_next_request_id: u64,
     latest_gatekeeper_request_id: Option<u64>,
     pending_gatekeeper_batches: HashMap<u64, PendingGatekeeperBatch>,
+    output_records: usize,
     host_status_tx: mpsc::Sender<HostCommandStatus>,
     sent_board_command_ids: HashSet<BoardCmdId>,
     flight: Flight,
@@ -553,6 +600,12 @@ impl SafeTEA {
         let board = rebuild_board_from_outputs(&runtime_paths)
             .await
             .expect("rebuild board");
+        let event_records = journal_record_count(&runtime_paths.events)
+            .await
+            .expect("count event records");
+        let output_records = journal_record_count(&runtime_paths.outputs)
+            .await
+            .expect("count output records");
         let sent_board_command_ids: HashSet<BoardCmdId> =
             board.source_of_truth.iter().cloned().collect();
 
@@ -592,11 +645,13 @@ impl SafeTEA {
             cfg,
             config_reload_tick: time::interval(Duration::from_secs(1)),
             external_command_rx,
+            event_records,
             gatekeeper_input_tx,
             gatekeeper_output_rx,
             gatekeeper_next_request_id: 1,
             latest_gatekeeper_request_id: None,
             pending_gatekeeper_batches: HashMap::new(),
+            output_records,
             sent_board_command_ids,
             flight,
             host_command_dispatch_tx,
@@ -1215,6 +1270,7 @@ impl SafeTEA {
                         append_jsonl(&self.runtime_paths.events, &ev)
                             .await
                             .expect("event append");
+                        self.event_records += 1;
                     }
                 }
 
@@ -1505,6 +1561,9 @@ impl SafeTEA {
                 save_json_atomic(&self.runtime_paths.summary, &self.summary)
                     .await
                     .expect("save json");
+                self.compact_journals_if_needed()
+                    .await
+                    .expect("compact recovery journals");
 
                 if !matches!(ev.msg, Msg::Tick)
                     && let Err(e) = self.write_operational_status().await
@@ -1524,13 +1583,57 @@ impl SafeTEA {
     }
 
     async fn apply_event(&mut self, ev: &Event, emit_outputs: bool) -> anyhow::Result<Vec<Effect>> {
-        apply_event(
+        let effects = apply_event(
             &mut self.flight,
             ev,
             &self.runtime_paths.outputs,
             emit_outputs,
         )
-        .await
+        .await?;
+        if emit_outputs {
+            self.output_records += effects.len();
+        }
+        Ok(effects)
+    }
+
+    async fn compact_journals_if_needed(&mut self) -> anyhow::Result<()> {
+        if journal_exceeds_limits(
+            &self.runtime_paths.events,
+            self.event_records,
+            self.cfg.persistence.events_max_bytes,
+            self.cfg.persistence.events_max_records,
+        )
+        .await?
+        {
+            atomic_write_file(&self.runtime_paths.events, b"").await?;
+            self.event_records = 0;
+        }
+
+        if journal_exceeds_limits(
+            &self.runtime_paths.outputs,
+            self.output_records,
+            self.cfg.persistence.outputs_max_bytes,
+            self.cfg.persistence.outputs_max_records,
+        )
+        .await?
+        {
+            let snapshot = OutputJournalRecord::Snapshot {
+                board: self.board.clone(),
+            };
+            let mut contents = serde_json::to_vec(&snapshot)?;
+            contents.push(b'\n');
+            if contents.len() as u64 > self.cfg.persistence.outputs_max_bytes {
+                warn!(
+                    snapshot_bytes = contents.len(),
+                    configured_max_bytes = self.cfg.persistence.outputs_max_bytes,
+                    "board snapshot exceeds the output journal size limit"
+                );
+            }
+            atomic_write_file(&self.runtime_paths.outputs, &contents).await?;
+            self.output_records = 1;
+        }
+
+        Ok(())
     }
 
     fn update(&mut self, ev: &Event) -> Vec<Effect> {
