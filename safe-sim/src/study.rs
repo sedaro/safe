@@ -632,18 +632,55 @@ mod tests {
         assert!(result.success);
     }
 
+    /// Verifies that EDS receives an owned target config and that it is cleaned up.
+    #[tokio::test]
+    async fn simulator_uses_and_cleans_unique_target_config() {
+        let workspace = fake_eds(
+            "printf '%s\\n' \"$*\" >> invocations && for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\"; fi; previous=\"$arg\"; done",
+        );
+        let first = simulator(&workspace);
+        let second = first.clone();
+
+        first.run_collect(1.0).await.unwrap();
+        second.run_collect(1.0).await.unwrap();
+
+        let invocations = std::fs::read_to_string(workspace.path().join("invocations")).unwrap();
+        let target_configs: Vec<_> = invocations
+            .lines()
+            .map(|invocation| {
+                let args: Vec<_> = invocation.split_whitespace().collect();
+                let index = args
+                    .iter()
+                    .position(|arg| *arg == "--target-config")
+                    .unwrap();
+                args[index + 1]
+            })
+            .collect();
+
+        assert_eq!(target_configs.len(), 2);
+        assert_ne!(target_configs[0], target_configs[1]);
+        for target_config in target_configs {
+            assert_eq!(target_config.len(), 32);
+            assert!(
+                target_config
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            );
+            assert!(!workspace.path().join(target_config).exists());
+        }
+    }
+
     /// Verifies that malformed target output becomes a run failure instead of a panic.
     #[tokio::test]
     async fn malformed_target_output_is_a_run_failure() {
         let workspace = fake_eds(
-            "printf '%s\\n' '{\"data\":{\"config\":\"\",\"stream_id\":\"x\",\"type\":\"(\"},\"event\":\"config\",\"stream_id\":\"x\"}' > broken.jsonl",
+            "for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\" && printf '%s\\n' '{\"data\":{\"config\":\"\",\"stream_id\":\"x\",\"type\":\"(\"},\"event\":\"config\",\"stream_id\":\"x\"}' > \"$arg/broken.jsonl\"; fi; previous=\"$arg\"; done",
         );
         let study = TradeStudy::new(simulator(&workspace), 1.0).case(StudyCase::new("broken"));
 
         let result = study.run().await.unwrap();
 
         assert!(matches!(result.runs[0].outcome, StudyRunOutcome::Failed(_)));
-        assert!(workspace.path().join("broken.jsonl").exists());
     }
 
     /// Verifies that cancellation drops the child process and preserves partial-study metadata.

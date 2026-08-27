@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use simvm::sv::ser_de::{dyn_de, dyn_ser};
 use simvm::sv::{combine::TR, combine::TRD, parse::Parse};
@@ -22,10 +23,15 @@ pub use study::{
 };
 pub use tokio_util::sync::CancellationToken;
 
-const SAFE_DELETE_EDS_OUTPUT_FILES_ENV: &str = "SAFE_DELETE_EDS_OUTPUT_FILES";
+fn random_target_config() -> String {
+    // A 128-bit OS-seeded value produces a portable directory name.
+    format!("{:032x}", rand::rng().random::<u128>())
+}
 
-fn should_delete_eds_output_files() -> bool {
-    std::env::var(SAFE_DELETE_EDS_OUTPUT_FILES_ENV)
+const SAFE_DELETE_EDS_RESULTS_ENV: &str = "SAFE_DELETE_EDS_RESULTS";
+
+fn should_delete_eds_results() -> bool {
+    std::env::var(SAFE_DELETE_EDS_RESULTS_ENV)
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "0" | "false" | "no" | "off")
@@ -96,11 +102,6 @@ impl SimulationResult {
             target_dir.join("local").join("output"),
             target_dir.join("output"),
         ];
-        if let Some(parent) = target_dir.parent() {
-            candidate_dirs.push(parent.join("local").join("output"));
-            candidate_dirs.push(parent.join("output"));
-        }
-
         for dir in candidate_dirs {
             collect_jsonl_paths_recursive(&dir, &mut jsonl_paths, &mut seen)?;
         }
@@ -139,25 +140,6 @@ impl SimulationResult {
             frames_by_file.len()
         );
 
-        // once frames have been read, delete the JSONL files to save disk space
-        if should_delete_eds_output_files() {
-            for path in &jsonl_paths {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!(
-                        "Failed to delete simulation output file '{}': {:?}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        } else {
-            tracing::debug!(
-                "Keeping {} simulation output .jsonl files in place ({}=false)",
-                jsonl_paths.len(),
-                SAFE_DELETE_EDS_OUTPUT_FILES_ENV
-            );
-        }
-
         Ok(Self {
             success: output.status.success(),
             exit_code: output.status.code(),
@@ -174,14 +156,32 @@ impl SimulationResult {
 }
 
 /// Configures and launches simulations from an EDS workspace.
-#[derive(Debug, Serialize, Clone)]
+///
+/// Each instance owns a random target directory so concurrent simulations do not
+/// write results into one another's output.
+#[derive(Debug, Serialize)]
 pub struct SedaroSimulator {
     path: std::path::PathBuf,
     args: Vec<String>,
+    target_config: String,
     timeout: Duration,
     venv: Option<std::path::PathBuf>,
     init_type: Option<TR>,
     epoch: Option<f64>,
+}
+
+impl Clone for SedaroSimulator {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            args: self.args.clone(),
+            target_config: random_target_config(),
+            timeout: self.timeout,
+            venv: self.venv.clone(),
+            init_type: self.init_type.clone(),
+            epoch: self.epoch,
+        }
+    }
 }
 
 /// Describes one EDS initial-state patch.
@@ -237,6 +237,7 @@ impl SedaroSimulator {
         SedaroSimulator {
             path: path.clone(),
             args: Vec::new(),
+            target_config: random_target_config(),
             timeout: Duration::MAX,
             venv: None,
             init_type: None,
@@ -296,7 +297,28 @@ impl SedaroSimulator {
 
     /// Appends raw command-line arguments passed to EDS.
     pub fn args(mut self, args: Vec<&str>) -> Self {
-        self.args.extend(args.iter().map(|s| s.to_string()));
+        let mut args = args.into_iter().peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--target-config" {
+                if let Some(value) = args.next_if(|value| !value.starts_with('-')) {
+                    tracing::warn!(
+                        attempted_target_config = value,
+                        "Ignoring caller-supplied EDS target-config; SedaroSimulator manages it"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Ignoring caller-supplied EDS target-config without a value; SedaroSimulator manages it"
+                    );
+                }
+            } else if let Some(value) = arg.strip_prefix("--target-config=") {
+                tracing::warn!(
+                    attempted_target_config = value,
+                    "Ignoring caller-supplied EDS target-config; SedaroSimulator manages it"
+                );
+            } else {
+                self.args.push(arg.to_string());
+            }
+        }
         self
     }
 
@@ -331,6 +353,8 @@ impl SedaroSimulator {
             command_args.push("--start".to_string());
             command_args.push(epoch_mjd.to_string());
         }
+        command_args.push("--target-config".to_string());
+        command_args.push(self.target_config.clone());
 
         let mut cmd = TokioCommand::new(&executable_path);
         let cmd = cmd
@@ -388,11 +412,37 @@ impl SedaroSimulator {
         }
     }
 
-    /// Runs EDS and collects its decoded target files into a simulation result.
+    /// Runs EDS, collects only this instance's target files, and removes that directory.
     pub async fn run_collect(&self, duration_days: f64) -> Result<SimulationResult> {
         let workspace_dir = self.workspace_dir()?;
-        let output = self.run(duration_days).await?;
-        SimulationResult::from_target_dir(&output, &workspace_dir)
+        let target_dir = workspace_dir.join(&self.target_config);
+        let output = match self.run(duration_days).await {
+            Ok(output) => output,
+            Err(error) => {
+                if should_delete_eds_results() {
+                    let _ = std::fs::remove_dir_all(&target_dir);
+                }
+                return Err(error);
+            }
+        };
+        let result = SimulationResult::from_target_dir(&output, &target_dir);
+        if should_delete_eds_results() {
+            if let Err(error) = std::fs::remove_dir_all(&target_dir) {
+                if target_dir.exists() {
+                    tracing::warn!(
+                        target_dir = %target_dir.display(),
+                        %error,
+                        "Failed to remove EDS results directory"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                target_dir = %target_dir.display(),
+                "Keeping EDS results directory (SAFE_DELETE_EDS_RESULTS=false)"
+            );
+        }
+        result
     }
 
     /// Reads the serialized type definition for an agent's initial state.
