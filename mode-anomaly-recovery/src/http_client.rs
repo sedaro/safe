@@ -114,7 +114,8 @@ mod tests {
 
     #[test]
     fn parses_plain_response() {
-        let response = parse_response(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello").unwrap();
+        let response =
+            parse_response(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello").unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "hello");
     }
