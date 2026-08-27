@@ -70,11 +70,16 @@ Pending board batches are sent to the configured gatekeeper. With
 detail `gatekeeper disabled`. An external gatekeeper receives JSONL requests on
 stdin and returns JSONL `approve` or `reject` messages on stdout.
 
-The default platform egress writes:
+The default `safectl_filesystem` platform egress writes:
 
 - Host command status records to `state/host_command_status.jsonl`.
 - Approved scheduled commands to `out/commands.csv` with `cmd` and `gps_time`
   columns.
+
+Set `platform.egress_adapter: external` to run a separate egress binary. SAFE
+writes status updates and complete board snapshots as JSONL to its stdin; the
+binary must return `board_published` JSONL acknowledgements on stdout before
+SAFE marks those commands published.
 
 `TimedCommand::Now` and `TimedCommand::NOOP` are currently omitted from
 `commands.csv`. The direct `ExecuteNow` path is recorded in SAFE effects, but

@@ -61,9 +61,11 @@ base_paths:
 platform:
   telemetry_adapter: "example"
   command_adapter: "safectl_unix_json"
+  egress_adapter: "safectl_filesystem"
   gatekeeper_adapter: "disabled"
   bash_mock_telemetry_command: null
   external_telemetry_command: null
+  external_egress_command: null
   external_gatekeeper_command: null
 
 gatekeeper: {}
@@ -84,10 +86,12 @@ gatekeeper: {}
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
-| `platform.command_adapter` | `safectl_unix_json` | The currently supported command ingress/egress adapter. |
+| `platform.command_adapter` | `safectl_unix_json` | Selects the command ingress adapter. |
+| `platform.egress_adapter` | `safectl_filesystem` | Selects `safectl_filesystem` or `external` platform egress. |
 | `platform.gatekeeper_adapter` | `disabled` | Selects `disabled` or `external`. Disabled automatically approves batches. |
 | `platform.bash_mock_telemetry_command` | none | Command used by `bash_mock`; the feature must be enabled at build time. |
 | `platform.external_telemetry_command` | none | Shell command whose stdout supplies telemetry JSONL. |
+| `platform.external_egress_command` | none | Shell command implementing the external egress JSONL protocol. |
 | `platform.external_gatekeeper_command` | none | Shell command implementing the external gatekeeper JSONL protocol. |
 | `gatekeeper` | `{}` | Arbitrary JSON passed to an external gatekeeper as an environment variable. |
 
@@ -103,6 +107,8 @@ fields on `__`. For example:
 ```bash
 SAFE_PLATFORM__TELEMETRY_ADAPTER=external
 SAFE_PLATFORM__EXTERNAL_TELEMETRY_COMMAND='cat /var/run/telemetry.jsonl'
+SAFE_PLATFORM__EGRESS_ADAPTER=external
+SAFE_PLATFORM__EXTERNAL_EGRESS_COMMAND='/usr/local/bin/platform-egress'
 SAFE_BASE_PATHS__BASE_WRITABLE_DIRECTORY=/var/lib/safe
 ```
 
@@ -138,7 +144,7 @@ the `platform-bash-mock` feature to enable this adapter.
 stdout line must be a JSON object with optional `source` and `ts_mono` fields and
 a `payload` field. Invalid lines are logged and skipped.
 
-## Command and Gatekeeper Adapters
+## Command, Egress, and Gatekeeper Adapters
 
 The default `safectl_unix_json` adapter listens at:
 
@@ -148,6 +154,33 @@ The default `safectl_unix_json` adapter listens at:
 
 It accepts newline-delimited JSON command or telemetry ingress messages. See
 [`safectl.md`](./safectl.md) for the wire shapes.
+
+The default `safectl_filesystem` egress writes host command status records to
+`state/host_command_status.jsonl` and approved scheduled commands to
+`out/commands.csv`.
+
+The `external` egress adapter executes `external_egress_command` through
+`bash -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
+responses from stdout. The child receives either a status update:
+
+```json
+{"kind":"host_command_status","status":{"request_id":"request-1","state":"accepted","detail":"command accepted","ts_mono":42}}
+```
+
+or a complete board snapshot:
+
+```json
+{"kind":"board_snapshot","board":{"proposals":{},"rejected":{},"approved":{},"source_of_truth":[]}}
+```
+
+After delivering commands from a board snapshot, the child must return:
+
+```json
+{"kind":"board_published","command_ids":["42:00000000-0000-0000-0000-000000000001:0"]}
+```
+
+SAFE marks only the acknowledged command IDs as `Published`. A successful
+stdin write alone does not mark a command published.
 
 The disabled gatekeeper consumes pending-batch requests and immediately emits
 approval. The external gatekeeper receives JSONL on stdin and must write JSONL
