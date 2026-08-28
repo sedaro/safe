@@ -14,7 +14,7 @@ use crate::safetea::{
     journal_record_count, rebuild_board_from_outputs, update,
 };
 use crate::telemetry_frame::TelemetryFrame;
-use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
+use crate::utils::{append_jsonl, append_jsonl_bounded, load_or_default_json, save_json_atomic};
 use std::path::Path;
 
 fn mk_mode_id(n: u128) -> AutonomyModeId {
@@ -50,8 +50,7 @@ fn telemetry_with_flag(flag: bool) -> TelemetryFrame {
 }
 
 #[tokio::test]
-#[ignore = "reproduces oversized event journal writes before compaction"]
-async fn oversized_event_is_written_before_the_journal_limit_is_checked() {
+async fn oversized_event_is_rejected_before_the_journal_is_written() {
     let tempdir = tempfile::tempdir().unwrap();
     let events_path = tempdir.path().join("events.jsonl");
     let max_bytes = 1024;
@@ -66,18 +65,40 @@ async fn oversized_event_is_written_before_the_journal_limit_is_checked() {
         }),
     };
 
-    append_jsonl(&events_path, &event).await.unwrap();
+    let error = append_jsonl_bounded(&events_path, &event, max_bytes as u64)
+        .await
+        .unwrap_err();
 
-    let written_bytes = fs::metadata(&events_path).await.unwrap().len();
     assert!(
-        written_bytes > max_bytes as u64,
-        "the append was expected to exceed the configured limit before compaction"
+        error.to_string().contains("exceeding"),
+        "unexpected error: {error}"
     );
+    assert!(!events_path.exists());
+}
+
+#[tokio::test]
+async fn bounded_event_append_replaces_checkpointed_history_before_overflow() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let events_path = tempdir.path().join("events.jsonl");
+    let max_bytes = 512;
+    let first = serde_json::json!({ "event": 1, "data": "a".repeat(300) });
+    let second = serde_json::json!({ "event": 2, "data": "b".repeat(300) });
+
     assert!(
-        journal_exceeds_limits(&events_path, 1, max_bytes as u64, usize::MAX)
+        !append_jsonl_bounded(&events_path, &first, max_bytes)
             .await
             .unwrap()
     );
+    assert!(
+        append_jsonl_bounded(&events_path, &second, max_bytes)
+            .await
+            .unwrap()
+    );
+
+    let contents = fs::read_to_string(&events_path).await.unwrap();
+    assert!(contents.len() <= max_bytes as usize);
+    assert!(!contents.contains("\"event\":1"));
+    assert!(contents.contains("\"event\":2"));
 }
 
 fn mode_meta(id: u128, priority: u8, enabled: bool) -> AutonomyModeMeta {
