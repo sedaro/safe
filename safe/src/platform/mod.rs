@@ -220,10 +220,12 @@ pub fn spawn_platform_egress(
                 .ok_or_else(|| anyhow::anyhow!(
                     "platform egress adapter external selected, but platform.external_egress_command is not configured"
                 ))?;
+            let shell_executable = cfg.platform.shell_executable.clone();
             let retry_config = cfg.platform.external_egress_retry.clone();
             tokio::spawn(async move {
                 if let Err(e) = external_egress_adapter(
                     command,
+                    shell_executable,
                     status_rx,
                     command_dispatch_rx,
                     board_publication_tx,
@@ -290,6 +292,7 @@ async fn filesystem_egress_adapter(
 
 async fn external_egress_adapter(
     command: String,
+    shell_executable: String,
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
     mut command_dispatch_rx: watch::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
@@ -313,6 +316,7 @@ async fn external_egress_adapter(
         let started_at = tokio::time::Instant::now();
         match run_external_egress_session(
             &command,
+            &shell_executable,
             &mut status_rx,
             &mut command_dispatch_rx,
             &board_publication_tx,
@@ -351,6 +355,7 @@ enum ExternalEgressSessionExit {
 
 async fn run_external_egress_session(
     command: &str,
+    shell_executable: &str,
     status_rx: &mut mpsc::Receiver<HostCommandStatus>,
     command_dispatch_rx: &mut watch::Receiver<BoardState>,
     board_publication_tx: &mpsc::Sender<BoardPublicationStatus>,
@@ -360,7 +365,7 @@ async fn run_external_egress_session(
 ) -> anyhow::Result<ExternalEgressSessionExit> {
     info!(%command, "platform egress adapter `external` started");
 
-    let mut child_command = Command::new("bash");
+    let mut child_command = Command::new(shell_executable);
     child_command
         .arg("-lc")
         .arg(command)
@@ -653,6 +658,7 @@ mod tests {
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             r#"while IFS= read -r _; do printf '%s\n' '{"kind":"board_published","command_ids":["test-id"]}'; done"#.to_string(),
+            "/bin/sh".to_string(),
             status_rx,
             board_rx,
             publication_tx,
@@ -687,6 +693,7 @@ mod tests {
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             "cat >/dev/null".to_string(),
+            "bash".to_string(),
             status_rx,
             board_rx,
             publication_tx,
@@ -718,6 +725,7 @@ mod tests {
         let (clear_tx, mut clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             r#"while IFS= read -r _; do printf '%s\n' '{"kind":"clear_board_commands","command_ids":["test-id"],"reason":"host schedule cleared"}'; done"#.to_string(),
+            "bash".to_string(),
             status_rx,
             board_rx,
             publication_tx,
@@ -750,6 +758,7 @@ mod tests {
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             "sleep 1".to_string(),
+            "bash".to_string(),
             status_rx,
             board_rx,
             publication_tx,
@@ -798,6 +807,7 @@ done"#,
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
             command,
+            "bash".to_string(),
             status_rx,
             board_rx,
             publication_tx,
@@ -852,6 +862,7 @@ done"#,
         };
         let adapter = tokio::spawn(external_egress_adapter(
             command,
+            "bash".to_string(),
             status_rx,
             board_rx,
             publication_tx,

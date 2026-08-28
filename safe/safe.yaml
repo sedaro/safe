@@ -31,6 +31,7 @@ base_paths:
   base_writable_directory: /tmp/safe
 
 platform:
+  shell_executable: bash
   egress_adapter: safectl_filesystem
   external_egress_command: null
   external_egress_retry:
