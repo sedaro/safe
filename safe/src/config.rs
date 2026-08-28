@@ -153,8 +153,6 @@ pub struct PlatformConfig {
     #[serde(default = "default_gatekeeper_adapter")]
     pub gatekeeper_adapter: String,
     #[serde(default)]
-    pub bash_mock_telemetry_command: Option<String>,
-    #[serde(default)]
     pub external_telemetry_command: Option<String>,
     #[serde(default)]
     pub external_egress_command: Option<String>,
@@ -245,7 +243,6 @@ impl Default for SerializedDefaults {
                 command_adapter: default_command_adapter(),
                 egress_adapter: default_egress_adapter(),
                 gatekeeper_adapter: default_gatekeeper_adapter(),
-                bash_mock_telemetry_command: None,
                 external_telemetry_command: None,
                 external_egress_command: None,
                 external_egress_retry: ExternalEgressRetryConfigDefaults {
@@ -322,7 +319,6 @@ struct PlatformConfigDefaults {
     command_adapter: String,
     egress_adapter: String,
     gatekeeper_adapter: String,
-    bash_mock_telemetry_command: Option<String>,
     external_telemetry_command: Option<String>,
     external_egress_command: Option<String>,
     external_egress_retry: ExternalEgressRetryConfigDefaults,
@@ -349,12 +345,12 @@ mod tests {
 
         std::fs::write(
             &cfg_a,
-            "base_paths:\n  base_writable_directory: /tmp/a\n  base_working_directory: /tmp/a\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  bash_mock_telemetry_command: null\n  gatekeeper_adapter: disabled\n",
+            "base_paths:\n  base_writable_directory: /tmp/a\n  base_working_directory: /tmp/a\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  gatekeeper_adapter: disabled\n",
         )
         .unwrap();
         std::fs::write(
             &cfg_b,
-            "base_paths:\n  base_writable_directory: /tmp/b\n  base_working_directory: /tmp/b\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  bash_mock_telemetry_command: null\n  gatekeeper_adapter: disabled\n",
+            "base_paths:\n  base_writable_directory: /tmp/b\n  base_working_directory: /tmp/b\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  gatekeeper_adapter: disabled\n",
         )
         .unwrap();
 

@@ -92,6 +92,26 @@ safectl send telemetry --json '{"type":"telemetry","telemetry":{"source":"exampl
 The external telemetry adapter accepts decoded payload objects directly; see
 [`runtime-config.md`](./runtime-config.md).
 
+### TLE Telemetry Sender
+
+`send-tle` is a development sender that propagates a public GP/TLE with SGP4 and
+writes frames directly to the SAFE ingress socket. Prefer `--tle-file` when the
+network is unavailable; it accepts the normal two-line TLE or CelesTrak's
+three-line response. The TLE's NORAD ID must match `--norad-id`.
+
+```bash
+safectl send-tle --norad-id 25544 --tle-file ./iss.tle --frames 60
+safectl send-tle --norad-id 25544 --speed 60 --step-secs 1
+```
+
+Each frame has source `tle-sim:<norad-id>`. `payload.telemetry.orbit` contains
+SGP4 TEME position and velocity, altitude, and approximate ground track.
+`environment.sunlit` is an eclipse estimate. `power` and `thermal` are bounded,
+deterministic synthetic values driven by sunlight and load; they are not
+spacecraft measurements. `temperature_c` is repeated at the telemetry root for
+simple anomaly-profile compatibility. Use `--start-at <RFC3339>` for a
+reproducible simulation epoch.
+
 ## Command Ingress
 
 The general form is:

@@ -69,7 +69,6 @@ platform:
   command_adapter: "safectl_unix_json"
   egress_adapter: "safectl_filesystem"
   gatekeeper_adapter: "disabled"
-  bash_mock_telemetry_command: null
   external_telemetry_command: null
   external_egress_command: null
   external_egress_retry:
@@ -102,11 +101,10 @@ gatekeeper: {}
 | `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
-| `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
+| `platform.telemetry_adapter` | `example` | Selects `disabled`, `example`, or `external`. |
 | `platform.command_adapter` | `safectl_unix_json` | Selects the command ingress adapter. |
 | `platform.egress_adapter` | `safectl_filesystem` | Selects `safectl_filesystem` or `external` platform egress. |
 | `platform.gatekeeper_adapter` | `disabled` | Selects `disabled` or `external`. Disabled automatically approves batches. |
-| `platform.bash_mock_telemetry_command` | none | Command used by `bash_mock`; the feature must be enabled at build time. |
 | `platform.external_telemetry_command` | none | Shell command whose stdout supplies telemetry JSONL. |
 | `platform.external_egress_command` | none | Shell command implementing the external egress JSONL protocol. |
 | `platform.external_egress_retry.initial_delay_ms` | `100` | Delay before the first external egress restart. |
@@ -157,13 +155,11 @@ used as a supported configuration switch.
 
 ## Telemetry Adapters
 
-`example` emits one frame per second with source `example` and a counter under
-`payload.telemetry.temperature_value_c`.
+`disabled` starts no built-in telemetry producer. Use this when telemetry will
+arrive only through `safectl send telemetry` or another explicit sender.
 
-`bash_mock` executes the configured shell command and interprets each non-empty
-stdout line as a JSON payload. It assigns source `bash_mock` and uses a payload
-`ts_mono` field when present, otherwise a local sequence number. Build SAFE with
-the `platform-bash-mock` feature to enable this adapter.
+`example` emits one frame per second with source `example` and counters under
+`payload.telemetry.batt_v` and `payload.telemetry.batt_c`.
 
 `external` executes the configured command through `bash -lc`. Each non-empty
 stdout line must be a JSON object with optional `source` and `ts_mono` fields and
