@@ -611,6 +611,46 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "reproduces external egress pipe backpressure"]
+    async fn external_egress_that_does_not_read_stdin_blocks_board_producers() {
+        let (_status_tx, status_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = mpsc::channel(1024);
+        let (publication_tx, _publication_rx) = mpsc::channel(1);
+        let (clear_tx, _clear_rx) = mpsc::channel(1);
+        let adapter = tokio::spawn(external_egress_adapter(
+            "sleep 1".to_string(),
+            status_rx,
+            board_rx,
+            publication_tx,
+            clear_tx,
+        ));
+
+        let blocked_write = BoardState {
+            source_of_truth: vec![BoardCmdId("x".repeat(4 * 1024 * 1024))],
+            ..Default::default()
+        };
+        board_tx.send(blocked_write).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for _ in 0..1024 {
+            board_tx.send(BoardState::default()).await.unwrap();
+        }
+        let producer_blocked = timeout(
+            Duration::from_millis(100),
+            board_tx.send(BoardState::default()),
+        )
+        .await
+        .is_err();
+
+        adapter.abort();
+        let _ = adapter.await;
+        assert!(
+            producer_blocked,
+            "the board producer was expected to block after the egress pipe and channel filled"
+        );
+    }
+
+    #[tokio::test]
     async fn append_host_command_dispatch_csv_writes_header_and_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let csv_path = tmp.path().join("dispatch.csv");

@@ -49,6 +49,37 @@ fn telemetry_with_flag(flag: bool) -> TelemetryFrame {
     }
 }
 
+#[tokio::test]
+#[ignore = "reproduces oversized event journal writes before compaction"]
+async fn oversized_event_is_written_before_the_journal_limit_is_checked() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let events_path = tempdir.path().join("events.jsonl");
+    let max_bytes = 1024;
+    let event = Event {
+        seq: 1,
+        ts_mono: 1,
+        source: Source::Telemetry,
+        msg: Msg::TelemetryReceived(TelemetryFrame {
+            source: Some("test".to_string()),
+            ts_mono: 1,
+            payload: serde_json::json!({ "data": "x".repeat(max_bytes * 2) }),
+        }),
+    };
+
+    append_jsonl(&events_path, &event).await.unwrap();
+
+    let written_bytes = fs::metadata(&events_path).await.unwrap().len();
+    assert!(
+        written_bytes > max_bytes as u64,
+        "the append was expected to exceed the configured limit before compaction"
+    );
+    assert!(
+        journal_exceeds_limits(&events_path, 1, max_bytes as u64, usize::MAX)
+            .await
+            .unwrap()
+    );
+}
+
 fn mode_meta(id: u128, priority: u8, enabled: bool) -> AutonomyModeMeta {
     AutonomyModeMeta {
         id: mk_mode_id(id),
