@@ -109,11 +109,13 @@ pub fn spawn_platform_ingress(
             #[cfg(feature = "platform-safectl-json")]
             {
                 let runtime_paths = runtime_paths.clone();
-                tokio::spawn(safectl_ingress_reader(
-                    runtime_paths,
-                    telemetry_tx,
-                    command_tx,
-                ));
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        safectl_ingress_reader(runtime_paths, telemetry_tx, command_tx).await
+                    {
+                        error!(%error, "safectl command ingress stopped");
+                    }
+                });
             }
             #[cfg(not(feature = "platform-safectl-json"))]
             {

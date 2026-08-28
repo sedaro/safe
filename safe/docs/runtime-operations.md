@@ -182,6 +182,8 @@ immediate exit, a write stall, and a forced process death.
 Use `--no-build` to reuse existing binaries. Use `--keep` or `KEEP_TMP=1` to
 retain the generated state, journals, configuration, and process logs for
 inspection. `SAFE_BIN` and `SAFECTL_BIN` can override the binaries under test.
+Temporary runtimes use `/tmp` to stay within Unix-socket path limits;
+`SAFE_EDGE_TMPDIR` can override that location with another short path.
 
 ## Safety Limitations
 

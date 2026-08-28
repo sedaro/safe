@@ -43,7 +43,11 @@ fi
   exit 1
 }
 
-TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/safe-runtime-edges.XXXXXX")
+# macOS limits Unix-domain socket paths to roughly 104 bytes. TMPDIR is usually
+# much longer than /tmp there, so keep the generated safectl.sock path short.
+EDGE_TMPDIR=${SAFE_EDGE_TMPDIR:-/tmp}
+EDGE_TMPDIR=${EDGE_TMPDIR%/}
+TMP_ROOT=$(mktemp -d "$EDGE_TMPDIR/safe-edges.XXXXXX")
 ACTIVE_PIDS=()
 
 cleanup() {
