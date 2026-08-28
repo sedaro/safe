@@ -2477,6 +2477,8 @@ name = "safe-gatekeeper"
 version = "1.2.3"
 dependencies = [
  "anyhow",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "safe",
  "safe-sim",
  "serde",
