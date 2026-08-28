@@ -64,6 +64,14 @@ trap cleanup EXIT INT TERM
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
+  local log
+  for log in "$TMP_ROOT"/*/safe-process.log*; do
+    if [[ -f "$log" ]]; then
+      printf '\n--- %s ---\n' "$log" >&2
+      tail -n 100 "$log" >&2
+    fi
+  done
+  KEEP_TMP=1
   exit 1
 }
 
@@ -97,6 +105,9 @@ wait_for_path() {
   local i
   for ((i = 0; i < attempts; i++)); do
     [[ -e "$path" ]] && return 0
+    if [[ -n "${LAST_PID:-}" ]] && ! kill -0 "$LAST_PID" 2>/dev/null; then
+      fail "SAFE exited before creating $path"
+    fi
     sleep 0.025
   done
   fail "timed out waiting for $path"
@@ -111,6 +122,9 @@ wait_for_json() {
   for ((i = 0; i < attempts; i++)); do
     if [[ -s "$path" ]] && jq -e "$filter" "$path" >/dev/null 2>&1; then
       return 0
+    fi
+    if [[ -n "${LAST_PID:-}" ]] && ! kill -0 "$LAST_PID" 2>/dev/null; then
+      fail "SAFE exited while waiting for '$filter' in $path"
     fi
     sleep 0.025
   done
