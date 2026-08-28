@@ -72,6 +72,11 @@ platform:
   bash_mock_telemetry_command: null
   external_telemetry_command: null
   external_egress_command: null
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
   external_gatekeeper_command: null
 
 gatekeeper: {}
@@ -104,12 +109,17 @@ gatekeeper: {}
 | `platform.bash_mock_telemetry_command` | none | Command used by `bash_mock`; the feature must be enabled at build time. |
 | `platform.external_telemetry_command` | none | Shell command whose stdout supplies telemetry JSONL. |
 | `platform.external_egress_command` | none | Shell command implementing the external egress JSONL protocol. |
+| `platform.external_egress_retry.initial_delay_ms` | `100` | Delay before the first external egress restart. |
+| `platform.external_egress_retry.max_delay_ms` | `30000` | Maximum exponential restart delay. |
+| `platform.external_egress_retry.stable_session_ms` | `30000` | Runtime after which a failed session resets the backoff to its initial delay. |
+| `platform.external_egress_retry.write_timeout_ms` | `5000` | Maximum time allowed for one JSONL write to the child before restarting it. |
 | `platform.external_gatekeeper_command` | none | Shell command implementing the external gatekeeper JSONL protocol. |
 | `gatekeeper` | `{}` | Arbitrary JSON passed to an external gatekeeper as an environment variable. |
 
-SAFE validates that `max_autonomy_modes`, all persistence limits,
-`rotation.max_files`, and `rotation.max_file_size_mb` are greater than zero,
-and that the configured log size can be represented in bytes. Each log stream retains at most
+SAFE validates that `max_autonomy_modes`, all persistence limits, log rotation
+limits, and external egress retry durations are greater than zero. The initial
+egress retry delay must not exceed its maximum. SAFE also validates that the
+configured log size can be represented in bytes. Each log stream retains at most
 `rotation.max_files * rotation.max_file_size_mb` MiB. This bound is per stream,
 not a global limit for the logging directory. It does not validate that
 configured adapter commands or executable paths exist until they are started.
@@ -176,7 +186,10 @@ The default `safectl_filesystem` egress writes host command status records to
 
 The `external` egress adapter executes `external_egress_command` through
 `bash -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
-responses from stdout. The child receives either a status update:
+responses from stdout. SAFE restarts a failed, exited, or write-stalled child
+indefinitely using the configured capped exponential backoff. A session that
+runs for `stable_session_ms` resets the next delay to `initial_delay_ms`.
+The child receives either a status update:
 
 ```json
 {"kind":"host_command_status","status":{"request_id":"request-1","state":"accepted","detail":"command accepted","ts_mono":42}}
@@ -223,6 +236,11 @@ outputs under its `--base-path` (default: `/tmp/safe`):
 platform:
   egress_adapter: external
   external_egress_command: "/path/to/platform-egress-example --base-path /tmp/safe"
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
 ```
 
 The disabled gatekeeper consumes pending-batch requests and immediately emits

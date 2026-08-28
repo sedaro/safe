@@ -79,6 +79,20 @@ impl Config {
         {
             return Err("persistence journal limits must be greater than zero".into());
         }
+        let retry = &self.platform.external_egress_retry;
+        if retry.initial_delay_ms == 0
+            || retry.max_delay_ms == 0
+            || retry.stable_session_ms == 0
+            || retry.write_timeout_ms == 0
+        {
+            return Err("platform.external_egress_retry values must be greater than zero".into());
+        }
+        if retry.initial_delay_ms > retry.max_delay_ms {
+            return Err(
+                "platform.external_egress_retry.initial_delay_ms must not exceed max_delay_ms"
+                    .into(),
+            );
+        }
         Ok(())
     }
 }
@@ -144,8 +158,17 @@ pub struct PlatformConfig {
     pub external_telemetry_command: Option<String>,
     #[serde(default)]
     pub external_egress_command: Option<String>,
+    pub external_egress_retry: ExternalEgressRetryConfig,
     #[serde(default)]
     pub external_gatekeeper_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExternalEgressRetryConfig {
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub stable_session_ms: u64,
+    pub write_timeout_ms: u64,
 }
 
 fn default_telemetry_adapter() -> String {
@@ -225,6 +248,12 @@ impl Default for SerializedDefaults {
                 bash_mock_telemetry_command: None,
                 external_telemetry_command: None,
                 external_egress_command: None,
+                external_egress_retry: ExternalEgressRetryConfigDefaults {
+                    initial_delay_ms: 100,
+                    max_delay_ms: 30_000,
+                    stable_session_ms: 30_000,
+                    write_timeout_ms: 5_000,
+                },
                 external_gatekeeper_command: None,
             },
             base_paths: BasePathsConfigDefaults {
@@ -296,7 +325,16 @@ struct PlatformConfigDefaults {
     bash_mock_telemetry_command: Option<String>,
     external_telemetry_command: Option<String>,
     external_egress_command: Option<String>,
+    external_egress_retry: ExternalEgressRetryConfigDefaults,
     external_gatekeeper_command: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ExternalEgressRetryConfigDefaults {
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    stable_session_ms: u64,
+    write_timeout_ms: u64,
 }
 
 #[cfg(test)]
@@ -339,6 +377,62 @@ mod tests {
             .unwrap();
         config.logging.rotation.max_file_size_mb = u64::MAX;
 
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn loads_external_egress_retry_defaults_and_yaml_overrides() {
+        let defaults: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            defaults.platform.external_egress_retry.initial_delay_ms,
+            100
+        );
+        assert_eq!(defaults.platform.external_egress_retry.max_delay_ms, 30_000);
+        assert_eq!(
+            defaults.platform.external_egress_retry.stable_session_ms,
+            30_000
+        );
+        assert_eq!(
+            defaults.platform.external_egress_retry.write_timeout_ms,
+            5_000
+        );
+
+        let overridden: Config =
+            Figment::from(Serialized::defaults(SerializedDefaults::default()))
+                .merge(Yaml::string(
+                    "platform:\n  external_egress_retry:\n    initial_delay_ms: 25\n    max_delay_ms: 400\n    stable_session_ms: 800\n    write_timeout_ms: 75\n",
+                ))
+                .extract()
+                .unwrap();
+        assert_eq!(
+            overridden.platform.external_egress_retry.initial_delay_ms,
+            25
+        );
+        assert_eq!(overridden.platform.external_egress_retry.max_delay_ms, 400);
+        assert_eq!(
+            overridden.platform.external_egress_retry.stable_session_ms,
+            800
+        );
+        assert_eq!(
+            overridden.platform.external_egress_retry.write_timeout_ms,
+            75
+        );
+    }
+
+    #[test]
+    fn validates_external_egress_retry_settings() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+
+        config.platform.external_egress_retry.write_timeout_ms = 0;
+        assert!(config.validate().is_err());
+
+        config.platform.external_egress_retry.write_timeout_ms = 1;
+        config.platform.external_egress_retry.initial_delay_ms = 2;
+        config.platform.external_egress_retry.max_delay_ms = 1;
         assert!(config.validate().is_err());
     }
 }
