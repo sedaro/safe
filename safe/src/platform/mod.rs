@@ -291,14 +291,75 @@ async fn external_egress_adapter(
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
     board_clear_tx: mpsc::Sender<BoardClearRequest>,
 ) -> anyhow::Result<()> {
+    const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+    const STABLE_SESSION_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut retry_delay = INITIAL_RETRY_DELAY;
+    let mut pending_status = None;
+    loop {
+        if status_rx.is_closed()
+            && status_rx.is_empty()
+            && command_dispatch_rx.has_changed().is_err()
+        {
+            return Ok(());
+        }
+
+        let started_at = tokio::time::Instant::now();
+        match run_external_egress_session(
+            &command,
+            &mut status_rx,
+            &mut command_dispatch_rx,
+            &board_publication_tx,
+            &board_clear_tx,
+            &mut pending_status,
+        )
+        .await
+        {
+            Ok(ExternalEgressSessionExit::InputsClosed) => return Ok(()),
+            Err(error) => {
+                error!(%error, retry_delay_ms = retry_delay.as_millis(), "external platform egress adapter failed; restarting");
+            }
+        }
+
+        if status_rx.is_closed()
+            && status_rx.is_empty()
+            && command_dispatch_rx.has_changed().is_err()
+        {
+            return Ok(());
+        }
+
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = if started_at.elapsed() >= STABLE_SESSION_DURATION {
+            INITIAL_RETRY_DELAY
+        } else {
+            retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY)
+        };
+    }
+}
+
+enum ExternalEgressSessionExit {
+    InputsClosed,
+}
+
+async fn run_external_egress_session(
+    command: &str,
+    status_rx: &mut mpsc::Receiver<HostCommandStatus>,
+    command_dispatch_rx: &mut watch::Receiver<BoardState>,
+    board_publication_tx: &mpsc::Sender<BoardPublicationStatus>,
+    board_clear_tx: &mpsc::Sender<BoardClearRequest>,
+    pending_status: &mut Option<HostCommandStatus>,
+) -> anyhow::Result<ExternalEgressSessionExit> {
     info!(%command, "platform egress adapter `external` started");
 
-    let mut child = Command::new("bash")
+    let mut child_command = Command::new("bash");
+    child_command
         .arg("-lc")
         .arg(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .spawn()?;
+        .kill_on_drop(true);
+    let mut child = child_command.spawn()?;
     let stdin = child
         .stdin
         .take()
@@ -310,16 +371,42 @@ async fn external_egress_adapter(
 
     let mut writer = stdin;
     let mut lines = BufReader::new(stdout).lines();
+
+    if let Some(status) = pending_status.as_ref() {
+        write_egress_message_with_timeout(
+            &mut writer,
+            PlatformEgressWireInput::HostCommandStatus {
+                status: status.clone(),
+            },
+        )
+        .await?;
+        *pending_status = None;
+    }
+
+    let board = command_dispatch_rx.borrow_and_update().clone();
+    write_egress_message_with_timeout(
+        &mut writer,
+        PlatformEgressWireInput::BoardSnapshot { board },
+    )
+    .await?;
+
     let mut status_open = true;
     let mut command_dispatch_open = true;
     loop {
         if !status_open && !command_dispatch_open {
-            break;
+            return Ok(ExternalEgressSessionExit::InputsClosed);
         }
         tokio::select! {
             status = status_rx.recv(), if status_open => {
                 match status {
-                    Some(status) => write_egress_message(&mut writer, PlatformEgressWireInput::HostCommandStatus { status }).await?,
+                    Some(status) => {
+                        *pending_status = Some(status.clone());
+                        write_egress_message_with_timeout(
+                            &mut writer,
+                            PlatformEgressWireInput::HostCommandStatus { status },
+                        ).await?;
+                        *pending_status = None;
+                    }
                     None => status_open = false,
                 }
             }
@@ -327,13 +414,18 @@ async fn external_egress_adapter(
                 match board_changed {
                     Ok(()) => {
                         let board = command_dispatch_rx.borrow_and_update().clone();
-                        write_egress_message(&mut writer, PlatformEgressWireInput::BoardSnapshot { board }).await?;
+                        write_egress_message_with_timeout(
+                            &mut writer,
+                            PlatformEgressWireInput::BoardSnapshot { board },
+                        ).await?;
                     }
                     Err(_) => command_dispatch_open = false,
                 }
             }
             line = lines.next_line() => {
-                let Some(line) = line? else { break; };
+                let Some(line) = line? else {
+                    anyhow::bail!("external egress process closed stdout");
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -341,12 +433,12 @@ async fn external_egress_adapter(
                 match serde_json::from_str::<PlatformEgressWireOutput>(trimmed) {
                     Ok(PlatformEgressWireOutput::BoardPublished { command_ids }) => {
                         if board_publication_tx.send(BoardPublicationStatus { command_ids }).await.is_err() {
-                            break;
+                            return Ok(ExternalEgressSessionExit::InputsClosed);
                         }
                     }
                     Ok(PlatformEgressWireOutput::ClearBoardCommands { command_ids, reason }) => {
                         if board_clear_tx.send(BoardClearRequest { command_ids, reason }).await.is_err() {
-                            break;
+                            return Ok(ExternalEgressSessionExit::InputsClosed);
                         }
                     }
                     Err(e) => error!("invalid external egress json value: {e}; line={trimmed}"),
@@ -354,6 +446,17 @@ async fn external_egress_adapter(
             }
         }
     }
+}
+
+async fn write_egress_message_with_timeout(
+    writer: &mut tokio::process::ChildStdin,
+    message: PlatformEgressWireInput,
+) -> anyhow::Result<()> {
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    tokio::time::timeout(WRITE_TIMEOUT, write_egress_message(writer, message))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out writing to external egress process"))??;
     Ok(())
 }
 
@@ -649,6 +752,51 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "board updates blocked behind the external egress pipe for {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn external_egress_restarts_until_the_child_recovers() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let attempts_path = tempdir.path().join("attempts");
+        let command = format!(
+            r#"attempt=$(cat {path} 2>/dev/null || printf 0)
+attempt=$((attempt + 1))
+printf '%s' "$attempt" > {path}
+if [ "$attempt" -lt 3 ]; then exit 1; fi
+while IFS= read -r _; do
+  printf '%s\n' '{{"kind":"board_published","command_ids":["recovered"]}}'
+done"#,
+            path = attempts_path.display(),
+        );
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = watch::channel(BoardState::default());
+        let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let (clear_tx, _clear_rx) = mpsc::channel(1);
+        let adapter = tokio::spawn(external_egress_adapter(
+            command,
+            status_rx,
+            board_rx,
+            publication_tx,
+            clear_tx,
+        ));
+
+        let publication = timeout(Duration::from_secs(3), publication_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publication.command_ids,
+            vec![BoardCmdId("recovered".to_string())]
+        );
+        assert_eq!(std::fs::read_to_string(attempts_path).unwrap(), "3");
+
+        drop(status_tx);
+        drop(board_tx);
+        timeout(Duration::from_secs(1), adapter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
