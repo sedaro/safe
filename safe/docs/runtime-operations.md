@@ -165,6 +165,24 @@ Look for `starting`, `connecting`, `connected`, `disconnected`, `faulted`, and
 path, a protocol-version mismatch, a missing executable dependency, or a
 sandbox isolation failure.
 
+## Runtime Edge Smoke Test
+
+Run the targeted persistence and egress smoke test from the repository root:
+
+```bash
+safe/scripts/runtime-edge-smoke.sh
+```
+
+The script requires Bash and `jq`. It builds `safe` and `safectl`, creates
+isolated temporary runtime directories, injects telemetry and controller
+commands, forces event/output journal compaction, restarts SAFE, and verifies
+the recovered board. It also exercises external egress recovery after an
+immediate exit, a write stall, and a forced process death.
+
+Use `--no-build` to reuse existing binaries. Use `--keep` or `KEEP_TMP=1` to
+retain the generated state, journals, configuration, and process logs for
+inspection. `SAFE_BIN` and `SAFECTL_BIN` can override the binaries under test.
+
 ## Safety Limitations
 
 The repository is not yet a flight-ready host command integration. Before
