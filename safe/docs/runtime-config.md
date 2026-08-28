@@ -262,7 +262,7 @@ The child returns one of these for an evaluation request:
 {"kind":"reject","request_id":1,"reason":"not safe"}
 ```
 
-The generic `safe_gatekeeperd` implementation can be selected as that external
+The `safe_gatekeeperd` implementation can be selected as that external
 gatekeeper. It retains the latest telemetry frame and invokes a mission-specific
 one-shot process to convert that telemetry and each requested board batch into
 an EDS start epoch and patches. A complete configuration is:
