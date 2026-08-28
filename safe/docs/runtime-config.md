@@ -54,6 +54,12 @@ logging:
 limits:
   max_autonomy_modes: 10
 
+persistence:
+  events_max_bytes: 16777216
+  events_max_records: 10000
+  outputs_max_bytes: 16777216
+  outputs_max_records: 10000
+
 base_paths:
   base_working_directory: "/tmp/safe"
   base_writable_directory: "/tmp/safe"
@@ -66,6 +72,11 @@ platform:
   bash_mock_telemetry_command: null
   external_telemetry_command: null
   external_egress_command: null
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
   external_gatekeeper_command: null
 
 gatekeeper: {}
@@ -81,8 +92,14 @@ gatekeeper: {}
 | `sockets.telemetry` | `0.0.0.0:44212` | Retained socket configuration; the current adapters do not bind this endpoint. |
 | `sockets.commands` | `127.0.0.1:7002` | Retained socket configuration; command ingress currently uses a Unix socket. |
 | `logging.file_path` | `/tmp/safe/logs/app.log` | Its parent directory is used for `default.log` and per-mode logs. |
-| `logging.rotation.*` | `100`, `10`, `false` | Validated values, but file rotation is not currently implemented. |
+| `logging.rotation.max_file_size_mb` | `100` | Maximum bytes in one log file, in mebibytes. A record that exceeds this limit is dropped rather than exceeding it. |
+| `logging.rotation.max_files` | `10` | Maximum retained files per stream, including the active file. Older numbered archives are removed. |
+| `logging.rotation.daily` | `false` | Rotate a non-empty active log when its UTC calendar day changes. Size rotation always applies. |
 | `limits.max_autonomy_modes` | `10` | Maximum number of JSON mode entries, including disabled entries. |
+| `persistence.events_max_bytes` | `16777216` | Compact the event recovery journal after it reaches this byte count. |
+| `persistence.events_max_records` | `10000` | Compact the event recovery journal after this many records. |
+| `persistence.outputs_max_bytes` | `16777216` | Compact the output recovery journal after it reaches this byte count. |
+| `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
@@ -92,11 +109,19 @@ gatekeeper: {}
 | `platform.bash_mock_telemetry_command` | none | Command used by `bash_mock`; the feature must be enabled at build time. |
 | `platform.external_telemetry_command` | none | Shell command whose stdout supplies telemetry JSONL. |
 | `platform.external_egress_command` | none | Shell command implementing the external egress JSONL protocol. |
+| `platform.external_egress_retry.initial_delay_ms` | `100` | Delay before the first external egress restart. |
+| `platform.external_egress_retry.max_delay_ms` | `30000` | Maximum exponential restart delay. |
+| `platform.external_egress_retry.stable_session_ms` | `30000` | Runtime after which a failed session resets the backoff to its initial delay. |
+| `platform.external_egress_retry.write_timeout_ms` | `5000` | Maximum time allowed for one JSONL write to the child before restarting it. |
 | `platform.external_gatekeeper_command` | none | Shell command implementing the external gatekeeper JSONL protocol. |
 | `gatekeeper` | `{}` | Arbitrary JSON passed to an external gatekeeper as an environment variable. |
 
-SAFE validates that `max_autonomy_modes`, `rotation.max_files`, and
-`rotation.max_file_size_mb` are greater than zero. It does not validate that
+SAFE validates that `max_autonomy_modes`, all persistence limits, log rotation
+limits, and external egress retry durations are greater than zero. The initial
+egress retry delay must not exceed its maximum. SAFE also validates that the
+configured log size can be represented in bytes. Each log stream retains at most
+`rotation.max_files * rotation.max_file_size_mb` MiB. This bound is per stream,
+not a global limit for the logging directory. It does not validate that
 configured adapter commands or executable paths exist until they are started.
 
 ## Environment Overrides
@@ -161,7 +186,10 @@ The default `safectl_filesystem` egress writes host command status records to
 
 The `external` egress adapter executes `external_egress_command` through
 `bash -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
-responses from stdout. The child receives either a status update:
+responses from stdout. SAFE restarts a failed, exited, or write-stalled child
+indefinitely using the configured capped exponential backoff. A session that
+runs for `stable_session_ms` resets the next delay to `initial_delay_ms`.
+The child receives either a status update:
 
 ```json
 {"kind":"host_command_status","status":{"request_id":"request-1","state":"accepted","detail":"command accepted","ts_mono":42}}
@@ -208,6 +236,11 @@ outputs under its `--base-path` (default: `/tmp/safe`):
 platform:
   egress_adapter: external
   external_egress_command: "/path/to/platform-egress-example --base-path /tmp/safe"
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
 ```
 
 The disabled gatekeeper consumes pending-batch requests and immediately emits

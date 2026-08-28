@@ -34,8 +34,13 @@ are marked by `stream`.
 
 SAFE also reads the previous sanitized
 `AutonomyModeId_<uuid>_.log` filename through `safectl` so upgrades do not hide
-existing supervisor records. The current logging implementation does not
-rotate files even though rotation fields are validated in YAML.
+existing supervisor records. Files rotate before a write would exceed
+`logging.rotation.max_file_size_mb`, and optionally at a UTC day boundary.
+The active file is retained with numbered archives (`default.log.1`,
+`default.log.2`, and so on). `logging.rotation.max_files` includes the active
+file, so every stream is bounded by `max_files * max_file_size_mb`; a record
+larger than one file is dropped. `safectl logs` includes these archives. This
+is a per-stream bound, not a total directory-size bound across mode IDs.
 
 The sandbox metrics writer additionally uses
 `SAFE_METRIC_BASE_PATH/<mode-uuid>/metrics-current.json` and
@@ -57,6 +62,14 @@ Events with a sequence number no greater than the persisted flight sequence are
 ignored during recovery. Invalid JSONL lines are skipped during replay. Keep
 `flight.json`, `events.jsonl`, and `outputs.jsonl` together when backing up or
 restoring runtime state.
+
+SAFE compacts the recovery journals after either their configured byte or record
+limit is reached. It first atomically saves `flight.json`, then clears
+`events.jsonl`; events already represented by the checkpoint are ignored during
+recovery. `outputs.jsonl` is atomically replaced by a current `BoardState`
+snapshot, followed by later effects. This bounds historical journal growth and
+replay time. It does not bound the snapshot itself: with no limit on outstanding
+commands, the current board can grow beyond `persistence.outputs_max_bytes`.
 
 ## Event, Board, and Output Flow
 
