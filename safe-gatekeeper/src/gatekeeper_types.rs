@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use safe::protocol::{BoardCmdId, BoardState};
+use safe::protocol::{BoardCmdId, BoardState, TimedCommand};
 use safe::telemetry_frame::TelemetryFrame;
 use safe_sim::{EdsPatch, EdsPatchTarget, ProbabilityDistribution};
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,9 @@ pub struct GatekeeperConfig {
     pub input_adapter_timeout_secs: Option<u64>,
     #[serde(default)]
     pub input_adapter_config: serde_json::Value,
+    /// JSON Pointer to a finite GPS-seconds value in `TelemetryFrame.payload`.
+    /// Required when evaluating an immediate command.
+    pub telemetry_gps_time_pointer: Option<String>,
     /// Optional wall-clock limit applied separately to every EDS run.
     pub simulation_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -167,6 +170,7 @@ impl Default for GatekeeperConfig {
             input_adapter_command: Vec::new(),
             input_adapter_timeout_secs: None,
             input_adapter_config: serde_json::Value::Null,
+            telemetry_gps_time_pointer: None,
             simulation_timeout_secs: None,
             field_checks: Vec::new(),
             monte_carlo: None,
@@ -195,13 +199,14 @@ pub enum GatekeeperOutput {
     Reject { request_id: u64, reason: String },
 }
 
-/// One self-contained request sent to the mission-specific input adapter.
-/// The gatekeeper deliberately treats telemetry and commands as opaque data.
+/// One self-contained simulation scenario sent to the mission-specific input
+/// adapter. The gatekeeper resolves SAFE board state before constructing it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationInputRequest {
     pub telemetry: TelemetryFrame,
-    pub board: BoardState,
-    pub candidate_command_ids: Vec<BoardCmdId>,
+    /// The complete command schedule to represent in this simulation, ordered
+    /// by execution time. Commands with the same time retain proposal order.
+    pub commands: Vec<TimedCommand>,
     #[serde(default)]
     pub config: serde_json::Value,
 }
@@ -223,6 +228,7 @@ mod tests {
         assert!(config.eds_path.as_os_str().is_empty());
         assert!(config.input_adapter_command.is_empty());
         assert!(config.input_adapter_timeout_secs.is_none());
+        assert!(config.telemetry_gps_time_pointer.is_none());
         assert!(config.simulation_timeout_secs.is_none());
         assert!(config.field_checks.is_empty());
         assert!(config.monte_carlo.is_none());
@@ -232,6 +238,7 @@ mod tests {
     fn monte_carlo_config_uses_tagged_distribution_and_safe_defaults() {
         let config: GatekeeperConfig = serde_json::from_value(serde_json::json!({
             "input_adapter_timeout_secs": 10,
+            "telemetry_gps_time_pointer": "/spacecraft/gps_time",
             "simulation_timeout_secs": 300,
             "field_checks": [{
                 "target_file": "output.jsonl",
@@ -261,6 +268,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.input_adapter_timeout_secs, Some(10));
+        assert_eq!(
+            config.telemetry_gps_time_pointer.as_deref(),
+            Some("/spacecraft/gps_time")
+        );
         assert_eq!(config.simulation_timeout_secs, Some(300));
         assert_eq!(config.field_checks[0].tolerance, 1e-9);
         let monte_carlo = config.monte_carlo.unwrap();
@@ -271,5 +282,23 @@ mod tests {
             monte_carlo.variations[0].operation,
             MonteCarloOperation::Add
         ));
+    }
+
+    #[test]
+    fn simulation_input_contains_resolved_command_schedule_not_board_state() {
+        let request = SimulationInputRequest {
+            telemetry: TelemetryFrame::new(serde_json::json!({"source": "test"})),
+            commands: vec![
+                TimedCommand::Now(safe::protocol::Command::PointNadir),
+                TimedCommand::Now(safe::protocol::Command::PointSunYaw),
+            ],
+            config: serde_json::Value::Null,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert!(value["commands"].is_array());
+        assert!(value.get("board").is_none());
+        assert!(value.get("baseline_commands").is_none());
+        assert!(value.get("candidate_command_ids").is_none());
     }
 }

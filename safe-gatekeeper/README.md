@@ -9,13 +9,14 @@ field layout.
 
 1. SAFE sends normalized telemetry frames to the gatekeeper. The gatekeeper
    retains the latest frame without decoding its payload.
-2. SAFE sends an evaluation request containing the command board and candidate
-   command IDs.
+2. SAFE sends an evaluation request containing the command board and command
+   IDs under review. The gatekeeper resolves one complete command schedule from
+   the accepted commands and commands under review.
 3. The gatekeeper starts `input_adapter_command` as a one-shot child process.
 4. The gatekeeper writes a `SimulationInputRequest` JSON object to the child's
    stdin and closes stdin.
-5. The adapter interprets the telemetry and board using mission-specific logic,
-   then writes one `SimulationInputResponse` JSON object to stdout.
+5. The adapter interprets telemetry and resolved commands using mission-specific
+   logic, then writes one `SimulationInputResponse` JSON object to stdout.
 6. The gatekeeper applies the returned start epoch and patches, runs the nominal
    EDS case for `sim_duration_days`, and collects its outputs.
 7. When Monte Carlo analysis is configured, the gatekeeper varies configured
@@ -46,6 +47,7 @@ gatekeeper:
   input_adapter_timeout_secs: 10
   input_adapter_config:
     deployment: example
+  telemetry_gps_time_pointer: /spacecraft/gps_time
   simulation_timeout_secs: 300
   field_checks:
     - target_file: agent.engine.jsonl
@@ -80,6 +82,12 @@ gatekeeper:
 allows mission deployments to change adapter behavior without adding
 mission-specific options to the gatekeeper.
 
+`telemetry_gps_time_pointer` is an optional JSON Pointer into the telemetry
+frame's `payload`. The selected value must be a finite number of GPS seconds.
+It is required when a batch contains an immediate command. JSON Pointer supports
+nested payloads, for example `/spacecraft/gps_time` selects
+`payload.spacecraft.gps_time`.
+
 `input_adapter_timeout_secs` limits each one-shot adapter invocation, while
 `simulation_timeout_secs` limits each nominal or Monte Carlo EDS process. Both
 must be greater than zero when supplied. Omitting either retains the previous
@@ -95,8 +103,7 @@ The one-shot adapter receives:
 ```json
 {
    "telemetry": {"source":"example-source","ts_mono":42,"payload":"{}"},
-  "board": {"proposals":{},"rejected":{},"approved":{},"source_of_truth":[]},
-  "candidate_command_ids": [],
+  "commands": [],
    "config": {"deployment":"example"}
 }
 ```
@@ -118,8 +125,14 @@ It returns an MJD epoch and the generic `safe_sim::EdsPatch` values to apply:
 }
 ```
 
-The adapter owns all mission-specific IDs, telemetry extraction, unit
-conversion, epoch derivation, and board-command schedule projection.
+The gatekeeper owns SAFE board interpretation. It combines accepted commands
+with the commands under review, removes duplicate IDs and no-ops, and orders the
+result by execution time. Immediate commands use the configured telemetry GPS
+time, scheduled commands use their `gps_time`, and commands at the same time
+retain proposal order. The adapter owns all mission-specific IDs, telemetry
+extraction, unit conversion, epoch derivation, and command-to-EDS schedule projection.
+`commands` is the complete schedule to represent in the simulation, without
+assuming that the caller uses a gatekeeper workflow.
 
 ## Monte Carlo Analysis
 
