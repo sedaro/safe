@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
-use safe::telemetry_frame::TelemetryFrame;
+use safe::{
+    protocol::{BoardCmdId, BoardState, TimedCommand},
+    telemetry_frame::TelemetryFrame,
+};
 use safe_sim::{EdsPatch, SedaroSimulator, SimulationResult};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -75,6 +79,100 @@ impl Gatekeeper {
             simulator: SedaroSimulator::new(&config.eds_path),
             config,
             latest_telemetry: None,
+        }
+    }
+
+    fn commands_for_simulation(
+        board: &BoardState,
+        candidate_command_ids: &[BoardCmdId],
+        current_gps_time: Option<f64>,
+    ) -> anyhow::Result<Vec<TimedCommand>> {
+        let mut seen = HashSet::new();
+        let mut commands = board
+            .source_of_truth
+            .iter()
+            .chain(candidate_command_ids)
+            .filter(|id| seen.insert((*id).clone()))
+            .map(|id| {
+                board
+                    .proposals
+                    .get(id)
+                    .map(|(_from, command, proposal_time)| {
+                        (command.clone(), *proposal_time, id.0.clone())
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("board has no command for id '{}'", id.0))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        commands.retain(|(command, _, _)| !matches!(command, TimedCommand::NOOP));
+        let mut commands = commands
+            .into_iter()
+            .map(|(command, proposal_time, id)| {
+                let execution_time = match &command {
+                    TimedCommand::Now(_) => current_gps_time.context(
+                        "telemetry_gps_time_pointer must be configured when evaluating an immediate command",
+                    )?,
+                    TimedCommand::Scheduled { gps_time, .. } if gps_time.is_finite() => *gps_time,
+                    TimedCommand::Scheduled { .. } => {
+                        anyhow::bail!("command '{}' has a non-finite scheduled GPS time", id)
+                    }
+                    TimedCommand::NOOP => unreachable!("no-ops were removed above"),
+                };
+                Ok((command, execution_time, proposal_time, id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        commands.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+
+        Ok(commands
+            .into_iter()
+            .map(|(command, _, _, _)| command)
+            .collect())
+    }
+
+    fn telemetry_gps_time(&self, telemetry: &TelemetryFrame) -> anyhow::Result<Option<f64>> {
+        let Some(pointer) = self.config.telemetry_gps_time_pointer.as_deref() else {
+            return Ok(None);
+        };
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            anyhow::bail!("telemetry_gps_time_pointer must be empty or start with '/'");
+        }
+        let value = telemetry.payload.pointer(pointer).with_context(|| {
+            format!("telemetry payload has no GPS time at JSON Pointer '{pointer}'")
+        })?;
+        let gps_time = value.as_f64().with_context(|| {
+            format!("telemetry GPS time at JSON Pointer '{pointer}' is not numeric")
+        })?;
+        if !gps_time.is_finite() {
+            anyhow::bail!(
+                "telemetry GPS time at JSON Pointer '{}' is not finite",
+                pointer
+            );
+        }
+        Ok(Some(gps_time))
+    }
+
+    fn telemetry_gps_time_for_commands(
+        &self,
+        telemetry: &TelemetryFrame,
+        board: &BoardState,
+        candidate_command_ids: &[BoardCmdId],
+    ) -> anyhow::Result<Option<f64>> {
+        let has_immediate_command = board
+            .source_of_truth
+            .iter()
+            .chain(candidate_command_ids)
+            .filter_map(|id| board.proposals.get(id))
+            .any(|(_from, command, _proposal_time)| matches!(command, TimedCommand::Now(_)));
+
+        if has_immediate_command {
+            self.telemetry_gps_time(telemetry)
+        } else {
+            Ok(None)
         }
     }
 
@@ -357,29 +455,45 @@ impl Gatekeeper {
                         continue;
                     };
 
-                    let request = SimulationInputRequest {
-                        telemetry,
-                        board,
-                        candidate_command_ids: candidate_command_ids.clone(),
-                        config: self.config.input_adapter_config.clone(),
-                    };
-                    let out = match self.build_simulation_input(&request).await {
-                        Ok(input) => match self.run_analysis(input).await {
-                            Ok(details) => GatekeeperOutput::Approve {
-                                request_id,
-                                details: format!(
-                                    "{details}; batch_size={}",
-                                    candidate_command_ids.len()
-                                ),
+                    let request: anyhow::Result<SimulationInputRequest> = (|| {
+                        let current_gps_time = self.telemetry_gps_time_for_commands(
+                            &telemetry,
+                            &board,
+                            &candidate_command_ids,
+                        )?;
+                        Ok(SimulationInputRequest {
+                            telemetry,
+                            commands: Self::commands_for_simulation(
+                                &board,
+                                &candidate_command_ids,
+                                current_gps_time,
+                            )?,
+                            config: self.config.input_adapter_config.clone(),
+                        })
+                    })();
+                    let out = match request {
+                        Ok(request) => match self.build_simulation_input(&request).await {
+                            Ok(input) => match self.run_analysis(input).await {
+                                Ok(details) => GatekeeperOutput::Approve {
+                                    request_id,
+                                    details: format!(
+                                        "{details}; batch_size={}",
+                                        candidate_command_ids.len()
+                                    ),
+                                },
+                                Err(error) => GatekeeperOutput::Reject {
+                                    request_id,
+                                    reason: format!("Simulation rejected: {error:#}"),
+                                },
                             },
                             Err(error) => GatekeeperOutput::Reject {
                                 request_id,
-                                reason: format!("Simulation rejected: {error:#}"),
+                                reason: format!("Simulation error: {error:#}"),
                             },
                         },
                         Err(error) => GatekeeperOutput::Reject {
                             request_id,
-                            reason: format!("Simulation error: {error:#}"),
+                            reason: format!("Simulation input error: {error:#}"),
                         },
                     };
 
@@ -418,8 +532,7 @@ mod tests {
         });
         let request = SimulationInputRequest {
             telemetry: TelemetryFrame::new(serde_json::json!({})),
-            board: BoardState::default(),
-            candidate_command_ids: Vec::new(),
+            commands: Vec::new(),
             config: serde_json::Value::Null,
         };
 
@@ -444,8 +557,7 @@ mod tests {
         let gatekeeper = Gatekeeper::new(config);
         let request = SimulationInputRequest {
             telemetry: TelemetryFrame::new(serde_json::json!({"opaque": true})),
-            board: BoardState::default(),
-            candidate_command_ids: Vec::new(),
+            commands: Vec::new(),
             config: serde_json::Value::Null,
         };
 
@@ -475,5 +587,170 @@ mod tests {
             GatekeeperOutput::Reject { request_id: 7, reason }
                 if reason == "No telemetry available yet"
         ));
+    }
+
+    #[test]
+    fn combines_and_orders_commands_by_execution_time() {
+        let second = BoardCmdId("second".to_string());
+        let third = BoardCmdId("third".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "first": ["00000000-0000-0000-0000-000000000000", {"Scheduled": {"cmd": "PointNadir", "gps_time": 20.0}}, 1],
+                "second": ["00000000-0000-0000-0000-000000000000", {"Scheduled": {"cmd": "CaptureImage", "gps_time": 10.0}}, 2],
+                "third": ["00000000-0000-0000-0000-000000000000", {"Now": "PointSunYaw"}, 3]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": ["first"]
+        }))
+        .unwrap();
+
+        let commands =
+            Gatekeeper::commands_for_simulation(&board, &[second, third], Some(15.0)).unwrap();
+        assert!(matches!(
+            commands[0],
+            TimedCommand::Scheduled {
+                cmd: safe::protocol::Command::CaptureImage,
+                gps_time: 10.0
+            }
+        ));
+        assert!(matches!(
+            commands[1],
+            TimedCommand::Now(safe::protocol::Command::PointSunYaw)
+        ));
+        assert!(matches!(
+            commands[2],
+            TimedCommand::Scheduled {
+                cmd: safe::protocol::Command::PointNadir,
+                gps_time: 20.0
+            }
+        ));
+    }
+
+    #[test]
+    fn equal_time_commands_retain_proposal_order() {
+        let earlier = BoardCmdId("10:earlier".to_string());
+        let later = BoardCmdId("2:later".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "10:earlier": ["00000000-0000-0000-0000-000000000000", {"Scheduled": {"cmd": "PointNadir", "gps_time": 10.0}}, 1],
+                "2:later": ["00000000-0000-0000-0000-000000000000", {"Now": "PointSunYaw"}, 2]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": []
+        }))
+        .unwrap();
+
+        let commands =
+            Gatekeeper::commands_for_simulation(&board, &[later, earlier], Some(10.0)).unwrap();
+        assert!(matches!(
+            commands[0],
+            TimedCommand::Scheduled {
+                cmd: safe::protocol::Command::PointNadir,
+                ..
+            }
+        ));
+        assert!(matches!(
+            commands[1],
+            TimedCommand::Now(safe::protocol::Command::PointSunYaw)
+        ));
+    }
+
+    #[test]
+    fn reads_nested_telemetry_gps_time_pointer() {
+        let gatekeeper = Gatekeeper::new(GatekeeperConfig {
+            telemetry_gps_time_pointer: Some("/spacecraft/clock/gps_time".to_string()),
+            ..GatekeeperConfig::default()
+        });
+        let telemetry = TelemetryFrame::new(serde_json::json!({
+            "spacecraft": {"clock": {"gps_time": 1234.5}}
+        }));
+
+        assert_eq!(
+            gatekeeper.telemetry_gps_time(&telemetry).unwrap(),
+            Some(1234.5)
+        );
+    }
+
+    #[test]
+    fn immediate_command_requires_telemetry_gps_time() {
+        let id = BoardCmdId("immediate".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "immediate": ["00000000-0000-0000-0000-000000000000", {"Now": "PointNadir"}, 1]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": []
+        }))
+        .unwrap();
+
+        let error = Gatekeeper::commands_for_simulation(&board, &[id], None).unwrap_err();
+        assert!(error.to_string().contains("telemetry_gps_time_pointer"));
+    }
+
+    #[test]
+    fn scheduled_only_commands_do_not_read_telemetry_gps_time() {
+        let id = BoardCmdId("scheduled".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "scheduled": ["00000000-0000-0000-0000-000000000000", {"Scheduled": {"cmd": "PointNadir", "gps_time": 10.0}}, 1]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": []
+        }))
+        .unwrap();
+        let gatekeeper = Gatekeeper::new(GatekeeperConfig {
+            telemetry_gps_time_pointer: Some("/missing".to_string()),
+            ..GatekeeperConfig::default()
+        });
+        let telemetry = TelemetryFrame::new(serde_json::json!({}));
+
+        let gps_time = gatekeeper
+            .telemetry_gps_time_for_commands(&telemetry, &board, std::slice::from_ref(&id))
+            .unwrap();
+        assert_eq!(gps_time, None);
+        assert_eq!(
+            Gatekeeper::commands_for_simulation(&board, &[id], gps_time)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_command_ids_are_included_once() {
+        let id = BoardCmdId("duplicate".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "duplicate": ["00000000-0000-0000-0000-000000000000", {"Scheduled": {"cmd": "PointNadir", "gps_time": 10.0}}, 1]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": ["duplicate"]
+        }))
+        .unwrap();
+
+        let commands = Gatekeeper::commands_for_simulation(&board, &[id], None).unwrap();
+        assert_eq!(commands.len(), 1);
+    }
+
+    #[test]
+    fn noops_are_removed_from_the_simulation_schedule() {
+        let id = BoardCmdId("noop".to_string());
+        let board: BoardState = serde_json::from_value(serde_json::json!({
+            "proposals": {
+                "noop": ["00000000-0000-0000-0000-000000000000", "NOOP", 1]
+            },
+            "rejected": {},
+            "approved": {},
+            "source_of_truth": []
+        }))
+        .unwrap();
+
+        let commands = Gatekeeper::commands_for_simulation(&board, &[id], None).unwrap();
+        assert!(commands.is_empty());
     }
 }
