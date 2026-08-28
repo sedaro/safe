@@ -103,6 +103,7 @@ pub fn spawn_gatekeeper_adapter(
             let gatekeeper_config_json = serde_json::to_string(&cfg.gatekeeper)?;
             tokio::spawn(external_gatekeeper_adapter(
                 command,
+                cfg.platform.shell_executable.clone(),
                 gatekeeper_config_json,
                 in_rx,
                 out_tx,
@@ -114,13 +115,14 @@ pub fn spawn_gatekeeper_adapter(
 
 async fn external_gatekeeper_adapter(
     command: String,
+    shell_executable: String,
     gatekeeper_config_json: String,
     mut in_rx: mpsc::Receiver<GatekeeperAdapterInput>,
     out_tx: mpsc::Sender<GatekeeperAdapterOutput>,
 ) -> anyhow::Result<()> {
     info!(%command, "platform gatekeeper adapter `external` started");
 
-    let mut child = Command::new("bash")
+    let mut child = Command::new(shell_executable)
         .arg("-lc")
         .arg(command)
         .env("SAFE_GATEKEEPER_CONFIG_JSON", gatekeeper_config_json)

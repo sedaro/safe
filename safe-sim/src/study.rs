@@ -263,8 +263,12 @@ impl ProbabilityDistribution {
         Ok(())
     }
 
-    /// Draws one value from the distribution using the supplied case RNG.
-    fn sample(&self, rng: &mut ChaCha8Rng) -> Result<f64> {
+    /// Draws one value from the distribution using the supplied RNG.
+    ///
+    /// Exposing sampling lets callers build domain-specific case values, such as
+    /// perturbations around a baseline supplied by live telemetry, while using
+    /// the same validated distributions as `MonteCarloStudy`.
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Result<f64> {
         self.validate()?;
         Ok(match self {
             Self::Normal { mean, std_dev } => Normal::new(*mean, *std_dev)?.sample(rng),
