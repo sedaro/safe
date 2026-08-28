@@ -11,13 +11,12 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use simvm::sv::data::Data;
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
-use simvm::sv::{combine::TR, combine::TRD, parse::Parse};
 use tokio::{process::Command as TokioCommand, time::timeout};
 
+mod eds_data;
 pub mod study;
 
+pub use eds_data::{EdsFrame, EdsType, EdsValue};
 pub use study::{
     EdsPatchTarget, MonteCarloParameter, MonteCarloStudy, ProbabilityDistribution, StudyCase,
     StudyResult, StudyRunFailure, StudyRunOutcome, StudyRunResult, StudyTermination, TradeStudy,
@@ -46,7 +45,7 @@ pub struct SimulationResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
-    pub frames_by_file: HashMap<String, Vec<TRD>>,
+    pub frames_by_file: HashMap<String, Vec<EdsFrame>>,
 }
 
 impl SimulationResult {
@@ -94,7 +93,7 @@ impl SimulationResult {
             Ok(())
         }
 
-        let mut frames_by_file: HashMap<String, Vec<TRD>> = HashMap::new();
+        let mut frames_by_file: HashMap<String, Vec<EdsFrame>> = HashMap::new();
         let mut jsonl_paths = Vec::new();
         let mut seen = HashSet::new();
 
@@ -181,14 +180,14 @@ impl SimulationResult {
 ///
 /// Each instance owns a random target directory so concurrent simulations do not
 /// write results into one another's output.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SedaroSimulator {
     path: std::path::PathBuf,
     args: Vec<String>,
     target_config: String,
     timeout: Duration,
     venv: Option<std::path::PathBuf>,
-    init_type: Option<TR>,
+    init_type: Option<EdsType>,
     epoch: Option<f64>,
 }
 
@@ -468,7 +467,7 @@ impl SedaroSimulator {
     }
 
     /// Reads the serialized type definition for an agent's initial state.
-    pub fn read_init_type(&self, agent_id: &str) -> Result<TR> {
+    pub fn read_init_type(&self, agent_id: &str) -> Result<EdsType> {
         let workspace_dir = self.workspace_dir()?;
         match &self.init_type {
             Some(ty) => Ok(ty.clone()),
@@ -476,34 +475,34 @@ impl SedaroSimulator {
                 let type_sig =
                     std::fs::read(workspace_dir.join(format!("data/init_ty_{agent_id}.json")))?;
                 let type_sig_str = std::str::from_utf8(&type_sig)?;
-                let parsed_ty = TR::parse(type_sig_str).unwrap();
+                let parsed_ty = EdsType::parse(type_sig_str).with_context(|| {
+                    format!("failed to parse initial-state type for agent '{agent_id}'")
+                })?;
                 Ok(parsed_ty)
             }
         }
     }
 
     /// Reads and decodes an agent's initial-state value.
-    pub fn read_init_trd(&self, agent_id: &str) -> Result<TRD> {
+    pub fn read_init_trd(&self, agent_id: &str) -> Result<EdsFrame> {
         let init_type = self.read_init_type(agent_id)?;
         let workspace_dir = self.workspace_dir()?;
         let init_file_path = workspace_dir
             .join(format!("data/init_{agent_id}.bin"))
             .canonicalize()?;
         let init_bytes = std::fs::read(&init_file_path)?;
-        let init_val = dyn_de(&init_type.typ, &init_bytes).unwrap();
-        let init_val = TRD::from((init_type.clone(), init_val));
-        Ok(init_val)
+        let init_val = eds_data::decode(&init_type, &init_bytes)?;
+        Ok(EdsFrame::new(init_type, init_val))
     }
 
     /// Encodes and writes an agent's initial-state value.
-    pub fn write_init_trd(&self, agent_id: &str, init_val: TRD) -> Result<()> {
+    pub fn write_init_trd(&self, agent_id: &str, init_val: EdsFrame) -> Result<()> {
         let init_type = self.read_init_type(agent_id)?;
         let workspace_dir = self.workspace_dir()?;
         let init_file_path = workspace_dir
             .join(format!("data/init_{agent_id}.bin"))
             .canonicalize()?;
-        let init_val = init_val.data;
-        let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+        let bytes = eds_data::encode(&init_type, &init_val.data)?;
         std::fs::write(&init_file_path, bytes)?;
         Ok(())
     }
@@ -540,9 +539,9 @@ pub struct FileTargetConfigEntry {
 #[derive(Debug)]
 pub struct FileTargetReader {
     reader: BufReader<File>,
-    ty: Option<TR>,
+    ty: Option<EdsType>,
     timestamps_mjd: Vec<f64>,
-    frames: Vec<TRD>,
+    frames: Vec<EdsFrame>,
     line_idx: u64,
 }
 
@@ -578,8 +577,8 @@ impl FileTargetReader {
             }
             if self.ty.is_none() {
                 if let Ok(config) = serde_json::from_str::<FileTargetConfigEntry>(&line) {
-                    self.ty = Some(TR::parse(&config.data.type_).map_err(|error| {
-                        anyhow::anyhow!("invalid target type '{}': {error:?}", config.data.type_)
+                    self.ty = Some(EdsType::parse(&config.data.type_).map_err(|error| {
+                        anyhow::anyhow!("invalid target type '{}': {error:#}", config.data.type_)
                     })?);
                 }
             } else if let Ok(entry) = serde_json::from_str::<FileTargetFrameEntry>(&line) {
@@ -587,10 +586,10 @@ impl FileTargetReader {
                     let frame_bytes = BASE64_STANDARD
                         .decode(&entry.data.frame)
                         .context("invalid base64 target frame")?;
-                    match dyn_de(&parsed.typ, &frame_bytes) {
+                    match eds_data::decode(parsed, &frame_bytes) {
                         Ok(val) => {
                             self.timestamps_mjd.push(entry.data.time);
-                            self.frames.push(TRD::from((parsed.clone(), val))); // TODO: More memory efficient approach?
+                            self.frames.push(EdsFrame::new(parsed.clone(), val));
                         }
                         Err(e) => {
                             return Err(anyhow::anyhow!(
@@ -607,7 +606,7 @@ impl FileTargetReader {
     }
 
     /// Returns frames added since the previous call.
-    pub fn read_frames(&mut self) -> Result<Vec<TRD>> {
+    pub fn read_frames(&mut self) -> Result<Vec<EdsFrame>> {
         self.parse_frames()?;
         let frames = std::mem::take(&mut self.frames);
         Ok(frames)
@@ -625,7 +624,7 @@ impl FileTargetReader {
         }
     }
     /// Returns the first frame at or after a modified Julian timestamp.
-    pub fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<TRD>> {
+    pub fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<EdsFrame>> {
         self.parse_frames()?;
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             if timestamp_mjd < *start_time_mjd
@@ -641,7 +640,7 @@ impl FileTargetReader {
         ))
     }
     /// Returns the frame at an elapsed duration from the first target frame.
-    pub fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
+    pub fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<EdsFrame>> {
         self.parse_frames()?; // TODO: Figure out how to avoid this redundant parse
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             let timestamp_mjd = start_time_mjd + (duration.as_secs_f64() / 86400.0);
@@ -657,12 +656,51 @@ impl FileTargetReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::FileTargetFrameEntry;
+    use std::io::Write;
+
+    use base64::{Engine, prelude::BASE64_STANDARD};
+
+    use crate::{EdsValue, FileTargetFrameEntry, FileTargetReader};
 
     #[test]
     fn test_deser() {
         let d = "{\"data\": {\"frame\": \"Ojh7A1M4aD4OXAPUmHGxPzo4ewNTOGg+AAAAAAAAAAAAAAAAAAAAAN2GE2yw0FW+c/MadAWsor8AAAAAAAAAgN2GE2yw0FW+AAAAAAAAAIB8vJBmDtUhPn7HaQ7qt82/AAAAAAAAAAAAAAAAAAAAAHy8kGYO1SE+3Lw5s5ZdBL/cvDmzll0kvwAAAAAAAACAabUM7FgVDT7TqOkwv53NvW4PIvlgaBk/bg8i+WBoOT8Axu8aVyQiPgAAAAAAAACAQcL3XHUbEz6Rzddv4er7vpHN12/h6hu/x1lA25hMxD1Ai/nbov70PQAAAAAAAACA8txmVC+buT9BxX77W7cGP97akH4unvW+lgtyagiIUj+ArD0EKvvaPjcLtcZPCfU+pMJSGAH1lr+uLUHo8P3vvwAAAAAAAAAA6hI11QCsxr6vzrMhXAunP3jdFcCy9+8/Aay8s7GXEOi+bZE+n4REtz7VtWt1W9n2Phqyp5WcgbrALqeCeHklg8A5IgZhP9aiv4NPCayU6uU/w9rONlWzHsCUIuwDMq82P43qZTMDTO1AcuUByTpXHj8=\", \"time\": 60000.100024183375, \"time_step\": 0.00011574074074074072}, \"event\": \"enqueue\", \"stream_id\": \"PTnSrPdY4f8c2XSBcZX9LH.gnc\"}";
         let entry: FileTargetFrameEntry = serde_json::from_str(d).unwrap();
         assert_eq!(entry.data.time, 60000.100024183375);
+    }
+
+    #[test]
+    fn reads_named_fields_from_target_jsonl() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"data":{{"config":"","stream_id":"agent.gnc","type":"(time: f64, visible: bool)"}},"event":"config","stream_id":"agent.gnc"}}"#
+        )
+        .unwrap();
+        let mut bytes = 60_000.25f64.to_le_bytes().to_vec();
+        bytes.push(1);
+        writeln!(
+            file,
+            r#"{{"data":{{"frame":"{}","time":60000.25,"time_step":0.1}},"event":"enqueue","stream_id":"agent.gnc"}}"#,
+            BASE64_STANDARD.encode(bytes)
+        )
+        .unwrap();
+
+        let mut reader = FileTargetReader::try_from_path(&file.path().to_path_buf()).unwrap();
+        let frames = reader.read_frames().unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].get_by_field("time").unwrap().data,
+            EdsValue::F64(60_000.25)
+        );
+        assert!(
+            frames[0]
+                .get_by_field("visible")
+                .unwrap()
+                .data
+                .as_bool()
+                .unwrap()
+        );
     }
 }
