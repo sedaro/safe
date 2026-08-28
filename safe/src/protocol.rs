@@ -20,6 +20,19 @@ pub enum Command {
     PointThruster,
     ThrusterOn,
     ThrusterOff,
+    Track {
+        latitude_deg: f64,
+        longitude_deg: f64,
+        altitude_m: f64,
+    },
+    PointNadirWithSensor {
+        sensor: u32,
+    },
+    PointYpr {
+        roll_deg: f64,
+        pitch_deg: f64,
+        yaw_deg: f64,
+    },
 }
 
 impl Into<String> for &Command {
@@ -40,6 +53,19 @@ impl Into<String> for &Command {
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
             Command::ThrusterOff => "ThrusterOff".to_string(),
+            Command::Track {
+                latitude_deg,
+                longitude_deg,
+                altitude_m,
+            } => format!("Track({latitude_deg}, {longitude_deg}, {altitude_m})"),
+            Command::PointNadirWithSensor { sensor } => {
+                format!("PointNadirWithSensor({sensor})")
+            }
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            } => format!("PointYpr({roll_deg}, {pitch_deg}, {yaw_deg})"),
         }
     }
 }
@@ -62,6 +88,19 @@ impl Into<String> for Command {
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
             Command::ThrusterOff => "ThrusterOff".to_string(),
+            Command::Track {
+                latitude_deg,
+                longitude_deg,
+                altitude_m,
+            } => format!("Track({latitude_deg}, {longitude_deg}, {altitude_m})"),
+            Command::PointNadirWithSensor { sensor } => {
+                format!("PointNadirWithSensor({sensor})")
+            }
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            } => format!("PointYpr({roll_deg}, {pitch_deg}, {yaw_deg})"),
         }
     }
 }
@@ -347,6 +386,46 @@ mod tests {
 
         let rendered: String = (&command).into();
         assert_eq!(rendered, "PointQuaternion(0, 0, 0, 1)");
+    }
+
+    #[test]
+    fn extended_pointing_commands_serialize_and_round_trip() {
+        let cases = [
+            (
+                Command::Track {
+                    latitude_deg: 10.5,
+                    longitude_deg: -20.5,
+                    altitude_m: 100.1,
+                },
+                "Track(10.5, -20.5, 100.1)",
+            ),
+            (
+                Command::PointNadirWithSensor { sensor: 2 },
+                "PointNadirWithSensor(2)",
+            ),
+            (
+                Command::PointYpr {
+                    roll_deg: 0.0,
+                    pitch_deg: -45.0,
+                    yaw_deg: 90.0,
+                },
+                "PointYpr(0, -45, 90)",
+            ),
+        ];
+
+        for (command, expected_rendering) in cases {
+            let json = serde_json::to_vec(&command).unwrap();
+            let from_json: Command = serde_json::from_slice(&json).unwrap();
+            let bytes = bincode::serialize(&command).unwrap();
+            let from_bincode: Command = bincode::deserialize(&bytes).unwrap();
+
+            let rendered: String = (&command).into();
+            let json_rendered: String = (&from_json).into();
+            let bincode_rendered: String = from_bincode.into();
+            assert_eq!(rendered, expected_rendering);
+            assert_eq!(json_rendered, expected_rendering);
+            assert_eq!(bincode_rendered, expected_rendering);
+        }
     }
 
     prop_compose! {
