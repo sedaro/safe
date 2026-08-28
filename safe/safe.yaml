@@ -21,12 +21,23 @@ logging:
 limits:
   max_autonomy_modes: 10
 
+persistence:
+  events_max_bytes: 16777216
+  events_max_records: 10000
+  outputs_max_bytes: 16777216
+  outputs_max_records: 10000
+
 base_paths:
   base_writable_directory: /tmp/safe
 
 platform:
   egress_adapter: safectl_filesystem
   external_egress_command: null
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
   gatekeeper_adapter: disabled
   external_gatekeeper_command: null
 

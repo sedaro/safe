@@ -197,11 +197,14 @@ pub(crate) async fn run_logs(
         let mode_id = mode_id_from_name(&name).0;
         mode_log_sources(&logs_dir, mode_id, Some(name))
     } else {
-        vec![LogSource {
-            mode_id: None,
-            mode_name: None,
-            path: logs_dir.join("default.log"),
-        }]
+        log_file_paths(&logs_dir, "default.log")
+            .into_iter()
+            .map(|path| LogSource {
+                mode_id: None,
+                mode_name: None,
+                path,
+            })
+            .collect()
     };
 
     if !sources.iter().any(|source| source.path.exists()) {
@@ -230,12 +233,40 @@ pub(crate) async fn run_logs(
 fn mode_log_sources(logs_dir: &Path, mode_id: Uuid, mode_name: Option<String>) -> Vec<LogSource> {
     mode_log_file_candidates(mode_id)
         .into_iter()
-        .map(|file| LogSource {
-            mode_id: Some(mode_id),
-            mode_name: mode_name.clone(),
-            path: logs_dir.join(file),
+        .flat_map(|file| {
+            log_file_paths(logs_dir, &file)
+                .into_iter()
+                .map(|path| LogSource {
+                    mode_id: Some(mode_id),
+                    mode_name: mode_name.clone(),
+                    path,
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn log_file_paths(logs_dir: &Path, file_name: &str) -> Vec<PathBuf> {
+    let mut paths = vec![logs_dir.join(file_name)];
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return paths;
+    };
+    let prefix = format!("{file_name}.");
+    let mut archives: Vec<(usize, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let index = name
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .parse::<usize>()
+                .ok()?;
+            Some((index, entry.path()))
+        })
+        .collect();
+    archives.sort_by_key(|(index, _)| *index);
+    paths.extend(archives.into_iter().map(|(_, path)| path));
+    paths
 }
 
 fn mode_log_file_candidates(id: Uuid) -> Vec<String> {
@@ -762,5 +793,20 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert!(candidates[0].ends_with(".log"));
         assert!(candidates[1].contains("AutonomyModeId_"));
+    }
+
+    #[test]
+    fn discovers_numbered_log_archives() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("default.log"), "current").unwrap();
+        std::fs::write(tempdir.path().join("default.log.2"), "older").unwrap();
+        std::fs::write(tempdir.path().join("default.log.invalid"), "ignore").unwrap();
+        std::fs::write(tempdir.path().join("other.log.1"), "ignore").unwrap();
+
+        let paths = log_file_paths(tempdir.path(), "default.log");
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], tempdir.path().join("default.log"));
+        assert_eq!(paths[1], tempdir.path().join("default.log.2"));
     }
 }
