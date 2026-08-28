@@ -60,17 +60,18 @@ fn external_egress_clear_request_cancels_only_the_requested_command() {
 }
 
 #[test]
-#[ignore = "reproduces repeated external clear request state growth"]
-fn repeated_external_clear_requests_accumulate_rejections() {
+fn repeated_external_clear_requests_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut safe = start_safe_with_egress(&tempdir, true);
 
-    let rejection_count =
-        wait_for_rejection_count(&tempdir.path().join("state/outputs.jsonl"), COMMAND_ID, 2);
+    let outputs = tempdir.path().join("state/outputs.jsonl");
+    wait_for_rejection_count(&outputs, COMMAND_ID, 1);
+    sleep(Duration::from_millis(300));
+    let rejection_count = wait_for_rejection_count(&outputs, COMMAND_ID, 1);
 
-    assert!(
-        rejection_count >= 2,
-        "the same external clear request was expected to be applied repeatedly"
+    assert_eq!(
+        rejection_count, 1,
+        "the same clear request was applied twice"
     );
     assert!(safe.0.try_wait().unwrap().is_none());
 }

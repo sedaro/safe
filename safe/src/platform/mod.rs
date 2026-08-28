@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use crate::config::Config;
@@ -192,7 +192,7 @@ pub fn spawn_platform_egress(
     cfg: &Config,
     runtime_paths: &RuntimePaths,
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
-    mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    command_dispatch_rx: watch::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
     board_clear_tx: mpsc::Sender<BoardClearRequest>,
 ) -> anyhow::Result<()> {
@@ -241,7 +241,7 @@ async fn filesystem_egress_adapter(
     status_path: PathBuf,
     dispatch_csv_path: PathBuf,
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
-    mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    mut command_dispatch_rx: watch::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
 ) -> anyhow::Result<()> {
     let mut status_open = true;
@@ -261,9 +261,11 @@ async fn filesystem_egress_adapter(
                     None => status_open = false,
                 }
             }
-            board_state = command_dispatch_rx.recv(), if command_dispatch_open => {
-                match board_state {
-                    Some(board_state) => match write_host_command_dispatch_csv(&dispatch_csv_path, &board_state).await {
+            board_changed = command_dispatch_rx.changed(), if command_dispatch_open => {
+                match board_changed {
+                    Ok(()) => {
+                        let board_state = command_dispatch_rx.borrow_and_update().clone();
+                        match write_host_command_dispatch_csv(&dispatch_csv_path, &board_state).await {
                         Ok(()) => {
                             if board_publication_tx.send(BoardPublicationStatus {
                                 command_ids: board_state.source_of_truth,
@@ -272,8 +274,9 @@ async fn filesystem_egress_adapter(
                             }
                         }
                         Err(e) => error!("failed writing host command dispatch csv: {e}"),
-                    },
-                    None => command_dispatch_open = false,
+                        }
+                    }
+                    Err(_) => command_dispatch_open = false,
                 }
             }
         }
@@ -284,7 +287,7 @@ async fn filesystem_egress_adapter(
 async fn external_egress_adapter(
     command: String,
     mut status_rx: mpsc::Receiver<HostCommandStatus>,
-    mut command_dispatch_rx: mpsc::Receiver<BoardState>,
+    mut command_dispatch_rx: watch::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
     board_clear_tx: mpsc::Sender<BoardClearRequest>,
 ) -> anyhow::Result<()> {
@@ -320,10 +323,13 @@ async fn external_egress_adapter(
                     None => status_open = false,
                 }
             }
-            board = command_dispatch_rx.recv(), if command_dispatch_open => {
-                match board {
-                    Some(board) => write_egress_message(&mut writer, PlatformEgressWireInput::BoardSnapshot { board }).await?,
-                    None => command_dispatch_open = false,
+            board_changed = command_dispatch_rx.changed(), if command_dispatch_open => {
+                match board_changed {
+                    Ok(()) => {
+                        let board = command_dispatch_rx.borrow_and_update().clone();
+                        write_egress_message(&mut writer, PlatformEgressWireInput::BoardSnapshot { board }).await?;
+                    }
+                    Err(_) => command_dispatch_open = false,
                 }
             }
             line = lines.next_line() => {
@@ -519,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn external_egress_publishes_only_acknowledged_command_ids() {
         let (status_tx, status_rx) = mpsc::channel(1);
-        let (board_tx, board_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = watch::channel(BoardState::default());
         let (publication_tx, mut publication_rx) = mpsc::channel(1);
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
@@ -530,7 +536,7 @@ mod tests {
             clear_tx,
         ));
 
-        board_tx.send(BoardState::default()).await.unwrap();
+        board_tx.send(BoardState::default()).unwrap();
         let publication = timeout(Duration::from_secs(1), publication_rx.recv())
             .await
             .unwrap()
@@ -552,7 +558,7 @@ mod tests {
     #[tokio::test]
     async fn external_egress_does_not_publish_without_an_acknowledgement() {
         let (status_tx, status_rx) = mpsc::channel(1);
-        let (board_tx, board_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = watch::channel(BoardState::default());
         let (publication_tx, mut publication_rx) = mpsc::channel(1);
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
@@ -563,7 +569,7 @@ mod tests {
             clear_tx,
         ));
 
-        board_tx.send(BoardState::default()).await.unwrap();
+        board_tx.send(BoardState::default()).unwrap();
         assert!(
             timeout(Duration::from_millis(100), publication_rx.recv())
                 .await
@@ -582,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn external_egress_forwards_clear_requests() {
         let (status_tx, status_rx) = mpsc::channel(1);
-        let (board_tx, board_rx) = mpsc::channel(1);
+        let (board_tx, board_rx) = watch::channel(BoardState::default());
         let (publication_tx, _publication_rx) = mpsc::channel(1);
         let (clear_tx, mut clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
@@ -593,7 +599,7 @@ mod tests {
             clear_tx,
         ));
 
-        board_tx.send(BoardState::default()).await.unwrap();
+        board_tx.send(BoardState::default()).unwrap();
         let clear = timeout(Duration::from_secs(1), clear_rx.recv())
             .await
             .unwrap()
@@ -611,10 +617,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "reproduces external egress pipe backpressure"]
-    async fn external_egress_that_does_not_read_stdin_blocks_board_producers() {
+    async fn external_egress_that_does_not_read_stdin_does_not_block_board_producers() {
         let (_status_tx, status_rx) = mpsc::channel(1);
-        let (board_tx, board_rx) = mpsc::channel(1024);
+        let (board_tx, board_rx) = watch::channel(BoardState::default());
         let (publication_tx, _publication_rx) = mpsc::channel(1);
         let (clear_tx, _clear_rx) = mpsc::channel(1);
         let adapter = tokio::spawn(external_egress_adapter(
@@ -629,24 +634,20 @@ mod tests {
             source_of_truth: vec![BoardCmdId("x".repeat(4 * 1024 * 1024))],
             ..Default::default()
         };
-        board_tx.send(blocked_write).await.unwrap();
+        board_tx.send(blocked_write).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        for _ in 0..1024 {
-            board_tx.send(BoardState::default()).await.unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1025 {
+            board_tx.send_replace(BoardState::default());
         }
-        let producer_blocked = timeout(
-            Duration::from_millis(100),
-            board_tx.send(BoardState::default()),
-        )
-        .await
-        .is_err();
+        let elapsed = started.elapsed();
 
         adapter.abort();
         let _ = adapter.await;
         assert!(
-            producer_blocked,
-            "the board producer was expected to block after the egress pipe and channel filled"
+            elapsed < Duration::from_millis(100),
+            "board updates blocked behind the external egress pipe for {elapsed:?}"
         );
     }
 

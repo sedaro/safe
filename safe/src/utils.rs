@@ -136,17 +136,49 @@ pub async fn append_jsonl<T: Serialize>(path: &PathBuf, v: &T) -> anyhow::Result
         fs::create_dir_all(parent).await?;
     }
     let mut file_contents = if Path::new(path).exists() {
-        tokio::fs::read_to_string(path).await.expect("file read")
+        tokio::fs::read_to_string(path).await?
     } else {
         "".to_string()
     };
     let line = serde_json::to_string(v)?;
     file_contents.push_str(&line);
-    file_contents.push_str("\n");
-    atomic_write_file(path, file_contents.as_bytes())
-        .await
-        .expect("atomic write");
+    file_contents.push('\n');
+    atomic_write_file(path, file_contents.as_bytes()).await?;
     Ok(())
+}
+
+/// Append one JSONL record without allowing the journal to exceed `max_bytes`.
+/// Returns true when checkpointed records were replaced by the new record.
+pub async fn append_jsonl_bounded<T: Serialize>(
+    path: &PathBuf,
+    v: &T,
+    max_bytes: u64,
+) -> anyhow::Result<bool> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let mut line = serde_json::to_vec(v)?;
+    line.push(b'\n');
+    if line.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "JSONL record is {} bytes, exceeding the {max_bytes} byte journal limit",
+            line.len()
+        );
+    }
+
+    let current_bytes = match fs::metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if current_bytes.saturating_add(line.len() as u64) > max_bytes {
+        atomic_write_file(path, &line).await?;
+        return Ok(true);
+    }
+
+    append_jsonl(path, v).await?;
+    Ok(false)
 }
 
 pub async fn load_or_default_json<T>(path: &PathBuf, default_value: T) -> anyhow::Result<T>

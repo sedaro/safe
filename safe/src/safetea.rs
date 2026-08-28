@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::{fs, time};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -30,7 +30,9 @@ use crate::runtime::{
 };
 use crate::sandbox::sandbox::SandboxResources;
 use crate::telemetry_frame::TelemetryFrame;
-use crate::utils::{append_jsonl, atomic_write_file, load_or_default_json, save_json_atomic};
+use crate::utils::{
+    append_jsonl, append_jsonl_bounded, atomic_write_file, load_or_default_json, save_json_atomic,
+};
 use crate::{
     AutonomyModeId, AutonomyModeInput, AutonomyModeMeta, AutonomyModeOutput, BoardCmdId,
     BoardEvent, BoardState, Command, CommandEnvelope, ExternalCommand, HostCommandDispatchRecord,
@@ -313,7 +315,7 @@ pub struct SafeTEA {
     host_status_tx: mpsc::Sender<HostCommandStatus>,
     sent_board_command_ids: HashSet<BoardCmdId>,
     flight: Flight,
-    host_command_dispatch_tx: mpsc::Sender<BoardState>,
+    host_command_dispatch_tx: watch::Sender<BoardState>,
     logical_ts: u64,
     latest_telemetry: Option<TelemetryFrame>,
     next_seq: u64,
@@ -613,7 +615,7 @@ impl SafeTEA {
         let (external_command_tx, external_command_rx) = mpsc::channel::<HostCommandRequest>(1024);
         let (host_status_tx, host_status_rx) = mpsc::channel::<HostCommandStatus>(1024);
         let (host_command_dispatch_tx, host_command_dispatch_rx) =
-            mpsc::channel::<BoardState>(1024);
+            watch::channel(BoardState::default());
         let (board_publication_tx, board_publication_rx) =
             mpsc::channel::<BoardPublicationStatus>(1024);
         let (board_clear_tx, board_clear_rx) = mpsc::channel::<BoardClearRequest>(1024);
@@ -697,6 +699,9 @@ impl SafeTEA {
             .await
             .expect("atomic save");
 
+        safetea
+            .host_command_dispatch_tx
+            .send_replace(safetea.board.clone());
         safetea.send_board_snapshot_to_all().await;
         safetea
             .write_operational_status()
@@ -961,6 +966,10 @@ impl SafeTEA {
                 maybe_clear = self.board_clear_rx.recv() => {
                     if let Some(clear) = maybe_clear {
                         for id in clear.command_ids {
+                            if !self.board.source_of_truth.contains(&id) {
+                                info!(command_id = ?id, "ignoring clear request for command not on the published board");
+                                continue;
+                            }
                             self.q.push_back(Event {
                                 seq: self.next_seq,
                                 ts_mono: self.logical_ts,
@@ -1267,10 +1276,28 @@ impl SafeTEA {
                 match &ev.msg {
                     Msg::Tick => {}
                     _ => {
-                        append_jsonl(&self.runtime_paths.events, &ev)
-                            .await
-                            .expect("event append");
-                        self.event_records += 1;
+                        match append_jsonl_bounded(
+                            &self.runtime_paths.events,
+                            &ev,
+                            self.cfg.persistence.events_max_bytes,
+                        )
+                        .await
+                        {
+                            Ok(replaced) => {
+                                self.event_records =
+                                    if replaced { 1 } else { self.event_records + 1 };
+                            }
+                            Err(error) => {
+                                let reason = format!(
+                                    "failed to persist event {} before applying it: {error}",
+                                    ev.seq
+                                );
+                                error!(event_seq = ev.seq, %error, "halting before applying unpersisted event");
+                                self.flight.set_fault(reason);
+                                self.flight.stop();
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1299,11 +1326,9 @@ impl SafeTEA {
                     }
                 }
 
-                if let Err(e) = self.host_command_dispatch_tx.send(self.board.clone()).await {
-                    error!("failed to enqueue host command dispatch record: {e}");
-                }
-
                 if board_changed {
+                    self.host_command_dispatch_tx
+                        .send_replace(self.board.clone());
                     if let Some(router) = self.router.as_ref() {
                         router.send_board_snapshot_to_all(self.board.clone()).await;
                     }
