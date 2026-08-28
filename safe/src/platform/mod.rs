@@ -6,7 +6,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
-use crate::config::Config;
+use crate::config::{Config, ExternalEgressRetryConfig};
 use crate::protocol::{BoardCmdId, BoardState};
 use crate::telemetry_frame::TelemetryFrame;
 use crate::{HostCommandRequest, HostCommandStatus, RuntimePaths, SafectlIngress, TimedCommand};
@@ -218,6 +218,7 @@ pub fn spawn_platform_egress(
                 .ok_or_else(|| anyhow::anyhow!(
                     "platform egress adapter external selected, but platform.external_egress_command is not configured"
                 ))?;
+            let retry_config = cfg.platform.external_egress_retry.clone();
             tokio::spawn(async move {
                 if let Err(e) = external_egress_adapter(
                     command,
@@ -225,6 +226,7 @@ pub fn spawn_platform_egress(
                     command_dispatch_rx,
                     board_publication_tx,
                     board_clear_tx,
+                    retry_config,
                 )
                 .await
                 {
@@ -290,12 +292,13 @@ async fn external_egress_adapter(
     mut command_dispatch_rx: watch::Receiver<BoardState>,
     board_publication_tx: mpsc::Sender<BoardPublicationStatus>,
     board_clear_tx: mpsc::Sender<BoardClearRequest>,
+    retry_config: ExternalEgressRetryConfig,
 ) -> anyhow::Result<()> {
-    const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-    const STABLE_SESSION_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
-
-    let mut retry_delay = INITIAL_RETRY_DELAY;
+    let initial_retry_delay = std::time::Duration::from_millis(retry_config.initial_delay_ms);
+    let max_retry_delay = std::time::Duration::from_millis(retry_config.max_delay_ms);
+    let stable_session_duration = std::time::Duration::from_millis(retry_config.stable_session_ms);
+    let write_timeout = std::time::Duration::from_millis(retry_config.write_timeout_ms);
+    let mut retry_delay = initial_retry_delay;
     let mut pending_status = None;
     loop {
         if status_rx.is_closed()
@@ -313,6 +316,7 @@ async fn external_egress_adapter(
             &board_publication_tx,
             &board_clear_tx,
             &mut pending_status,
+            write_timeout,
         )
         .await
         {
@@ -329,11 +333,12 @@ async fn external_egress_adapter(
             return Ok(());
         }
 
+        let session_duration = started_at.elapsed();
         tokio::time::sleep(retry_delay).await;
-        retry_delay = if started_at.elapsed() >= STABLE_SESSION_DURATION {
-            INITIAL_RETRY_DELAY
+        retry_delay = if session_duration >= stable_session_duration {
+            initial_retry_delay
         } else {
-            retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY)
+            retry_delay.saturating_mul(2).min(max_retry_delay)
         };
     }
 }
@@ -349,6 +354,7 @@ async fn run_external_egress_session(
     board_publication_tx: &mpsc::Sender<BoardPublicationStatus>,
     board_clear_tx: &mpsc::Sender<BoardClearRequest>,
     pending_status: &mut Option<HostCommandStatus>,
+    write_timeout: std::time::Duration,
 ) -> anyhow::Result<ExternalEgressSessionExit> {
     info!(%command, "platform egress adapter `external` started");
 
@@ -378,6 +384,7 @@ async fn run_external_egress_session(
             PlatformEgressWireInput::HostCommandStatus {
                 status: status.clone(),
             },
+            write_timeout,
         )
         .await?;
         *pending_status = None;
@@ -387,6 +394,7 @@ async fn run_external_egress_session(
     write_egress_message_with_timeout(
         &mut writer,
         PlatformEgressWireInput::BoardSnapshot { board },
+        write_timeout,
     )
     .await?;
 
@@ -404,6 +412,7 @@ async fn run_external_egress_session(
                         write_egress_message_with_timeout(
                             &mut writer,
                             PlatformEgressWireInput::HostCommandStatus { status },
+                            write_timeout,
                         ).await?;
                         *pending_status = None;
                     }
@@ -417,6 +426,7 @@ async fn run_external_egress_session(
                         write_egress_message_with_timeout(
                             &mut writer,
                             PlatformEgressWireInput::BoardSnapshot { board },
+                            write_timeout,
                         ).await?;
                     }
                     Err(_) => command_dispatch_open = false,
@@ -451,10 +461,9 @@ async fn run_external_egress_session(
 async fn write_egress_message_with_timeout(
     writer: &mut tokio::process::ChildStdin,
     message: PlatformEgressWireInput,
+    write_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
-    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    tokio::time::timeout(WRITE_TIMEOUT, write_egress_message(writer, message))
+    tokio::time::timeout(write_timeout, write_egress_message(writer, message))
         .await
         .map_err(|_| anyhow::anyhow!("timed out writing to external egress process"))??;
     Ok(())
@@ -581,6 +590,15 @@ mod tests {
     use crate::protocol::TimedCommand;
     use tokio::time::{Duration, timeout};
 
+    fn test_external_egress_retry_config() -> ExternalEgressRetryConfig {
+        ExternalEgressRetryConfig {
+            initial_delay_ms: 10,
+            max_delay_ms: 20,
+            stable_session_ms: 1_000,
+            write_timeout_ms: 100,
+        }
+    }
+
     #[test]
     fn platform_egress_kind_parses_supported_adapters() {
         assert_eq!(
@@ -637,6 +655,7 @@ mod tests {
             board_rx,
             publication_tx,
             clear_tx,
+            test_external_egress_retry_config(),
         ));
 
         board_tx.send(BoardState::default()).unwrap();
@@ -670,6 +689,7 @@ mod tests {
             board_rx,
             publication_tx,
             clear_tx,
+            test_external_egress_retry_config(),
         ));
 
         board_tx.send(BoardState::default()).unwrap();
@@ -700,6 +720,7 @@ mod tests {
             board_rx,
             publication_tx,
             clear_tx,
+            test_external_egress_retry_config(),
         ));
 
         board_tx.send(BoardState::default()).unwrap();
@@ -731,6 +752,7 @@ mod tests {
             board_rx,
             publication_tx,
             clear_tx,
+            test_external_egress_retry_config(),
         ));
 
         let blocked_write = BoardState {
@@ -778,6 +800,7 @@ done"#,
             board_rx,
             publication_tx,
             clear_tx,
+            test_external_egress_retry_config(),
         ));
 
         let publication = timeout(Duration::from_secs(3), publication_rx.recv())
@@ -789,6 +812,60 @@ done"#,
             vec![BoardCmdId("recovered".to_string())]
         );
         assert_eq!(std::fs::read_to_string(attempts_path).unwrap(), "3");
+
+        drop(status_tx);
+        drop(board_tx);
+        timeout(Duration::from_secs(1), adapter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_egress_uses_configured_write_timeout() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let attempts_path = tempdir.path().join("timeout-attempts");
+        let command = format!(
+            r#"attempt=$(cat {path} 2>/dev/null || printf 0)
+attempt=$((attempt + 1))
+printf '%s' "$attempt" > {path}
+if [ "$attempt" -eq 1 ]; then exec sleep 2; fi
+while IFS= read -r _; do
+  printf '%s\n' '{{"kind":"board_published","command_ids":["after-timeout"]}}'
+done"#,
+            path = attempts_path.display(),
+        );
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let initial_board = BoardState {
+            source_of_truth: vec![BoardCmdId("x".repeat(128 * 1024))],
+            ..Default::default()
+        };
+        let (board_tx, board_rx) = watch::channel(initial_board);
+        let (publication_tx, mut publication_rx) = mpsc::channel(1);
+        let (clear_tx, _clear_rx) = mpsc::channel(1);
+        let retry_config = ExternalEgressRetryConfig {
+            write_timeout_ms: 500,
+            ..test_external_egress_retry_config()
+        };
+        let adapter = tokio::spawn(external_egress_adapter(
+            command,
+            status_rx,
+            board_rx,
+            publication_tx,
+            clear_tx,
+            retry_config,
+        ));
+
+        let publication = timeout(Duration::from_secs(3), publication_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publication.command_ids,
+            vec![BoardCmdId("after-timeout".to_string())]
+        );
+        assert_eq!(std::fs::read_to_string(attempts_path).unwrap(), "2");
 
         drop(status_tx);
         drop(board_tx);
