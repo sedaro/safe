@@ -1,17 +1,28 @@
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::Context;
 use safe::telemetry_frame::TelemetryFrame;
-use safe_sim::{SedaroSimulator, SimulationResult};
+use safe_sim::{EdsPatch, SedaroSimulator, SimulationResult};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub mod gatekeeper_types;
+mod monte_carlo;
 
 use crate::gatekeeper_types::{
     CheckAggregation, ComparisonOp, FieldCheck, GatekeeperConfig, GatekeeperInput,
     GatekeeperOutput, SimulationInputRequest, SimulationInputResponse,
 };
+
+enum CheckOutcome {
+    Passed(String),
+    Failed(String),
+}
+
+fn meets_minimum_pass_fraction(passed: usize, samples: usize, minimum: f64) -> bool {
+    passed as f64 / samples as f64 + f64::EPSILON >= minimum
+}
 
 impl CheckAggregation {
     fn evaluate_over(&self, values: &[f64]) -> anyhow::Result<f64> {
@@ -29,14 +40,14 @@ impl CheckAggregation {
 }
 
 impl ComparisonOp {
-    fn compare(&self, observed: f64, threshold: f64) -> bool {
+    fn compare(&self, observed: f64, threshold: f64, tolerance: f64) -> bool {
         match self {
             ComparisonOp::Lt => observed < threshold,
             ComparisonOp::Lte => observed <= threshold,
             ComparisonOp::Gt => observed > threshold,
             ComparisonOp::Gte => observed >= threshold,
-            ComparisonOp::Eq => (observed - threshold).abs() <= 1e-9,
-            ComparisonOp::Ne => (observed - threshold).abs() > 1e-9,
+            ComparisonOp::Eq => (observed - threshold).abs() <= tolerance,
+            ComparisonOp::Ne => (observed - threshold).abs() > tolerance,
         }
     }
 
@@ -73,6 +84,9 @@ impl Gatekeeper {
         &self,
         request: &SimulationInputRequest,
     ) -> anyhow::Result<SimulationInputResponse> {
+        if self.config.input_adapter_timeout_secs == Some(0) {
+            anyhow::bail!("gatekeeper input_adapter_timeout_secs must be greater than zero");
+        }
         let (executable, args) = self
             .config
             .input_adapter_command
@@ -97,10 +111,17 @@ impl Gatekeeper {
         stdin.write_all(b"\n").await?;
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
-            .await
-            .context("failed while waiting for simulation input adapter")?;
+        let wait = child.wait_with_output();
+        let output = if let Some(timeout_secs) = self.config.input_adapter_timeout_secs {
+            tokio::time::timeout(Duration::from_secs(timeout_secs), wait)
+                .await
+                .with_context(|| {
+                    format!("simulation input adapter timed out after {timeout_secs} seconds")
+                })?
+        } else {
+            wait.await
+        }
+        .context("failed while waiting for simulation input adapter")?;
         if !output.status.success() {
             anyhow::bail!(
                 "simulation input adapter failed (code={:?}): {}",
@@ -119,25 +140,20 @@ impl Gatekeeper {
 
     async fn run_simulation(
         &self,
-        request: &SimulationInputRequest,
+        start_time_mjd: f64,
+        patches: Vec<EdsPatch>,
     ) -> anyhow::Result<SimulationResult> {
-        if self.config.sim_duration_days <= 0.0 {
-            anyhow::bail!(
-                "gatekeeper sim_duration_days must be > 0, got {}",
-                self.config.sim_duration_days
-            );
+        if self.config.simulation_timeout_secs == Some(0) {
+            anyhow::bail!("gatekeeper simulation_timeout_secs must be greater than zero");
         }
-
-        let input = self.build_simulation_input(request).await?;
-        if !input.start_time_mjd.is_finite() {
-            anyhow::bail!("simulation input adapter returned a non-finite start_time_mjd");
-        }
-
-        let simulator = self
+        let mut simulator = self
             .simulator
             .clone()
-            .at_epoch(input.start_time_mjd)
-            .patch_multi(input.patches);
+            .at_epoch(start_time_mjd)
+            .patch_multi(patches);
+        if let Some(timeout_secs) = self.config.simulation_timeout_secs {
+            simulator = simulator.timeout(Duration::from_secs(timeout_secs));
+        }
 
         tracing::info!(
             sim_duration_days = self.config.sim_duration_days,
@@ -155,7 +171,7 @@ impl Gatekeeper {
         result.numeric_field_values(&check.target_file, &check.field)
     }
 
-    fn evaluate(&self, result: &SimulationResult) -> anyhow::Result<String> {
+    fn evaluate(&self, result: &SimulationResult) -> anyhow::Result<CheckOutcome> {
         if !result.success {
             anyhow::bail!(
                 "Simulation failed (code={:?}): {}",
@@ -165,10 +181,10 @@ impl Gatekeeper {
         }
 
         if self.config.field_checks.is_empty() {
-            return Ok(format!(
+            return Ok(CheckOutcome::Passed(format!(
                 "Simulation OK (code={:?}); no field checks configured",
                 result.exit_code
-            ));
+            )));
         }
 
         let mut passed_checks = Vec::new();
@@ -183,8 +199,8 @@ impl Gatekeeper {
             }
 
             let observed = check.aggregation.evaluate_over(&values)?;
-            if !check.op.compare(observed, check.threshold) {
-                anyhow::bail!(
+            if !check.op.compare(observed, check.threshold, check.tolerance) {
+                return Ok(CheckOutcome::Failed(format!(
                     "Constraint violated: {}:{} {:?} must be {} {} (observed={:.6})",
                     check.target_file,
                     check.field,
@@ -192,7 +208,7 @@ impl Gatekeeper {
                     check.op.as_str(),
                     check.threshold,
                     observed
-                );
+                )));
             }
 
             passed_checks.push(format!(
@@ -206,10 +222,112 @@ impl Gatekeeper {
             ));
         }
 
-        Ok(format!(
+        Ok(CheckOutcome::Passed(format!(
             "Simulation OK (code={:?}); checks passed [{}]",
             result.exit_code,
             passed_checks.join("; ")
+        )))
+    }
+
+    /// Runs the exact adapter state first, then evaluates randomized scalar
+    /// perturbations independently of the required nominal result.
+    async fn run_analysis(&self, input: SimulationInputResponse) -> anyhow::Result<String> {
+        if !self.config.sim_duration_days.is_finite() || self.config.sim_duration_days <= 0.0 {
+            anyhow::bail!(
+                "gatekeeper sim_duration_days must be finite and > 0, got {}",
+                self.config.sim_duration_days
+            );
+        }
+        if !input.start_time_mjd.is_finite() {
+            anyhow::bail!("simulation input adapter returned a non-finite start_time_mjd");
+        }
+        for check in &self.config.field_checks {
+            if !check.tolerance.is_finite() || check.tolerance < 0.0 {
+                anyhow::bail!(
+                    "field check tolerance must be finite and >= 0 for file='{}' field='{}'",
+                    check.target_file,
+                    check.field
+                );
+            }
+        }
+        monte_carlo::validate_baseline_patches(&input.patches)?;
+        // Generate cases before launching EDS so invalid distributions, patch
+        // targets, or bounds fail without spending time on the nominal run.
+        let monte_carlo_cases = self
+            .config
+            .monte_carlo
+            .as_ref()
+            .map(|config| monte_carlo::generate_cases(config, &input.patches))
+            .transpose()?;
+
+        tracing::info!(
+            analysis_case = "nominal",
+            "Gatekeeper running nominal simulation"
+        );
+        let nominal_result = self
+            .run_simulation(input.start_time_mjd, input.patches.clone())
+            .await
+            .context("nominal simulation failed")?;
+        let nominal_details = match self.evaluate(&nominal_result)? {
+            CheckOutcome::Passed(details) => details,
+            CheckOutcome::Failed(reason) => anyhow::bail!("Nominal simulation rejected: {reason}"),
+        };
+
+        let Some(config) = &self.config.monte_carlo else {
+            return Ok(nominal_details);
+        };
+        let cases = monte_carlo_cases.context("Monte Carlo cases were not generated")?;
+
+        let mut passed = 0usize;
+        let mut failed_cases = Vec::new();
+        for case in cases {
+            tracing::info!(
+                analysis_case = %case.id,
+                case_seed = case.seed,
+                sampled_values = ?case.values,
+                "Gatekeeper running Monte Carlo simulation"
+            );
+            let result = self
+                .run_simulation(input.start_time_mjd, case.patches)
+                .await
+                .with_context(|| format!("Monte Carlo case '{}' failed", case.id))?;
+            match self
+                .evaluate(&result)
+                .with_context(|| format!("Monte Carlo case '{}' could not be evaluated", case.id))?
+            {
+                CheckOutcome::Passed(_) => passed += 1,
+                CheckOutcome::Failed(reason) => failed_cases.push(format!("{}: {reason}", case.id)),
+            }
+        }
+
+        let pass_fraction = passed as f64 / config.samples as f64;
+        tracing::info!(
+            samples = config.samples,
+            passed,
+            failed = config.samples - passed,
+            pass_fraction,
+            minimum_pass_fraction = config.minimum_pass_fraction,
+            seed = config.seed,
+            "Gatekeeper completed Monte Carlo analysis"
+        );
+        if !meets_minimum_pass_fraction(passed, config.samples, config.minimum_pass_fraction) {
+            let examples = failed_cases
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "Monte Carlo rejected: {passed}/{} cases passed ({pass_fraction:.3}, required {:.3}); failures [{}]",
+                config.samples,
+                config.minimum_pass_fraction,
+                examples
+            );
+        }
+
+        Ok(format!(
+            "{nominal_details}; Monte Carlo passed {passed}/{} cases ({pass_fraction:.3}, required {:.3}, seed={})",
+            config.samples, config.minimum_pass_fraction, config.seed
         ))
     }
 
@@ -245,8 +363,8 @@ impl Gatekeeper {
                         candidate_command_ids: candidate_command_ids.clone(),
                         config: self.config.input_adapter_config.clone(),
                     };
-                    let out = match self.run_simulation(&request).await {
-                        Ok(result) => match self.evaluate(&result) {
+                    let out = match self.build_simulation_input(&request).await {
+                        Ok(input) => match self.run_analysis(input).await {
                             Ok(details) => GatekeeperOutput::Approve {
                                 request_id,
                                 details: format!(
@@ -276,6 +394,41 @@ impl Gatekeeper {
 mod tests {
     use super::*;
     use safe::protocol::BoardState;
+
+    #[test]
+    fn monte_carlo_acceptance_uses_only_sampled_cases() {
+        assert!(meets_minimum_pass_fraction(19, 20, 0.95));
+        assert!(!meets_minimum_pass_fraction(18, 20, 0.95));
+        assert!(!meets_minimum_pass_fraction(19, 20, 1.0));
+    }
+
+    #[test]
+    fn equality_comparisons_use_configured_tolerance() {
+        assert!(ComparisonOp::Eq.compare(1.001, 1.0, 0.01));
+        assert!(!ComparisonOp::Eq.compare(1.001, 1.0, 0.0001));
+        assert!(!ComparisonOp::Ne.compare(1.001, 1.0, 0.01));
+        assert!(ComparisonOp::Ne.compare(1.001, 1.0, 0.0001));
+    }
+
+    #[tokio::test]
+    async fn zero_adapter_timeout_is_rejected_before_launch() {
+        let gatekeeper = Gatekeeper::new(GatekeeperConfig {
+            input_adapter_timeout_secs: Some(0),
+            ..GatekeeperConfig::default()
+        });
+        let request = SimulationInputRequest {
+            telemetry: TelemetryFrame::new(serde_json::json!({})),
+            board: BoardState::default(),
+            candidate_command_ids: Vec::new(),
+            config: serde_json::Value::Null,
+        };
+
+        let error = gatekeeper
+            .build_simulation_input(&request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
 
     #[tokio::test]
     async fn adapter_receives_request_and_returns_materialized_input() {
