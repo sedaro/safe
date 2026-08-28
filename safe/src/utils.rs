@@ -99,9 +99,19 @@ fn atomic_write_file_blocking(path: &Path, data: &[u8]) -> io::Result<()> {
     // Atomic replacement (on same filesystem).
     fs::rename(&tmp_path, path)?;
 
-    // fsync parent directory so the rename itself is durable.
+    // fsync parent directory so the rename itself is durable. Some Unix
+    // platforms and filesystems, including common macOS filesystems, reject
+    // directory fsync even though the rename itself succeeded atomically.
     let dir = File::open(parent)?;
-    dir.sync_all()?;
+    match dir.sync_all() {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) => {}
+        Err(error) => return Err(error),
+    }
 
     Ok(())
 }
