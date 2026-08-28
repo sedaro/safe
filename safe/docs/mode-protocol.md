@@ -65,6 +65,12 @@ inside the serialized frame.
 `TimedCommand` is either `Now(Command)`, `NOOP`, or
 `Scheduled { cmd, gps_time }`.
 
+Pointing and payload command variants include `PointNadir`, `PointSunYaw`,
+`PointQuaternion`, `Track { latitude_deg, longitude_deg, altitude_m }`,
+`PointNadirWithSensor { sensor }`, `PointYpr { roll_deg, pitch_deg, yaw_deg }`,
+and `CaptureImage`. `TimedCommand` determines whether any command is immediate
+or scheduled; command variants do not perform frame or unit conversion.
+
 ## Lifecycle and Heartbeats
 
 `run_mode` sends a `ready` lifecycle output after the handshake. It changes its

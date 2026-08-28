@@ -4,11 +4,9 @@ use anyhow::Context;
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 use safe::protocol::{Command, TimedCommand};
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
-use safe_sim::{EdsPatch, SimulationResult};
+use safe_sim::{EdsFrame, EdsPatch, SimulationResult};
 use safe_telemetry::augmented::AugmentedTelemetry;
 use safe_telemetry::model::Telemetry;
-use simvm::sv::combine::TRD;
-use simvm::sv::data::Data;
 
 use crate::types::{
     EdsPointingSchedule, CoorbitalEvasionMode, GeometrySample, ModeScheduleEntry, PointingTarget,
@@ -320,7 +318,7 @@ impl CoorbitalEvasionMode {
         patches
     }
 
-    fn frames_for_result<'a>(&self, result: &'a SimulationResult) -> anyhow::Result<&'a [TRD]> {
+    fn frames_for_result<'a>(&self, result: &'a SimulationResult) -> anyhow::Result<&'a [EdsFrame]> {
         if !result.success {
             anyhow::bail!(
                 "simulation failed (code={:?}): {}",
@@ -346,7 +344,7 @@ impl CoorbitalEvasionMode {
             .with_context(|| format!("missing expected simulation target file '{target_file}'"))
     }
 
-    fn field_vec(frame: &TRD, field: &str, length: usize) -> anyhow::Result<Vec<f64>> {
+    fn field_vec(frame: &EdsFrame, field: &str, length: usize) -> anyhow::Result<Vec<f64>> {
         let datum = frame
             .get_by_field(field)
             .map_err(|error| anyhow::anyhow!("missing EDS result field '{field}': {error}"))?;
@@ -369,19 +367,19 @@ impl CoorbitalEvasionMode {
             .collect()
     }
 
-    fn field_vec3(frame: &TRD, field: &str) -> anyhow::Result<Vector3<f64>> {
+    fn field_vec3(frame: &EdsFrame, field: &str) -> anyhow::Result<Vector3<f64>> {
         let values = Self::field_vec(frame, field, 3)?;
         Ok(Vector3::new(values[0], values[1], values[2]))
     }
 
-    fn field_quaternion(frame: &TRD, field: &str) -> anyhow::Result<UnitQuaternion<f64>> {
+    fn field_quaternion(frame: &EdsFrame, field: &str) -> anyhow::Result<UnitQuaternion<f64>> {
         let values = Self::field_vec(frame, field, 4)?;
         Ok(UnitQuaternion::new_normalize(Quaternion::new(
             values[3], values[0], values[1], values[2],
         )))
     }
 
-    fn field_bool(frame: &TRD, field: &str) -> anyhow::Result<bool> {
+    fn field_bool(frame: &EdsFrame, field: &str) -> anyhow::Result<bool> {
         frame
             .get_by_field(field)
             .map_err(|error| anyhow::anyhow!("missing EDS result field '{field}': {error}"))?

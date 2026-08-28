@@ -262,6 +262,35 @@ The child returns one of these for an evaluation request:
 {"kind":"reject","request_id":1,"reason":"not safe"}
 ```
 
+The `safe_gatekeeperd` implementation can be selected as that external
+gatekeeper. It retains the latest telemetry frame and invokes a mission-specific
+one-shot process to convert that telemetry and each requested board batch into
+an EDS start epoch and patches. A complete configuration is:
+
+```yaml
+platform:
+  gatekeeper_adapter: external
+  external_gatekeeper_command: /opt/safe/bin/safe_gatekeeperd
+
+gatekeeper:
+  eds_path: /opt/safe/eds
+  sim_duration_days: 1.0
+  input_adapter_command:
+    - /opt/safe/bin/mission-input-adapter
+    - gatekeeper-input
+  input_adapter_config: {}
+  field_checks:
+    - target_file: agent.engine.jsonl
+      field: component.metric
+      aggregation: min
+      op: gte
+      threshold: 0.5
+```
+
+The input adapter receives one JSON request on stdin and returns one JSON
+response on stdout before exiting. See
+[`safe-gatekeeper/README.md`](../../safe-gatekeeper/README.md) for the contract.
+
 ## Mode Configuration
 
 The YAML file does not define mode binaries. Add mode entries to the separate
