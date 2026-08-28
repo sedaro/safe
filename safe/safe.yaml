@@ -33,6 +33,11 @@ base_paths:
 platform:
   egress_adapter: safectl_filesystem
   external_egress_command: null
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
   gatekeeper_adapter: disabled
   external_gatekeeper_command: null
 
