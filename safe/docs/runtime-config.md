@@ -65,6 +65,7 @@ base_paths:
   base_writable_directory: "/tmp/safe"
 
 platform:
+  shell_executable: "bash"
   telemetry_adapter: "example"
   command_adapter: "safectl_unix_json"
   egress_adapter: "safectl_filesystem"
@@ -102,6 +103,7 @@ gatekeeper: {}
 | `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
+| `platform.shell_executable` | `bash` | Executable used as `<shell_executable> -lc <command>` for shell-backed telemetry, egress, and gatekeeper adapters. Set to `/bin/sh` on systems without Bash. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
 | `platform.command_adapter` | `safectl_unix_json` | Selects the command ingress adapter. |
 | `platform.egress_adapter` | `safectl_filesystem` | Selects `safectl_filesystem` or `external` platform egress. |
@@ -131,6 +133,7 @@ fields on `__`. For example:
 
 ```bash
 SAFE_PLATFORM__TELEMETRY_ADAPTER=external
+SAFE_PLATFORM__SHELL_EXECUTABLE=/bin/sh
 SAFE_PLATFORM__EXTERNAL_TELEMETRY_COMMAND='cat /var/run/telemetry.jsonl'
 SAFE_PLATFORM__EGRESS_ADAPTER=external
 SAFE_PLATFORM__EXTERNAL_EGRESS_COMMAND='/usr/local/bin/platform-egress'
@@ -165,7 +168,8 @@ stdout line as a JSON payload. It assigns source `bash_mock` and uses a payload
 `ts_mono` field when present, otherwise a local sequence number. Build SAFE with
 the `platform-bash-mock` feature to enable this adapter.
 
-`external` executes the configured command through `bash -lc`. Each non-empty
+`external` executes the configured command through
+`platform.shell_executable -lc`. Each non-empty
 stdout line must be a JSON object with optional `source` and `ts_mono` fields and
 a `payload` field. Invalid lines are logged and skipped.
 
@@ -185,7 +189,7 @@ The default `safectl_filesystem` egress writes host command status records to
 `out/commands.csv`.
 
 The `external` egress adapter executes `external_egress_command` through
-`bash -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
+`platform.shell_executable -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
 responses from stdout. SAFE restarts a failed, exited, or write-stalled child
 indefinitely using the configured capped exponential backoff. A session that
 runs for `stable_session_ms` resets the next delay to `initial_delay_ms`.

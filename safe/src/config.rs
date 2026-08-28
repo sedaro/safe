@@ -93,6 +93,9 @@ impl Config {
                     .into(),
             );
         }
+        if self.platform.shell_executable.trim().is_empty() {
+            return Err("platform.shell_executable must not be empty".into());
+        }
         Ok(())
     }
 }
@@ -144,6 +147,8 @@ pub struct PersistenceConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlatformConfig {
+    #[serde(default = "default_shell_executable")]
+    pub shell_executable: String,
     #[serde(default = "default_telemetry_adapter")]
     pub telemetry_adapter: String,
     #[serde(default = "default_command_adapter")]
@@ -173,6 +178,10 @@ pub struct ExternalEgressRetryConfig {
 
 fn default_telemetry_adapter() -> String {
     "example".to_string()
+}
+
+fn default_shell_executable() -> String {
+    "bash".to_string()
 }
 
 fn default_command_adapter() -> String {
@@ -241,6 +250,7 @@ impl Default for SerializedDefaults {
                 outputs_max_records: 10_000,
             },
             platform: PlatformConfigDefaults {
+                shell_executable: default_shell_executable(),
                 telemetry_adapter: default_telemetry_adapter(),
                 command_adapter: default_command_adapter(),
                 egress_adapter: default_egress_adapter(),
@@ -318,6 +328,7 @@ struct PersistenceConfigDefaults {
 
 #[derive(serde::Serialize)]
 struct PlatformConfigDefaults {
+    shell_executable: String,
     telemetry_adapter: String,
     command_adapter: String,
     egress_adapter: String,
@@ -433,6 +444,30 @@ mod tests {
         config.platform.external_egress_retry.write_timeout_ms = 1;
         config.platform.external_egress_retry.initial_delay_ms = 2;
         config.platform.external_egress_retry.max_delay_ms = 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn loads_shell_executable_default_and_yaml_override() {
+        let defaults: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        assert_eq!(defaults.platform.shell_executable, "bash");
+
+        let overridden: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .merge(Yaml::string("platform:\n  shell_executable: /bin/sh\n"))
+            .extract()
+            .unwrap();
+        assert_eq!(overridden.platform.shell_executable, "/bin/sh");
+    }
+
+    #[test]
+    fn rejects_empty_shell_executable() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        config.platform.shell_executable = "  ".into();
+
         assert!(config.validate().is_err());
     }
 }

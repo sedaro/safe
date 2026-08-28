@@ -119,7 +119,7 @@ fn start_safe_with_egress(tempdir: &tempfile::TempDir, clear_board: bool) -> Saf
     std::fs::write(
         &script_path,
         format!(
-            "#!/usr/bin/env bash\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *board_snapshot*) {response} ;;\n  esac\ndone\n"
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *board_snapshot*) {response} ;;\n  esac\ndone\n"
         ),
     )
     .unwrap();
@@ -128,7 +128,7 @@ fn start_safe_with_egress(tempdir: &tempfile::TempDir, clear_board: bool) -> Saf
     std::fs::write(
         &config_path,
         format!(
-            "base_paths:\n  base_working_directory: {base}\n  base_writable_directory: {base}\nlogging:\n  file_path: {base}/logs/safe.log\npersistence:\n  events_max_bytes: 1048576\n  events_max_records: 1000\n  outputs_max_bytes: 1048576\n  outputs_max_records: 1\nplatform:\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  egress_adapter: external\n  external_egress_command: \"bash {script}\"\n  gatekeeper_adapter: disabled\n",
+            "base_paths:\n  base_working_directory: {base}\n  base_writable_directory: {base}\nlogging:\n  file_path: {base}/logs/safe.log\npersistence:\n  events_max_bytes: 1048576\n  events_max_records: 1000\n  outputs_max_bytes: 1048576\n  outputs_max_records: 1\nplatform:\n  shell_executable: /bin/sh\n  telemetry_adapter: example\n  command_adapter: safectl_unix_json\n  egress_adapter: external\n  external_egress_command: \". {script}\"\n  gatekeeper_adapter: disabled\n",
             base = base.display(),
             script = script_path.display(),
         ),
