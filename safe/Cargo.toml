@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["platform-safectl-json"]
+otel-metrics = ["dep:opentelemetry-proto", "dep:prost"]
 platform-bash-mock = []
 platform-safectl-json = []
 
@@ -23,15 +24,14 @@ figment = { version = "0.10.19", features = ["env", "json", "toml", "yaml"] }
 futures = "0.3.32"
 safe-time = { path = "../safe-time" }
 nalgebra = { version = "0.33.2" }
-opentelemetry-proto = "0.31.0"
-prost = "0.14.3"
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+opentelemetry-proto = { version = "0.31.0", optional = true }
+prost = { version = "0.14.3", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = "0.6.3"
 sysinfo = "0.38.4"
-tokio = { version = "1.52.1", features = ["full"] }
-tokio-util = "0.7.18"
+tokio = { version = "1.52.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

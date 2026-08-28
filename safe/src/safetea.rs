@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::{fs, time};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::RuntimePaths;
@@ -18,7 +18,10 @@ use crate::flight::{AutonomyModeActivation, Flight};
 use crate::platform::gatekeeper::{
     GatekeeperAdapterInput, GatekeeperAdapterOutput, spawn_gatekeeper_adapter,
 };
-use crate::platform::{BoardPublicationStatus, spawn_platform_egress, spawn_platform_ingress};
+use crate::platform::{
+    BoardClearRequest, BoardPublicationStatus, platform_egress_id, spawn_platform_egress,
+    spawn_platform_ingress,
+};
 use crate::router::AutonomyModeConfig;
 use crate::router::{Router, canonical_path};
 use crate::runtime::{
@@ -27,7 +30,9 @@ use crate::runtime::{
 };
 use crate::sandbox::sandbox::SandboxResources;
 use crate::telemetry_frame::TelemetryFrame;
-use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
+use crate::utils::{
+    append_jsonl, append_jsonl_bounded, atomic_write_file, load_or_default_json, save_json_atomic,
+};
 use crate::{
     AutonomyModeId, AutonomyModeInput, AutonomyModeMeta, AutonomyModeOutput, BoardCmdId,
     BoardEvent, BoardState, Command, CommandEnvelope, ExternalCommand, HostCommandDispatchRecord,
@@ -85,6 +90,12 @@ pub enum Effect {
     Halt(String),
     ExecuteCommand(TimedCommand),
     Board(BoardEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutputJournalRecord {
+    Snapshot { board: BoardState },
+    Effect { effect: Effect },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +210,11 @@ pub(crate) async fn apply_event(
 
     if emit_outputs {
         for fx in &effects {
-            append_jsonl(outputs_path, fx).await?;
+            append_jsonl(
+                outputs_path,
+                &OutputJournalRecord::Effect { effect: fx.clone() },
+            )
+            .await?;
         }
     }
 
@@ -222,9 +237,14 @@ pub async fn rebuild_board_from_outputs(
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str(&line) {
-            Ok(fx) => {
-                if let Effect::Board(bev) = fx {
+        let record = serde_json::from_str::<OutputJournalRecord>(&line).or_else(|_| {
+            serde_json::from_str::<Effect>(&line)
+                .map(|effect| OutputJournalRecord::Effect { effect })
+        });
+        match record {
+            Ok(OutputJournalRecord::Snapshot { board: snapshot }) => board = snapshot,
+            Ok(OutputJournalRecord::Effect { effect }) => {
+                if let Effect::Board(bev) = effect {
                     board.apply(&bev);
                 }
             }
@@ -232,6 +252,36 @@ pub async fn rebuild_board_from_outputs(
         }
     }
     Ok(board)
+}
+
+pub(crate) async fn journal_record_count(path: &Path) -> anyhow::Result<usize> {
+    let file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut lines = BufReader::new(file).lines();
+    let mut count = 0;
+    while let Some(line) = lines.next_line().await? {
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+pub(crate) async fn journal_exceeds_limits(
+    path: &Path,
+    record_count: usize,
+    max_bytes: u64,
+    max_records: usize,
+) -> anyhow::Result<bool> {
+    let byte_limit_reached = match fs::metadata(path).await {
+        Ok(metadata) => metadata.len() >= max_bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(byte_limit_reached || record_count >= max_records)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,19 +300,22 @@ pub struct SafeTEASummary {
 
 pub struct SafeTEA {
     board: BoardState,
+    board_clear_rx: mpsc::Receiver<BoardClearRequest>,
     board_publication_rx: mpsc::Receiver<BoardPublicationStatus>,
     cfg: Config,
     config_reload_tick: time::Interval,
     external_command_rx: mpsc::Receiver<HostCommandRequest>,
+    event_records: usize,
     gatekeeper_input_tx: mpsc::Sender<GatekeeperAdapterInput>,
     gatekeeper_output_rx: mpsc::Receiver<GatekeeperAdapterOutput>,
     gatekeeper_next_request_id: u64,
     latest_gatekeeper_request_id: Option<u64>,
     pending_gatekeeper_batches: HashMap<u64, PendingGatekeeperBatch>,
+    output_records: usize,
     host_status_tx: mpsc::Sender<HostCommandStatus>,
     sent_board_command_ids: HashSet<BoardCmdId>,
     flight: Flight,
-    host_command_dispatch_tx: mpsc::Sender<BoardState>,
+    host_command_dispatch_tx: watch::Sender<BoardState>,
     logical_ts: u64,
     latest_telemetry: Option<TelemetryFrame>,
     next_seq: u64,
@@ -549,6 +602,12 @@ impl SafeTEA {
         let board = rebuild_board_from_outputs(&runtime_paths)
             .await
             .expect("rebuild board");
+        let event_records = journal_record_count(&runtime_paths.events)
+            .await
+            .expect("count event records");
+        let output_records = journal_record_count(&runtime_paths.outputs)
+            .await
+            .expect("count output records");
         let sent_board_command_ids: HashSet<BoardCmdId> =
             board.source_of_truth.iter().cloned().collect();
 
@@ -556,9 +615,10 @@ impl SafeTEA {
         let (external_command_tx, external_command_rx) = mpsc::channel::<HostCommandRequest>(1024);
         let (host_status_tx, host_status_rx) = mpsc::channel::<HostCommandStatus>(1024);
         let (host_command_dispatch_tx, host_command_dispatch_rx) =
-            mpsc::channel::<BoardState>(1024);
+            watch::channel(BoardState::default());
         let (board_publication_tx, board_publication_rx) =
             mpsc::channel::<BoardPublicationStatus>(1024);
+        let (board_clear_tx, board_clear_rx) = mpsc::channel::<BoardClearRequest>(1024);
         spawn_platform_ingress(
             &cfg,
             &runtime_paths,
@@ -572,6 +632,7 @@ impl SafeTEA {
             host_status_rx,
             host_command_dispatch_rx,
             board_publication_tx,
+            board_clear_tx,
         )
         .expect("platform egress");
 
@@ -581,15 +642,18 @@ impl SafeTEA {
         let next_seq = flight.peak_next_seq();
         let mut safetea = Self {
             board,
+            board_clear_rx,
             board_publication_rx,
             cfg,
             config_reload_tick: time::interval(Duration::from_secs(1)),
             external_command_rx,
+            event_records,
             gatekeeper_input_tx,
             gatekeeper_output_rx,
             gatekeeper_next_request_id: 1,
             latest_gatekeeper_request_id: None,
             pending_gatekeeper_batches: HashMap::new(),
+            output_records,
             sent_board_command_ids,
             flight,
             host_command_dispatch_tx,
@@ -635,6 +699,9 @@ impl SafeTEA {
             .await
             .expect("atomic save");
 
+        safetea
+            .host_command_dispatch_tx
+            .send_replace(safetea.board.clone());
         safetea.send_board_snapshot_to_all().await;
         safetea
             .write_operational_status()
@@ -892,6 +959,29 @@ impl SafeTEA {
                             .extend(publication.command_ids);
                         if let Err(e) = self.write_operational_status().await {
                             error!("failed writing operational status: {e}");
+                        }
+                    }
+                }
+
+                maybe_clear = self.board_clear_rx.recv() => {
+                    if let Some(clear) = maybe_clear {
+                        for id in clear.command_ids {
+                            if !self.board.source_of_truth.contains(&id) {
+                                info!(command_id = ?id, "ignoring clear request for command not on the published board");
+                                continue;
+                            }
+                            self.q.push_back(Event {
+                                seq: self.next_seq,
+                                ts_mono: self.logical_ts,
+                                source: Source::System,
+                                msg: Msg::BoardCommandCanceled {
+                                    id,
+                                    reason: clear.reason.clone(),
+                                    by: platform_egress_id(),
+                                },
+                            });
+                            self.next_seq += 1;
+                            self.logical_ts += 1;
                         }
                     }
                 }
@@ -1186,9 +1276,28 @@ impl SafeTEA {
                 match &ev.msg {
                     Msg::Tick => {}
                     _ => {
-                        append_jsonl(&self.runtime_paths.events, &ev)
-                            .await
-                            .expect("event append");
+                        match append_jsonl_bounded(
+                            &self.runtime_paths.events,
+                            &ev,
+                            self.cfg.persistence.events_max_bytes,
+                        )
+                        .await
+                        {
+                            Ok(replaced) => {
+                                self.event_records =
+                                    if replaced { 1 } else { self.event_records + 1 };
+                            }
+                            Err(error) => {
+                                let reason = format!(
+                                    "failed to persist event {} before applying it: {error}",
+                                    ev.seq
+                                );
+                                error!(event_seq = ev.seq, %error, "halting before applying unpersisted event");
+                                self.flight.set_fault(reason);
+                                self.flight.stop();
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1217,11 +1326,9 @@ impl SafeTEA {
                     }
                 }
 
-                if let Err(e) = self.host_command_dispatch_tx.send(self.board.clone()).await {
-                    error!("failed to enqueue host command dispatch record: {e}");
-                }
-
                 if board_changed {
+                    self.host_command_dispatch_tx
+                        .send_replace(self.board.clone());
                     if let Some(router) = self.router.as_ref() {
                         router.send_board_snapshot_to_all(self.board.clone()).await;
                     }
@@ -1479,6 +1586,9 @@ impl SafeTEA {
                 save_json_atomic(&self.runtime_paths.summary, &self.summary)
                     .await
                     .expect("save json");
+                self.compact_journals_if_needed()
+                    .await
+                    .expect("compact recovery journals");
 
                 if !matches!(ev.msg, Msg::Tick)
                     && let Err(e) = self.write_operational_status().await
@@ -1498,13 +1608,57 @@ impl SafeTEA {
     }
 
     async fn apply_event(&mut self, ev: &Event, emit_outputs: bool) -> anyhow::Result<Vec<Effect>> {
-        apply_event(
+        let effects = apply_event(
             &mut self.flight,
             ev,
             &self.runtime_paths.outputs,
             emit_outputs,
         )
-        .await
+        .await?;
+        if emit_outputs {
+            self.output_records += effects.len();
+        }
+        Ok(effects)
+    }
+
+    async fn compact_journals_if_needed(&mut self) -> anyhow::Result<()> {
+        if journal_exceeds_limits(
+            &self.runtime_paths.events,
+            self.event_records,
+            self.cfg.persistence.events_max_bytes,
+            self.cfg.persistence.events_max_records,
+        )
+        .await?
+        {
+            atomic_write_file(&self.runtime_paths.events, b"").await?;
+            self.event_records = 0;
+        }
+
+        if journal_exceeds_limits(
+            &self.runtime_paths.outputs,
+            self.output_records,
+            self.cfg.persistence.outputs_max_bytes,
+            self.cfg.persistence.outputs_max_records,
+        )
+        .await?
+        {
+            let snapshot = OutputJournalRecord::Snapshot {
+                board: self.board.clone(),
+            };
+            let mut contents = serde_json::to_vec(&snapshot)?;
+            contents.push(b'\n');
+            if contents.len() as u64 > self.cfg.persistence.outputs_max_bytes {
+                warn!(
+                    snapshot_bytes = contents.len(),
+                    configured_max_bytes = self.cfg.persistence.outputs_max_bytes,
+                    "board snapshot exceeds the output journal size limit"
+                );
+            }
+            atomic_write_file(&self.runtime_paths.outputs, &contents).await?;
+            self.output_records = 1;
+        }
+
+        Ok(())
     }
 
     fn update(&mut self, ev: &Event) -> Vec<Effect> {
