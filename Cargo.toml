@@ -26,5 +26,6 @@ inherits = "release"
 opt-level = "z"
 debug = false
 strip = true
+lto = "fat"
 panic = "abort"
 codegen-units = 1
