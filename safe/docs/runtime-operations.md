@@ -34,8 +34,13 @@ are marked by `stream`.
 
 SAFE also reads the previous sanitized
 `AutonomyModeId_<uuid>_.log` filename through `safectl` so upgrades do not hide
-existing supervisor records. The current logging implementation does not
-rotate files even though rotation fields are validated in YAML.
+existing supervisor records. Files rotate before a write would exceed
+`logging.rotation.max_file_size_mb`, and optionally at a UTC day boundary.
+The active file is retained with numbered archives (`default.log.1`,
+`default.log.2`, and so on). `logging.rotation.max_files` includes the active
+file, so every stream is bounded by `max_files * max_file_size_mb`; a record
+larger than one file is dropped. `safectl logs` includes these archives. This
+is a per-stream bound, not a total directory-size bound across mode IDs.
 
 The sandbox metrics writer additionally uses
 `SAFE_METRIC_BASE_PATH/<mode-uuid>/metrics-current.json` and
@@ -58,6 +63,14 @@ ignored during recovery. Invalid JSONL lines are skipped during replay. Keep
 `flight.json`, `events.jsonl`, and `outputs.jsonl` together when backing up or
 restoring runtime state.
 
+SAFE compacts the recovery journals after either their configured byte or record
+limit is reached. It first atomically saves `flight.json`, then clears
+`events.jsonl`; events already represented by the checkpoint are ignored during
+recovery. `outputs.jsonl` is atomically replaced by a current `BoardState`
+snapshot, followed by later effects. This bounds historical journal growth and
+replay time. It does not bound the snapshot itself: with no limit on outstanding
+commands, the current board can grow beyond `persistence.outputs_max_bytes`.
+
 ## Event, Board, and Output Flow
 
 Telemetry and external control requests become events. Mode commands become
@@ -70,11 +83,20 @@ Pending board batches are sent to the configured gatekeeper. With
 detail `gatekeeper disabled`. An external gatekeeper receives JSONL requests on
 stdin and returns JSONL `approve` or `reject` messages on stdout.
 
-The default platform egress writes:
+The default `safectl_filesystem` platform egress writes:
 
 - Host command status records to `state/host_command_status.jsonl`.
 - Approved scheduled commands to `out/commands.csv` with `cmd` and `gps_time`
   columns.
+
+Set `platform.egress_adapter: external` to run a separate egress binary. SAFE
+writes status updates and complete board snapshots as JSONL to its stdin; the
+binary must return `board_published` JSONL acknowledgements on stdout before
+SAFE marks those commands published.
+
+An external egress may also return `clear_board_commands` with command IDs and
+a reason. SAFE persists those removals as board cancellations attributed to the
+all-ones platform egress actor.
 
 `TimedCommand::Now` and `TimedCommand::NOOP` are currently omitted from
 `commands.csv`. The direct `ExecuteNow` path is recorded in SAFE effects, but
@@ -142,6 +164,26 @@ Look for `starting`, `connecting`, `connected`, `disconnected`, `faulted`, and
 `unresponsive` states. A mode that cannot connect may have an invalid binary
 path, a protocol-version mismatch, a missing executable dependency, or a
 sandbox isolation failure.
+
+## Runtime Edge Smoke Test
+
+Run the targeted persistence and egress smoke test from the repository root:
+
+```bash
+safe/scripts/runtime-edge-smoke.sh
+```
+
+The script requires Bash and `jq`. It builds `safe` and `safectl`, creates
+isolated temporary runtime directories, injects telemetry and controller
+commands, forces event/output journal compaction, restarts SAFE, and verifies
+the recovered board. It also exercises external egress recovery after an
+immediate exit, a write stall, and a forced process death.
+
+Use `--no-build` to reuse existing binaries. Use `--keep` or `KEEP_TMP=1` to
+retain the generated state, journals, configuration, and process logs for
+inspection. `SAFE_BIN` and `SAFECTL_BIN` can override the binaries under test.
+Temporary runtimes use `/tmp` to stay within Unix-socket path limits;
+`SAFE_EDGE_TMPDIR` can override that location with another short path.
 
 ## Safety Limitations
 

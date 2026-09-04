@@ -54,16 +54,30 @@ logging:
 limits:
   max_autonomy_modes: 10
 
+persistence:
+  events_max_bytes: 16777216
+  events_max_records: 10000
+  outputs_max_bytes: 16777216
+  outputs_max_records: 10000
+
 base_paths:
   base_working_directory: "/tmp/safe"
   base_writable_directory: "/tmp/safe"
 
 platform:
+  shell_executable: "bash"
   telemetry_adapter: "example"
   command_adapter: "safectl_unix_json"
+  egress_adapter: "safectl_filesystem"
   gatekeeper_adapter: "disabled"
   bash_mock_telemetry_command: null
   external_telemetry_command: null
+  external_egress_command: null
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
   external_gatekeeper_command: null
 
 gatekeeper: {}
@@ -79,20 +93,37 @@ gatekeeper: {}
 | `sockets.telemetry` | `0.0.0.0:44212` | Retained socket configuration; the current adapters do not bind this endpoint. |
 | `sockets.commands` | `127.0.0.1:7002` | Retained socket configuration; command ingress currently uses a Unix socket. |
 | `logging.file_path` | `/tmp/safe/logs/app.log` | Its parent directory is used for `default.log` and per-mode logs. |
-| `logging.rotation.*` | `100`, `10`, `false` | Validated values, but file rotation is not currently implemented. |
+| `logging.rotation.max_file_size_mb` | `100` | Maximum bytes in one log file, in mebibytes. A record that exceeds this limit is dropped rather than exceeding it. |
+| `logging.rotation.max_files` | `10` | Maximum retained files per stream, including the active file. Older numbered archives are removed. |
+| `logging.rotation.daily` | `false` | Rotate a non-empty active log when its UTC calendar day changes. Size rotation always applies. |
 | `limits.max_autonomy_modes` | `10` | Maximum number of JSON mode entries, including disabled entries. |
+| `persistence.events_max_bytes` | `16777216` | Compact the event recovery journal after it reaches this byte count. |
+| `persistence.events_max_records` | `10000` | Compact the event recovery journal after this many records. |
+| `persistence.outputs_max_bytes` | `16777216` | Compact the output recovery journal after it reaches this byte count. |
+| `persistence.outputs_max_records` | `10000` | Compact the output recovery journal after this many records. |
 | `base_paths.base_working_directory` | `/tmp/safe` | Deployment path retained by the config model; mode work directories currently derive from writable state. |
 | `base_paths.base_writable_directory` | `/tmp/safe` | Root for SAFE state and output files. |
+| `platform.shell_executable` | `bash` | Executable used as `<shell_executable> -lc <command>` for shell-backed telemetry, egress, and gatekeeper adapters. Set to `/bin/sh` on systems without Bash. |
 | `platform.telemetry_adapter` | `example` | Selects `example`, `bash_mock`, or `external`. |
-| `platform.command_adapter` | `safectl_unix_json` | The currently supported command ingress/egress adapter. |
+| `platform.command_adapter` | `safectl_unix_json` | Selects the command ingress adapter. |
+| `platform.egress_adapter` | `safectl_filesystem` | Selects `safectl_filesystem` or `external` platform egress. |
 | `platform.gatekeeper_adapter` | `disabled` | Selects `disabled` or `external`. Disabled automatically approves batches. |
 | `platform.bash_mock_telemetry_command` | none | Command used by `bash_mock`; the feature must be enabled at build time. |
 | `platform.external_telemetry_command` | none | Shell command whose stdout supplies telemetry JSONL. |
+| `platform.external_egress_command` | none | Shell command implementing the external egress JSONL protocol. |
+| `platform.external_egress_retry.initial_delay_ms` | `100` | Delay before the first external egress restart. |
+| `platform.external_egress_retry.max_delay_ms` | `30000` | Maximum exponential restart delay. |
+| `platform.external_egress_retry.stable_session_ms` | `30000` | Runtime after which a failed session resets the backoff to its initial delay. |
+| `platform.external_egress_retry.write_timeout_ms` | `5000` | Maximum time allowed for one JSONL write to the child before restarting it. |
 | `platform.external_gatekeeper_command` | none | Shell command implementing the external gatekeeper JSONL protocol. |
 | `gatekeeper` | `{}` | Arbitrary JSON passed to an external gatekeeper as an environment variable. |
 
-SAFE validates that `max_autonomy_modes`, `rotation.max_files`, and
-`rotation.max_file_size_mb` are greater than zero. It does not validate that
+SAFE validates that `max_autonomy_modes`, all persistence limits, log rotation
+limits, and external egress retry durations are greater than zero. The initial
+egress retry delay must not exceed its maximum. SAFE also validates that the
+configured log size can be represented in bytes. Each log stream retains at most
+`rotation.max_files * rotation.max_file_size_mb` MiB. This bound is per stream,
+not a global limit for the logging directory. It does not validate that
 configured adapter commands or executable paths exist until they are started.
 
 ## Environment Overrides
@@ -102,7 +133,10 @@ fields on `__`. For example:
 
 ```bash
 SAFE_PLATFORM__TELEMETRY_ADAPTER=external
+SAFE_PLATFORM__SHELL_EXECUTABLE=/bin/sh
 SAFE_PLATFORM__EXTERNAL_TELEMETRY_COMMAND='cat /var/run/telemetry.jsonl'
+SAFE_PLATFORM__EGRESS_ADAPTER=external
+SAFE_PLATFORM__EXTERNAL_EGRESS_COMMAND='/usr/local/bin/platform-egress'
 SAFE_BASE_PATHS__BASE_WRITABLE_DIRECTORY=/var/lib/safe
 ```
 
@@ -134,11 +168,12 @@ stdout line as a JSON payload. It assigns source `bash_mock` and uses a payload
 `ts_mono` field when present, otherwise a local sequence number. Build SAFE with
 the `platform-bash-mock` feature to enable this adapter.
 
-`external` executes the configured command through `bash -lc`. Each non-empty
+`external` executes the configured command through
+`platform.shell_executable -lc`. Each non-empty
 stdout line must be a JSON object with optional `source` and `ts_mono` fields and
 a `payload` field. Invalid lines are logged and skipped.
 
-## Command and Gatekeeper Adapters
+## Command, Egress, and Gatekeeper Adapters
 
 The default `safectl_unix_json` adapter listens at:
 
@@ -148,6 +183,69 @@ The default `safectl_unix_json` adapter listens at:
 
 It accepts newline-delimited JSON command or telemetry ingress messages. See
 [`safectl.md`](./safectl.md) for the wire shapes.
+
+The default `safectl_filesystem` egress writes host command status records to
+`state/host_command_status.jsonl` and approved scheduled commands to
+`out/commands.csv`.
+
+The `external` egress adapter executes `external_egress_command` through
+`platform.shell_executable -lc`. SAFE writes JSONL messages to the child's stdin and reads JSONL
+responses from stdout. SAFE restarts a failed, exited, or write-stalled child
+indefinitely using the configured capped exponential backoff. A session that
+runs for `stable_session_ms` resets the next delay to `initial_delay_ms`.
+The child receives either a status update:
+
+```json
+{"kind":"host_command_status","status":{"request_id":"request-1","state":"accepted","detail":"command accepted","ts_mono":42}}
+```
+
+or a complete board snapshot:
+
+```json
+{"kind":"board_snapshot","board":{"proposals":{},"rejected":{},"approved":{},"source_of_truth":[]}}
+```
+
+After delivering commands from a board snapshot, the child must return:
+
+```json
+{"kind":"board_published","command_ids":["42:00000000-0000-0000-0000-000000000001:0"]}
+```
+
+SAFE marks only the acknowledged command IDs as `Published`. A successful
+stdin write alone does not mark a command published.
+
+An external egress may request that SAFE remove commands from the board by
+writing this message to stdout:
+
+```json
+{"kind":"clear_board_commands","command_ids":["42:00000000-0000-0000-0000-000000000001:0"],"reason":"host schedule cleared"}
+```
+
+SAFE persists a cancellation event for each requested ID. These cancellations
+are attributed to the platform egress actor
+`ffffffff-ffff-ffff-ffff-ffffffffffff`; the gatekeeper remains the all-zero
+actor. This only clears SAFE's board and does not itself cancel commands that
+the host has already accepted.
+
+This repository includes an example compatible executable. Build it with:
+
+```bash
+cargo build -p safe --bin platform-egress-example
+```
+
+It reproduces the filesystem adapter's status JSONL and scheduled-command CSV
+outputs under its `--base-path` (default: `/tmp/safe`):
+
+```yaml
+platform:
+  egress_adapter: external
+  external_egress_command: "/path/to/platform-egress-example --base-path /tmp/safe"
+  external_egress_retry:
+    initial_delay_ms: 100
+    max_delay_ms: 30000
+    stable_session_ms: 30000
+    write_timeout_ms: 5000
+```
 
 The disabled gatekeeper consumes pending-batch requests and immediately emits
 approval. The external gatekeeper receives JSONL on stdin and must write JSONL
@@ -167,6 +265,35 @@ The child returns one of these for an evaluation request:
 {"kind":"approve","request_id":1,"details":"approved"}
 {"kind":"reject","request_id":1,"reason":"not safe"}
 ```
+
+The `safe_gatekeeperd` implementation can be selected as that external
+gatekeeper. It retains the latest telemetry frame and invokes a mission-specific
+one-shot process to convert that telemetry and each requested board batch into
+an EDS start epoch and patches. A complete configuration is:
+
+```yaml
+platform:
+  gatekeeper_adapter: external
+  external_gatekeeper_command: /opt/safe/bin/safe_gatekeeperd
+
+gatekeeper:
+  eds_path: /opt/safe/eds
+  sim_duration_days: 1.0
+  input_adapter_command:
+    - /opt/safe/bin/mission-input-adapter
+    - gatekeeper-input
+  input_adapter_config: {}
+  field_checks:
+    - target_file: agent.engine.jsonl
+      field: component.metric
+      aggregation: min
+      op: gte
+      threshold: 0.5
+```
+
+The input adapter receives one JSON request on stdin and returns one JSON
+response on stdout before exiting. See
+[`safe-gatekeeper/README.md`](../../safe-gatekeeper/README.md) for the contract.
 
 ## Mode Configuration
 

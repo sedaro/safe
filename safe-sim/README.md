@@ -191,12 +191,11 @@ deactivation and shutdown can still be processed.
 
 ## Execution Constraints
 
-Studies currently run sequentially because cases share an EDS workspace and
-output tree. Do not run concurrent studies against overlapping EDS output
-directories. Completed results retain all decoded frames in memory, so large
-studies may need to be split into smaller batches or have metrics extracted
-between batches.
+Each `SedaroSimulator` instance uses a separate random EDS results directory.
+Cloning a simulator creates another instance with a new results directory.
+Caller-supplied `--target-config` arguments are ignored.
+Completed results retain all decoded frames in memory, so large studies may need
+to be split into smaller batches or have metrics extracted between batches.
 
-By default, discovered `.jsonl` EDS output files are deleted after successful
-collection. Set `SAFE_DELETE_EDS_OUTPUT_FILES=false` to retain them for
-diagnosis.
+By default, the EDS results directory is deleted after collection. Set
+`SAFE_DELETE_EDS_RESULTS=false` to retain it for diagnosis.

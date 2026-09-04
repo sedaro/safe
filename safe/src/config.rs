@@ -17,6 +17,7 @@ pub struct Config {
     pub sockets: SocketsConfig,
     pub logging: LoggingConfig,
     pub limits: LimitsConfig,
+    pub persistence: PersistenceConfig,
     pub platform: PlatformConfig,
     pub base_paths: BasePathsConfig,
     #[serde(default = "default_gatekeeper_config")]
@@ -62,6 +63,39 @@ impl Config {
         if self.logging.rotation.max_file_size_mb == 0 {
             return Err("logging.rotation.max_file_size_mb must be > 0".into());
         }
+        if self
+            .logging
+            .rotation
+            .max_file_size_mb
+            .checked_mul(1024 * 1024)
+            .is_none()
+        {
+            return Err("logging.rotation.max_file_size_mb is too large".into());
+        }
+        if self.persistence.events_max_bytes == 0
+            || self.persistence.outputs_max_bytes == 0
+            || self.persistence.events_max_records == 0
+            || self.persistence.outputs_max_records == 0
+        {
+            return Err("persistence journal limits must be greater than zero".into());
+        }
+        let retry = &self.platform.external_egress_retry;
+        if retry.initial_delay_ms == 0
+            || retry.max_delay_ms == 0
+            || retry.stable_session_ms == 0
+            || retry.write_timeout_ms == 0
+        {
+            return Err("platform.external_egress_retry values must be greater than zero".into());
+        }
+        if retry.initial_delay_ms > retry.max_delay_ms {
+            return Err(
+                "platform.external_egress_retry.initial_delay_ms must not exceed max_delay_ms"
+                    .into(),
+            );
+        }
+        if self.platform.shell_executable.trim().is_empty() {
+            return Err("platform.shell_executable must not be empty".into());
+        }
         Ok(())
     }
 }
@@ -104,11 +138,23 @@ pub struct LimitsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PersistenceConfig {
+    pub events_max_bytes: u64,
+    pub events_max_records: usize,
+    pub outputs_max_bytes: u64,
+    pub outputs_max_records: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlatformConfig {
+    #[serde(default = "default_shell_executable")]
+    pub shell_executable: String,
     #[serde(default = "default_telemetry_adapter")]
     pub telemetry_adapter: String,
     #[serde(default = "default_command_adapter")]
     pub command_adapter: String,
+    #[serde(default = "default_egress_adapter")]
+    pub egress_adapter: String,
     #[serde(default = "default_gatekeeper_adapter")]
     pub gatekeeper_adapter: String,
     #[serde(default)]
@@ -116,15 +162,34 @@ pub struct PlatformConfig {
     #[serde(default)]
     pub external_telemetry_command: Option<String>,
     #[serde(default)]
+    pub external_egress_command: Option<String>,
+    pub external_egress_retry: ExternalEgressRetryConfig,
+    #[serde(default)]
     pub external_gatekeeper_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExternalEgressRetryConfig {
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub stable_session_ms: u64,
+    pub write_timeout_ms: u64,
 }
 
 fn default_telemetry_adapter() -> String {
     "example".to_string()
 }
 
+fn default_shell_executable() -> String {
+    "bash".to_string()
+}
+
 fn default_command_adapter() -> String {
     "safectl_unix_json".to_string()
+}
+
+fn default_egress_adapter() -> String {
+    "safectl_filesystem".to_string()
 }
 
 fn default_gatekeeper_adapter() -> String {
@@ -143,6 +208,7 @@ struct SerializedDefaults {
     sockets: SocketsConfigDefaults,
     logging: LoggingConfigDefaults,
     limits: LimitsConfigDefaults,
+    persistence: PersistenceConfigDefaults,
     platform: PlatformConfigDefaults,
     base_paths: BasePathsConfigDefaults,
     gatekeeper: serde_json::Value,
@@ -177,12 +243,27 @@ impl Default for SerializedDefaults {
             limits: LimitsConfigDefaults {
                 max_autonomy_modes: 10,
             },
+            persistence: PersistenceConfigDefaults {
+                events_max_bytes: 16 * 1024 * 1024,
+                events_max_records: 10_000,
+                outputs_max_bytes: 16 * 1024 * 1024,
+                outputs_max_records: 10_000,
+            },
             platform: PlatformConfigDefaults {
+                shell_executable: default_shell_executable(),
                 telemetry_adapter: default_telemetry_adapter(),
                 command_adapter: default_command_adapter(),
+                egress_adapter: default_egress_adapter(),
                 gatekeeper_adapter: default_gatekeeper_adapter(),
                 bash_mock_telemetry_command: None,
                 external_telemetry_command: None,
+                external_egress_command: None,
+                external_egress_retry: ExternalEgressRetryConfigDefaults {
+                    initial_delay_ms: 100,
+                    max_delay_ms: 30_000,
+                    stable_session_ms: 30_000,
+                    write_timeout_ms: 5_000,
+                },
                 external_gatekeeper_command: None,
             },
             base_paths: BasePathsConfigDefaults {
@@ -238,13 +319,33 @@ struct LimitsConfigDefaults {
 }
 
 #[derive(serde::Serialize)]
+struct PersistenceConfigDefaults {
+    events_max_bytes: u64,
+    events_max_records: usize,
+    outputs_max_bytes: u64,
+    outputs_max_records: usize,
+}
+
+#[derive(serde::Serialize)]
 struct PlatformConfigDefaults {
+    shell_executable: String,
     telemetry_adapter: String,
     command_adapter: String,
+    egress_adapter: String,
     gatekeeper_adapter: String,
     bash_mock_telemetry_command: Option<String>,
     external_telemetry_command: Option<String>,
+    external_egress_command: Option<String>,
+    external_egress_retry: ExternalEgressRetryConfigDefaults,
     external_gatekeeper_command: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ExternalEgressRetryConfigDefaults {
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    stable_session_ms: u64,
+    write_timeout_ms: u64,
 }
 
 #[cfg(test)]
@@ -278,5 +379,95 @@ mod tests {
 
         let cfg = Config::load().unwrap();
         assert_eq!(cfg.base_paths.base_writable_directory, "/tmp/a");
+    }
+
+    #[test]
+    fn rejects_log_size_that_overflows_bytes() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        config.logging.rotation.max_file_size_mb = u64::MAX;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn loads_external_egress_retry_defaults_and_yaml_overrides() {
+        let defaults: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            defaults.platform.external_egress_retry.initial_delay_ms,
+            100
+        );
+        assert_eq!(defaults.platform.external_egress_retry.max_delay_ms, 30_000);
+        assert_eq!(
+            defaults.platform.external_egress_retry.stable_session_ms,
+            30_000
+        );
+        assert_eq!(
+            defaults.platform.external_egress_retry.write_timeout_ms,
+            5_000
+        );
+
+        let overridden: Config =
+            Figment::from(Serialized::defaults(SerializedDefaults::default()))
+                .merge(Yaml::string(
+                    "platform:\n  external_egress_retry:\n    initial_delay_ms: 25\n    max_delay_ms: 400\n    stable_session_ms: 800\n    write_timeout_ms: 75\n",
+                ))
+                .extract()
+                .unwrap();
+        assert_eq!(
+            overridden.platform.external_egress_retry.initial_delay_ms,
+            25
+        );
+        assert_eq!(overridden.platform.external_egress_retry.max_delay_ms, 400);
+        assert_eq!(
+            overridden.platform.external_egress_retry.stable_session_ms,
+            800
+        );
+        assert_eq!(
+            overridden.platform.external_egress_retry.write_timeout_ms,
+            75
+        );
+    }
+
+    #[test]
+    fn validates_external_egress_retry_settings() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+
+        config.platform.external_egress_retry.write_timeout_ms = 0;
+        assert!(config.validate().is_err());
+
+        config.platform.external_egress_retry.write_timeout_ms = 1;
+        config.platform.external_egress_retry.initial_delay_ms = 2;
+        config.platform.external_egress_retry.max_delay_ms = 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn loads_shell_executable_default_and_yaml_override() {
+        let defaults: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        assert_eq!(defaults.platform.shell_executable, "bash");
+
+        let overridden: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .merge(Yaml::string("platform:\n  shell_executable: /bin/sh\n"))
+            .extract()
+            .unwrap();
+        assert_eq!(overridden.platform.shell_executable, "/bin/sh");
+    }
+
+    #[test]
+    fn rejects_empty_shell_executable() {
+        let mut config: Config = Figment::from(Serialized::defaults(SerializedDefaults::default()))
+            .extract()
+            .unwrap();
+        config.platform.shell_executable = "  ".into();
+
+        assert!(config.validate().is_err());
     }
 }

@@ -9,23 +9,29 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use simvm::sv::ser_de::{dyn_de, dyn_ser};
-use simvm::sv::{combine::TR, combine::TRD, parse::Parse};
 use tokio::{process::Command as TokioCommand, time::timeout};
 
+mod eds_data;
 pub mod study;
 
+pub use eds_data::{EdsFrame, EdsType, EdsValue};
 pub use study::{
     EdsPatchTarget, MonteCarloParameter, MonteCarloStudy, ProbabilityDistribution, StudyCase,
     StudyResult, StudyRunFailure, StudyRunOutcome, StudyRunResult, StudyTermination, TradeStudy,
 };
 pub use tokio_util::sync::CancellationToken;
 
-const SAFE_DELETE_EDS_OUTPUT_FILES_ENV: &str = "SAFE_DELETE_EDS_OUTPUT_FILES";
+fn random_target_config() -> String {
+    // A 128-bit OS-seeded value produces a portable directory name.
+    format!("{:032x}", rand::rng().random::<u128>())
+}
 
-fn should_delete_eds_output_files() -> bool {
-    std::env::var(SAFE_DELETE_EDS_OUTPUT_FILES_ENV)
+const SAFE_DELETE_EDS_RESULTS_ENV: &str = "SAFE_DELETE_EDS_RESULTS";
+
+fn should_delete_eds_results() -> bool {
+    std::env::var(SAFE_DELETE_EDS_RESULTS_ENV)
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "0" | "false" | "no" | "off")
@@ -39,7 +45,7 @@ pub struct SimulationResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
-    pub frames_by_file: HashMap<String, Vec<TRD>>,
+    pub frames_by_file: HashMap<String, Vec<EdsFrame>>,
 }
 
 impl SimulationResult {
@@ -87,20 +93,15 @@ impl SimulationResult {
             Ok(())
         }
 
-        let mut frames_by_file: HashMap<String, Vec<TRD>> = HashMap::new();
+        let mut frames_by_file: HashMap<String, Vec<EdsFrame>> = HashMap::new();
         let mut jsonl_paths = Vec::new();
         let mut seen = HashSet::new();
 
-        let mut candidate_dirs = vec![
+        let candidate_dirs = vec![
             target_dir.to_path_buf(),
             target_dir.join("local").join("output"),
             target_dir.join("output"),
         ];
-        if let Some(parent) = target_dir.parent() {
-            candidate_dirs.push(parent.join("local").join("output"));
-            candidate_dirs.push(parent.join("output"));
-        }
-
         for dir in candidate_dirs {
             collect_jsonl_paths_recursive(&dir, &mut jsonl_paths, &mut seen)?;
         }
@@ -139,25 +140,6 @@ impl SimulationResult {
             frames_by_file.len()
         );
 
-        // once frames have been read, delete the JSONL files to save disk space
-        if should_delete_eds_output_files() {
-            for path in &jsonl_paths {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!(
-                        "Failed to delete simulation output file '{}': {:?}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        } else {
-            tracing::debug!(
-                "Keeping {} simulation output .jsonl files in place ({}=false)",
-                jsonl_paths.len(),
-                SAFE_DELETE_EDS_OUTPUT_FILES_ENV
-            );
-        }
-
         Ok(Self {
             success: output.status.success(),
             exit_code: output.status.code(),
@@ -171,21 +153,60 @@ impl SimulationResult {
     pub fn total_frames(&self) -> usize {
         self.frames_by_file.values().map(|v| v.len()).sum()
     }
+
+    /// Returns numeric values for one field in a collected output file.
+    ///
+    /// Keeping dynamic EDS value decoding behind this API prevents callers
+    /// such as the gatekeeper from depending directly on the simulation VM's
+    /// internal data representation.
+    pub fn numeric_field_values(&self, target_file: &str, field: &str) -> Vec<f64> {
+        let frames = self.frames_by_file.get(target_file).or_else(|| {
+            self.frames_by_file
+                .iter()
+                .find(|(name, _)| name.ends_with(target_file))
+                .map(|(_, frames)| frames)
+        });
+
+        frames
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| frame.get_by_field(field).ok())
+            .filter_map(|datum| datum.data.as_f64().ok())
+            .collect()
+    }
 }
 
 /// Configures and launches simulations from an EDS workspace.
-#[derive(Debug, Serialize, Clone)]
+///
+/// Each instance owns a random target directory so concurrent simulations do not
+/// write results into one another's output.
+#[derive(Debug)]
 pub struct SedaroSimulator {
     path: std::path::PathBuf,
     args: Vec<String>,
+    target_config: String,
     timeout: Duration,
     venv: Option<std::path::PathBuf>,
-    init_type: Option<TR>,
+    init_type: Option<EdsType>,
     epoch: Option<f64>,
 }
 
+impl Clone for SedaroSimulator {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            args: self.args.clone(),
+            target_config: random_target_config(),
+            timeout: self.timeout,
+            venv: self.venv.clone(),
+            init_type: self.init_type.clone(),
+            epoch: self.epoch,
+        }
+    }
+}
+
 /// Describes one EDS initial-state patch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EdsPatch {
     /// The ID of the agent where the patched field exists
     pub agent_id: String,
@@ -237,6 +258,7 @@ impl SedaroSimulator {
         SedaroSimulator {
             path: path.clone(),
             args: Vec::new(),
+            target_config: random_target_config(),
             timeout: Duration::MAX,
             venv: None,
             init_type: None,
@@ -296,7 +318,28 @@ impl SedaroSimulator {
 
     /// Appends raw command-line arguments passed to EDS.
     pub fn args(mut self, args: Vec<&str>) -> Self {
-        self.args.extend(args.iter().map(|s| s.to_string()));
+        let mut args = args.into_iter().peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--target-config" {
+                if let Some(value) = args.next_if(|value| !value.starts_with('-')) {
+                    tracing::warn!(
+                        attempted_target_config = value,
+                        "Ignoring caller-supplied EDS target-config; SedaroSimulator manages it"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Ignoring caller-supplied EDS target-config without a value; SedaroSimulator manages it"
+                    );
+                }
+            } else if let Some(value) = arg.strip_prefix("--target-config=") {
+                tracing::warn!(
+                    attempted_target_config = value,
+                    "Ignoring caller-supplied EDS target-config; SedaroSimulator manages it"
+                );
+            } else {
+                self.args.push(arg.to_string());
+            }
+        }
         self
     }
 
@@ -331,6 +374,8 @@ impl SedaroSimulator {
             command_args.push("--start".to_string());
             command_args.push(epoch_mjd.to_string());
         }
+        command_args.push("--target-config".to_string());
+        command_args.push(self.target_config.clone());
 
         let mut cmd = TokioCommand::new(&executable_path);
         let cmd = cmd
@@ -388,15 +433,41 @@ impl SedaroSimulator {
         }
     }
 
-    /// Runs EDS and collects its decoded target files into a simulation result.
+    /// Runs EDS, collects only this instance's target files, and removes that directory.
     pub async fn run_collect(&self, duration_days: f64) -> Result<SimulationResult> {
         let workspace_dir = self.workspace_dir()?;
-        let output = self.run(duration_days).await?;
-        SimulationResult::from_target_dir(&output, &workspace_dir)
+        let target_dir = workspace_dir.join(&self.target_config);
+        let output = match self.run(duration_days).await {
+            Ok(output) => output,
+            Err(error) => {
+                if should_delete_eds_results() {
+                    let _ = std::fs::remove_dir_all(&target_dir);
+                }
+                return Err(error);
+            }
+        };
+        let result = SimulationResult::from_target_dir(&output, &target_dir);
+        if should_delete_eds_results() {
+            if let Err(error) = std::fs::remove_dir_all(&target_dir) {
+                if target_dir.exists() {
+                    tracing::warn!(
+                        target_dir = %target_dir.display(),
+                        %error,
+                        "Failed to remove EDS results directory"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                target_dir = %target_dir.display(),
+                "Keeping EDS results directory (SAFE_DELETE_EDS_RESULTS=false)"
+            );
+        }
+        result
     }
 
     /// Reads the serialized type definition for an agent's initial state.
-    pub fn read_init_type(&self, agent_id: &str) -> Result<TR> {
+    pub fn read_init_type(&self, agent_id: &str) -> Result<EdsType> {
         let workspace_dir = self.workspace_dir()?;
         match &self.init_type {
             Some(ty) => Ok(ty.clone()),
@@ -404,34 +475,34 @@ impl SedaroSimulator {
                 let type_sig =
                     std::fs::read(workspace_dir.join(format!("data/init_ty_{agent_id}.json")))?;
                 let type_sig_str = std::str::from_utf8(&type_sig)?;
-                let parsed_ty = TR::parse(type_sig_str).unwrap();
+                let parsed_ty = EdsType::parse(type_sig_str).with_context(|| {
+                    format!("failed to parse initial-state type for agent '{agent_id}'")
+                })?;
                 Ok(parsed_ty)
             }
         }
     }
 
     /// Reads and decodes an agent's initial-state value.
-    pub fn read_init_trd(&self, agent_id: &str) -> Result<TRD> {
+    pub fn read_init_trd(&self, agent_id: &str) -> Result<EdsFrame> {
         let init_type = self.read_init_type(agent_id)?;
         let workspace_dir = self.workspace_dir()?;
         let init_file_path = workspace_dir
             .join(format!("data/init_{agent_id}.bin"))
             .canonicalize()?;
         let init_bytes = std::fs::read(&init_file_path)?;
-        let init_val = dyn_de(&init_type.typ, &init_bytes).unwrap();
-        let init_val = TRD::from((init_type.clone(), init_val));
-        Ok(init_val)
+        let init_val = eds_data::decode(&init_type, &init_bytes)?;
+        Ok(EdsFrame::new(init_type, init_val))
     }
 
     /// Encodes and writes an agent's initial-state value.
-    pub fn write_init_trd(&self, agent_id: &str, init_val: TRD) -> Result<()> {
+    pub fn write_init_trd(&self, agent_id: &str, init_val: EdsFrame) -> Result<()> {
         let init_type = self.read_init_type(agent_id)?;
         let workspace_dir = self.workspace_dir()?;
         let init_file_path = workspace_dir
             .join(format!("data/init_{agent_id}.bin"))
             .canonicalize()?;
-        let init_val = init_val.data;
-        let bytes = dyn_ser(&init_type.typ, &init_val).unwrap();
+        let bytes = eds_data::encode(&init_type, &init_val.data)?;
         std::fs::write(&init_file_path, bytes)?;
         Ok(())
     }
@@ -468,9 +539,9 @@ pub struct FileTargetConfigEntry {
 #[derive(Debug)]
 pub struct FileTargetReader {
     reader: BufReader<File>,
-    ty: Option<TR>,
+    ty: Option<EdsType>,
     timestamps_mjd: Vec<f64>,
-    frames: Vec<TRD>,
+    frames: Vec<EdsFrame>,
     line_idx: u64,
 }
 
@@ -506,8 +577,8 @@ impl FileTargetReader {
             }
             if self.ty.is_none() {
                 if let Ok(config) = serde_json::from_str::<FileTargetConfigEntry>(&line) {
-                    self.ty = Some(TR::parse(&config.data.type_).map_err(|error| {
-                        anyhow::anyhow!("invalid target type '{}': {error:?}", config.data.type_)
+                    self.ty = Some(EdsType::parse(&config.data.type_).map_err(|error| {
+                        anyhow::anyhow!("invalid target type '{}': {error:#}", config.data.type_)
                     })?);
                 }
             } else if let Ok(entry) = serde_json::from_str::<FileTargetFrameEntry>(&line) {
@@ -515,10 +586,10 @@ impl FileTargetReader {
                     let frame_bytes = BASE64_STANDARD
                         .decode(&entry.data.frame)
                         .context("invalid base64 target frame")?;
-                    match dyn_de(&parsed.typ, &frame_bytes) {
+                    match eds_data::decode(parsed, &frame_bytes) {
                         Ok(val) => {
                             self.timestamps_mjd.push(entry.data.time);
-                            self.frames.push(TRD::from((parsed.clone(), val))); // TODO: More memory efficient approach?
+                            self.frames.push(EdsFrame::new(parsed.clone(), val));
                         }
                         Err(e) => {
                             return Err(anyhow::anyhow!(
@@ -535,7 +606,7 @@ impl FileTargetReader {
     }
 
     /// Returns frames added since the previous call.
-    pub fn read_frames(&mut self) -> Result<Vec<TRD>> {
+    pub fn read_frames(&mut self) -> Result<Vec<EdsFrame>> {
         self.parse_frames()?;
         let frames = std::mem::take(&mut self.frames);
         Ok(frames)
@@ -553,7 +624,7 @@ impl FileTargetReader {
         }
     }
     /// Returns the first frame at or after a modified Julian timestamp.
-    pub fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<TRD>> {
+    pub fn read_frame_at_timestamp(&mut self, timestamp_mjd: f64) -> Result<Option<EdsFrame>> {
         self.parse_frames()?;
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             if timestamp_mjd < *start_time_mjd
@@ -569,7 +640,7 @@ impl FileTargetReader {
         ))
     }
     /// Returns the frame at an elapsed duration from the first target frame.
-    pub fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<TRD>> {
+    pub fn read_frame_at_elapsed(&mut self, duration: Duration) -> Result<Option<EdsFrame>> {
         self.parse_frames()?; // TODO: Figure out how to avoid this redundant parse
         if let Some(start_time_mjd) = self.timestamps_mjd.first() {
             let timestamp_mjd = start_time_mjd + (duration.as_secs_f64() / 86400.0);
@@ -585,12 +656,51 @@ impl FileTargetReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::FileTargetFrameEntry;
+    use std::io::Write;
+
+    use base64::{Engine, prelude::BASE64_STANDARD};
+
+    use crate::{EdsValue, FileTargetFrameEntry, FileTargetReader};
 
     #[test]
     fn test_deser() {
         let d = "{\"data\": {\"frame\": \"Ojh7A1M4aD4OXAPUmHGxPzo4ewNTOGg+AAAAAAAAAAAAAAAAAAAAAN2GE2yw0FW+c/MadAWsor8AAAAAAAAAgN2GE2yw0FW+AAAAAAAAAIB8vJBmDtUhPn7HaQ7qt82/AAAAAAAAAAAAAAAAAAAAAHy8kGYO1SE+3Lw5s5ZdBL/cvDmzll0kvwAAAAAAAACAabUM7FgVDT7TqOkwv53NvW4PIvlgaBk/bg8i+WBoOT8Axu8aVyQiPgAAAAAAAACAQcL3XHUbEz6Rzddv4er7vpHN12/h6hu/x1lA25hMxD1Ai/nbov70PQAAAAAAAACA8txmVC+buT9BxX77W7cGP97akH4unvW+lgtyagiIUj+ArD0EKvvaPjcLtcZPCfU+pMJSGAH1lr+uLUHo8P3vvwAAAAAAAAAA6hI11QCsxr6vzrMhXAunP3jdFcCy9+8/Aay8s7GXEOi+bZE+n4REtz7VtWt1W9n2Phqyp5WcgbrALqeCeHklg8A5IgZhP9aiv4NPCayU6uU/w9rONlWzHsCUIuwDMq82P43qZTMDTO1AcuUByTpXHj8=\", \"time\": 60000.100024183375, \"time_step\": 0.00011574074074074072}, \"event\": \"enqueue\", \"stream_id\": \"PTnSrPdY4f8c2XSBcZX9LH.gnc\"}";
         let entry: FileTargetFrameEntry = serde_json::from_str(d).unwrap();
         assert_eq!(entry.data.time, 60000.100024183375);
+    }
+
+    #[test]
+    fn reads_named_fields_from_target_jsonl() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"data":{{"config":"","stream_id":"agent.gnc","type":"(time: f64, visible: bool)"}},"event":"config","stream_id":"agent.gnc"}}"#
+        )
+        .unwrap();
+        let mut bytes = 60_000.25f64.to_le_bytes().to_vec();
+        bytes.push(1);
+        writeln!(
+            file,
+            r#"{{"data":{{"frame":"{}","time":60000.25,"time_step":0.1}},"event":"enqueue","stream_id":"agent.gnc"}}"#,
+            BASE64_STANDARD.encode(bytes)
+        )
+        .unwrap();
+
+        let mut reader = FileTargetReader::try_from_path(&file.path().to_path_buf()).unwrap();
+        let frames = reader.read_frames().unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].get_by_field("time").unwrap().data,
+            EdsValue::F64(60_000.25)
+        );
+        assert!(
+            frames[0]
+                .get_by_field("visible")
+                .unwrap()
+                .data
+                .as_bool()
+                .unwrap()
+        );
     }
 }
