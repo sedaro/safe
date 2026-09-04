@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use reqwest::header::CONTENT_TYPE;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
 use safe::protocol::{AutonomyModeBoardState, Command, CommandEnvelope, TimedCommand};
 use safe::telemetry_frame::TelemetryFrame;
@@ -13,6 +12,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::http_client;
 use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 #[derive(Debug, Clone, Serialize)]
@@ -354,10 +354,6 @@ impl AnomalyRecoveryMode {
 
     async fn query_ollama(&self, prompt: &str) -> Result<String> {
         let body = self.build_ollama_request_body(prompt)?;
-        let url = format!(
-            "http://{}:{}{}",
-            self.config.ollama_host, self.config.ollama_port, self.config.ollama_path
-        );
         let request_start = Instant::now();
 
         info!(
@@ -371,26 +367,22 @@ impl AnomalyRecoveryMode {
         );
 
         let request_future = async {
-            let response = reqwest::Client::new()
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| anyhow!("ollama HTTP request failed: {e}"))?;
-            let status = response.status();
-            let body_text = response
-                .text()
-                .await
-                .map_err(|e| anyhow!("failed reading ollama response body: {e}"))?;
-            if !status.is_success() {
+            let response = http_client::post_json(
+                &self.config.ollama_host,
+                self.config.ollama_port,
+                &self.config.ollama_path,
+                &body,
+            )
+            .await
+            .map_err(|e| anyhow!("ollama HTTP request failed: {e}"))?;
+            if !(200..300).contains(&response.status) {
                 return Err(anyhow!(
                     "ollama returned HTTP status {}: {}",
-                    status,
-                    clip_chars(&body_text, 400)
+                    response.status,
+                    clip_chars(&response.body, 400)
                 ));
             }
-            Result::<String>::Ok(body_text)
+            Result::<String>::Ok(response.body)
         };
 
         let body_text = match timeout(
