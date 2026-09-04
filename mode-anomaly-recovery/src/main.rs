@@ -1,4 +1,5 @@
 mod config;
+mod http_client;
 mod runtime;
 mod types;
 
