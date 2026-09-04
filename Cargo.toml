@@ -2,11 +2,12 @@
 members = [
     "safe",
     "safe-time",
+    "safe-sim",
+    "safe-gatekeeper",
     "safectl",
     "mode-anomaly-recovery",
 ]
-excludes = [
-    "safe-sim",
+exclude = [
     "mode-coorbital-evasion",
 ]
 resolver = "2"
@@ -26,5 +27,6 @@ inherits = "release"
 opt-level = "z"
 debug = false
 strip = true
+lto = "fat"
 panic = "abort"
 codegen-units = 1

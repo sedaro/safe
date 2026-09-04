@@ -4,7 +4,7 @@ use safe::protocol::AutonomyModeBoardState;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::{AllowedAction, AnomalySeverity, AnomalyRecoveryModeConfig};
+use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, AnomalySeverity};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TelemetrySample {

@@ -9,9 +9,12 @@ use super::*;
 use crate::definitions::{Activation, Expr, Value, Variable};
 use crate::flight::{AutonomyModeActivation, Flight};
 use crate::safetea::{AutonomyModeRuntimeConfig, Event};
-use crate::safetea::{Effect, Msg, Source, apply_event, update};
+use crate::safetea::{
+    Effect, Msg, OutputJournalRecord, Source, apply_event, journal_exceeds_limits,
+    journal_record_count, rebuild_board_from_outputs, update,
+};
 use crate::telemetry_frame::TelemetryFrame;
-use crate::utils::{append_jsonl, load_or_default_json, save_json_atomic};
+use crate::utils::{append_jsonl, append_jsonl_bounded, load_or_default_json, save_json_atomic};
 use std::path::Path;
 
 fn mk_mode_id(n: u128) -> AutonomyModeId {
@@ -44,6 +47,58 @@ fn telemetry_with_flag(flag: bool) -> TelemetryFrame {
             "bitfield": [u8::from(flag)]
         }),
     }
+}
+
+#[tokio::test]
+async fn oversized_event_is_rejected_before_the_journal_is_written() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let events_path = tempdir.path().join("events.jsonl");
+    let max_bytes = 1024;
+    let event = Event {
+        seq: 1,
+        ts_mono: 1,
+        source: Source::Telemetry,
+        msg: Msg::TelemetryReceived(TelemetryFrame {
+            source: Some("test".to_string()),
+            ts_mono: 1,
+            payload: serde_json::json!({ "data": "x".repeat(max_bytes * 2) }),
+        }),
+    };
+
+    let error = append_jsonl_bounded(&events_path, &event, max_bytes as u64)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("exceeding"),
+        "unexpected error: {error}"
+    );
+    assert!(!events_path.exists());
+}
+
+#[tokio::test]
+async fn bounded_event_append_replaces_checkpointed_history_before_overflow() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let events_path = tempdir.path().join("events.jsonl");
+    let max_bytes = 512;
+    let first = serde_json::json!({ "event": 1, "data": "a".repeat(300) });
+    let second = serde_json::json!({ "event": 2, "data": "b".repeat(300) });
+
+    assert!(
+        !append_jsonl_bounded(&events_path, &first, max_bytes)
+            .await
+            .unwrap()
+    );
+    assert!(
+        append_jsonl_bounded(&events_path, &second, max_bytes)
+            .await
+            .unwrap()
+    );
+
+    let contents = fs::read_to_string(&events_path).await.unwrap();
+    assert!(contents.len() <= max_bytes as usize);
+    assert!(!contents.contains("\"event\":1"));
+    assert!(contents.contains("\"event\":2"));
 }
 
 fn mode_meta(id: u128, priority: u8, enabled: bool) -> AutonomyModeMeta {
@@ -370,6 +425,62 @@ async fn recovery_replays_unapplied_events_only() {
     }
 
     assert_eq!(flight.get_seq(), 2);
+}
+
+#[tokio::test]
+async fn output_journal_snapshot_replays_later_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output_path = tmp.path().join("outputs.jsonl");
+    let id = BoardCmdId("1:00000000-0000-0000-0000-000000000001:0".to_string());
+    let mut snapshot = BoardState::default();
+    snapshot.apply(&BoardEvent::Proposed {
+        id: id.clone(),
+        from: mk_mode_id(1),
+        cmd: TimedCommand::Now(Command::PointNadir),
+        ts_mono: 1,
+    });
+    append_jsonl(
+        &output_path,
+        &OutputJournalRecord::Snapshot { board: snapshot },
+    )
+    .await
+    .unwrap();
+    append_jsonl(
+        &output_path,
+        &OutputJournalRecord::Effect {
+            effect: Effect::Board(BoardEvent::Approved {
+                id: id.clone(),
+                by: mk_mode_id(2),
+                reason: "approved".to_string(),
+                ts_mono: 2,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let runtime_paths = RuntimePaths {
+        outputs: output_path,
+        ..RuntimePaths::default()
+    };
+    let board = rebuild_board_from_outputs(&runtime_paths).await.unwrap();
+
+    assert!(board.proposals.contains_key(&id));
+    assert_eq!(board.source_of_truth, vec![id]);
+}
+
+#[tokio::test]
+async fn journal_limits_trigger_on_bytes_or_record_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("events.jsonl");
+    append_jsonl(&path, &serde_json::json!({"event": 1}))
+        .await
+        .unwrap();
+
+    assert_eq!(journal_record_count(&path).await.unwrap(), 1);
+    assert!(journal_exceeds_limits(&path, 1, 1, 10).await.unwrap());
+    assert!(journal_exceeds_limits(&path, 1, u64::MAX, 1).await.unwrap());
+    assert!(!journal_exceeds_limits(&path, 1, u64::MAX, 2).await.unwrap());
 }
 
 #[test]

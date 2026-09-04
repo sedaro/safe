@@ -39,6 +39,7 @@ pub fn spawn_telemetry_ingress(
                         .bash_mock_telemetry_command
                         .clone()
                         .unwrap_or_else(|| "scripts/mock_telemetry.sh".to_string()),
+                    cfg.platform.shell_executable.clone(),
                     telemetry_tx,
                 ));
             }
@@ -59,7 +60,11 @@ pub fn spawn_telemetry_ingress(
                         "telemetry adapter external selected, but platform.external_telemetry_command is not configured"
                     )
                 })?;
-            tokio::spawn(external::external_telemetry_reader(command, telemetry_tx));
+            tokio::spawn(external::external_telemetry_reader(
+                command,
+                cfg.platform.shell_executable.clone(),
+                telemetry_tx,
+            ));
         }
     }
 
@@ -77,11 +82,12 @@ mod external {
 
     pub async fn external_telemetry_reader(
         command: String,
+        shell_executable: String,
         tx: mpsc::Sender<TelemetryFrame>,
     ) -> anyhow::Result<()> {
         info!(%command, "platform telemetry adapter `external` started");
 
-        let mut child = Command::new("bash")
+        let mut child = Command::new(shell_executable)
             .arg("-lc")
             .arg(command)
             .stdout(std::process::Stdio::piped())
@@ -170,11 +176,12 @@ mod bash_mock {
 
     pub async fn bash_mock_telemetry_reader(
         command: String,
+        shell_executable: String,
         tx: mpsc::Sender<TelemetryFrame>,
     ) -> anyhow::Result<()> {
         info!(%command, "platform telemetry adapter `bash_mock` started");
 
-        let mut child = Command::new("bash")
+        let mut child = Command::new(shell_executable)
             .arg("-lc")
             .arg(command)
             .stdout(std::process::Stdio::piped())
