@@ -1,0 +1,51 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "title": "Total Memory",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "sum by (sandbox_id) (sandbox_memory_usage_B)", "legendFormat": "{{sandbox_id}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "color": {"mode": "palette-classic"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "title": "Average Memory",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "avg(sandbox_memory_usage_B)", "legendFormat": "Average", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 0}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"}
+    },
+    {
+      "title": "CPU Utilization",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"expr": "sum by (sandbox_id) (sandbox_cpu_utilization_percent)", "legendFormat": "{{sandbox_id}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "title": "Memory by Process",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "sandbox_memory_usage_B", "legendFormat": "{{proc_cmd}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["safe", "flight", "otel"],
+  "templating": {"list": []},
+  "time": {"from": "now-30d", "to": "now"},
+  "timezone": "browser",
+  "title": "SAFE Flight Metrics",
+  "uid": "safe-flight-metrics",
+  "version": 1
+}
