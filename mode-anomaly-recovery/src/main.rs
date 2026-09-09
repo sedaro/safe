@@ -1,5 +1,6 @@
 mod config;
 mod http_client;
+mod planner;
 mod runtime;
 mod types;
 
