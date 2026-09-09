@@ -22,6 +22,7 @@ use crate::types::{AnomalyCandidate, TelemetrySample};
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
+const SELECT_INSTRUCTION: &str = "The required simulation is complete. Reply with exactly one native select_recovery_action tool call using the simulation result and listed candidate values. Do not return prose or JSON in message content.";
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -50,6 +51,8 @@ struct ChatMessage {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
 }
 #[derive(Serialize)]
 struct ChatOptions {
@@ -110,6 +113,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         role: "user".into(),
         content: prompt(&request, &scenarios)?,
         tool_calls: None,
+        tool_name: None,
     }];
     let mut runs = 0u8;
     let mut used_scenarios = Vec::new();
@@ -120,11 +124,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         if started.elapsed() >= planning_limit {
             bail!("planning time budget exhausted");
         }
-        let mut all_tools = tools();
         let phase_tools = if scenarios.is_empty() || runs > 0 {
-            vec![all_tools.remove(1)]
+            vec![select_tool(&request.candidates)]
         } else {
-            vec![all_tools.remove(0)]
+            vec![simulation_tool(&scenarios)]
         };
         let response = tokio::select! {
             _ = request.cancel.cancelled() => return Ok(()),
@@ -151,6 +154,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 role: "user".into(),
                 content: "Your prior response was rejected because it did not contain exactly one native tool call. Reply now with exactly one call to the only available tool and no prose.".into(),
                 tool_calls: None,
+                tool_name: None,
             });
             continue;
         }
@@ -195,6 +199,13 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     role: "tool".into(),
                     content: bounded_json(&tool_result)?,
                     tool_calls: None,
+                    tool_name: Some("run_eds_simulation".into()),
+                });
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: SELECT_INSTRUCTION.into(),
+                    tool_calls: None,
+                    tool_name: None,
                 });
             }
             "select_recovery_action" => {
@@ -268,7 +279,7 @@ fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Resul
     let next_step = if scenarios.is_empty() {
         "Your next response MUST contain exactly one native select_recovery_action tool call. Do not return prose or JSON in message content."
     } else {
-        "Your next response MUST contain exactly one native run_eds_simulation tool call for an applicable scenario. Do not return prose or JSON in message content."
+        "Start by returning exactly one native run_eds_simulation tool call for an applicable scenario. Do not return prose or JSON in message content."
     };
     let text = format!(
         "You are a constrained SAFE recovery advisor. {next_step} Use only provided native tools. Never invent IDs. A final action must select a listed candidate/action and exact evidence path. Context: {}",
@@ -280,11 +291,42 @@ fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Resul
     Ok(text)
 }
 
-fn tools() -> Vec<Value> {
-    vec![
-        json!({"type":"function","function":{"name":"run_eds_simulation","description":"Run an allow-listed local EDS scenario","parameters":{"type":"object","additionalProperties":false,"required":["scenario_id"],"properties":{"scenario_id":{"type":"string"},"parameters":{"type":"object","additionalProperties":{"type":"number"}}}}}}),
-        json!({"type":"function","function":{"name":"select_recovery_action","description":"Select one validated SAFE action","parameters":{"type":"object","additionalProperties":false,"required":["anomaly_id","action_id","reason","evidence_paths"],"properties":{"anomaly_id":{"type":"string"},"action_id":{"type":"string"},"reason":{"type":"string"},"evidence_paths":{"type":"array","items":{"type":"string"}}}}}}),
-    ]
+fn simulation_tool(scenarios: &[&SimulationScenario]) -> Value {
+    let scenario_ids = scenarios
+        .iter()
+        .map(|scenario| &scenario.id)
+        .collect::<Vec<_>>();
+    let mut parameter_properties = serde_json::Map::new();
+    for parameter in scenarios.iter().flat_map(|scenario| &scenario.parameters) {
+        parameter_properties.entry(parameter.id.clone()).or_insert_with(|| {
+            json!({
+                "type": "number",
+                "description": format!("Optional value from {} through {}", parameter.min, parameter.max)
+            })
+        });
+    }
+    json!({"type":"function","function":{"name":"run_eds_simulation","description":"Run one applicable allow-listed local EDS scenario","parameters":{"type":"object","required":["scenario_id"],"properties":{"scenario_id":{"type":"string","description":"Exact ID of the scenario to run","enum":scenario_ids},"parameters":{"type":"object","description":"Optional named numeric scenario parameters within their described bounds","properties":parameter_properties}}}}})
+}
+
+fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
+    let mut anomaly_ids = Vec::new();
+    let mut action_ids = Vec::new();
+    let mut evidence_paths = Vec::new();
+    for candidate in candidates {
+        if !anomaly_ids.contains(&candidate.anomaly_id.as_str()) {
+            anomaly_ids.push(candidate.anomaly_id.as_str());
+        }
+        if !evidence_paths.contains(&candidate.path.as_str()) {
+            evidence_paths.push(candidate.path.as_str());
+        }
+        for action in &candidate.eligible_actions {
+            let action = action.as_str();
+            if !action_ids.contains(&action) {
+                action_ids.push(action);
+            }
+        }
+    }
+    json!({"type":"function","function":{"name":"select_recovery_action","description":"Select one validated SAFE action for one listed anomaly","parameters":{"type":"object","required":["anomaly_id","action_id","reason","evidence_paths"],"properties":{"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"},"evidence_paths":{"type":"array","description":"The selected candidate's exact evidence path as a one-item array","items":{"type":"string","enum":evidence_paths}}}}}})
 }
 
 async fn chat(
@@ -514,6 +556,21 @@ mod tests {
         }
     }
 
+    fn candidate() -> AnomalyCandidate {
+        AnomalyCandidate {
+            profile_id: "profile".into(),
+            rule_id: "r".into(),
+            anomaly_id: "profile-r".into(),
+            source: "test".into(),
+            ts_mono: 1,
+            path: "telemetry.temperature".into(),
+            observed: json!(42.0),
+            expectation: "at most 30".into(),
+            severity: crate::config::AnomalySeverity::High,
+            eligible_actions: vec![AllowedAction::PointNadir],
+        }
+    }
+
     #[test]
     fn trusted_patches_use_only_config_and_frozen_telemetry() {
         let patches = build_patches(
@@ -544,13 +601,52 @@ mod tests {
     }
 
     #[test]
-    fn tool_schemas_are_closed_and_named() {
-        let tools = tools();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["function"]["name"], "run_eds_simulation");
+    fn tool_schemas_use_named_properties_and_allowed_values() {
+        let scenario = scenario();
+        let simulation = simulation_tool(&[&scenario]);
+        assert_eq!(simulation["function"]["name"], "run_eds_simulation");
         assert_eq!(
-            tools[0]["function"]["parameters"]["additionalProperties"],
-            false
+            simulation["function"]["parameters"]["properties"]["scenario_id"]["enum"][0],
+            "thermal"
         );
+        assert_eq!(
+            simulation["function"]["parameters"]["properties"]["parameters"]["properties"]["gain"]
+                ["type"],
+            "number"
+        );
+        assert!(
+            simulation["function"]["parameters"]
+                .get("additionalProperties")
+                .is_none()
+        );
+
+        let selection = select_tool(&[candidate()]);
+        assert_eq!(
+            selection["function"]["parameters"]["properties"]["anomaly_id"]["enum"][0],
+            "profile-r"
+        );
+        assert_eq!(
+            selection["function"]["parameters"]["properties"]["action_id"]["enum"][0],
+            "point_nadir"
+        );
+    }
+
+    #[test]
+    fn tool_result_names_the_executed_tool() {
+        let message = ChatMessage {
+            role: "tool".into(),
+            content: "{}".into(),
+            tool_calls: None,
+            tool_name: Some("run_eds_simulation".into()),
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(value["tool_name"], "run_eds_simulation");
+        assert!(value.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn selection_phase_instruction_supersedes_simulation_step() {
+        assert!(SELECT_INSTRUCTION.contains("select_recovery_action"));
+        assert!(!SELECT_INSTRUCTION.contains("run_eds_simulation"));
     }
 }
