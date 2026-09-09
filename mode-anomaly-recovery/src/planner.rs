@@ -91,6 +91,8 @@ struct SelectArguments {
     anomaly_id: String,
     action_id: String,
     reason: String,
+    #[serde(default)]
+    evidence_paths: Option<Vec<String>>,
 }
 #[derive(Serialize)]
 struct ToolResult {
@@ -355,6 +357,14 @@ async fn chat(
             num_predict: config.num_predict,
         },
     })?;
+    if config.decision_trace {
+        info!(
+            decision_trace = true,
+            stage = "ollama_request_body",
+            request_body = %body,
+            "anomaly recovery serialized Ollama chat request"
+        );
+    }
     info!(
         decision_trace = config.decision_trace,
         stage = "ollama_request",
@@ -513,6 +523,13 @@ fn evaluate<'a>(
         .iter()
         .find(|c| c.anomaly_id == args.anomaly_id || c.rule_id == args.anomaly_id)
         .ok_or_else(|| anyhow!("final anomaly is not a frozen candidate"))?;
+    if args
+        .evidence_paths
+        .as_ref()
+        .is_some_and(|paths| paths.as_slice() != [candidate.path.as_str()])
+    {
+        bail!("final evidence path is not exactly candidate evidence");
+    }
     let action = candidate
         .eligible_actions
         .iter()
