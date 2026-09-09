@@ -22,7 +22,6 @@ use crate::types::{AnomalyCandidate, TelemetrySample};
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
-const SELECT_INSTRUCTION: &str = "The required simulation is complete. Use select_recovery_action to choose the best eligible action for one supplied anomaly candidate based on the simulation result.";
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -51,8 +50,6 @@ struct ChatMessage {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_name: Option<String>,
 }
 #[derive(Serialize)]
 struct ChatOptions {
@@ -118,7 +115,6 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         role: "user".into(),
         content: prompt(&request, &scenarios)?,
         tool_calls: None,
-        tool_name: None,
     }];
     let mut runs = 0u8;
     let mut used_scenarios = Vec::new();
@@ -171,7 +167,6 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 role: "user".into(),
                 content: "Use the only available tool now to complete the requested task with the supplied values.".into(),
                 tool_calls: None,
-                tool_name: None,
             });
             continue;
         }
@@ -211,19 +206,8 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 };
                 used_scenarios.push(scenario);
                 info!(decision_trace = request.config.decision_trace, stage = "simulation_result", turn, runs, elapsed_ms = started_run.elapsed().as_millis() as u64, scenario = %scenario.id, status = tool_result.status, "anomaly recovery simulation tool completed");
-                messages.push(response.message);
-                messages.push(ChatMessage {
-                    role: "tool".into(),
-                    content: bounded_json(&tool_result)?,
-                    tool_calls: None,
-                    tool_name: Some("run_eds_simulation".into()),
-                });
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: SELECT_INSTRUCTION.into(),
-                    tool_calls: None,
-                    tool_name: None,
-                });
+                messages =
+                    fresh_selection_messages(selection_prompt(&request, &scenarios, &tool_result)?);
             }
             "select_recovery_action" => {
                 if !scenarios.is_empty() && runs == 0 {
@@ -292,7 +276,6 @@ fn applicable_scenarios<'a>(
 }
 
 fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Result<String> {
-    let value = json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| &m.id).collect::<Vec<_>>() })).collect::<Vec<_>>()});
     let next_step = if scenarios.is_empty() {
         "Choose the best eligible recovery action for one supplied anomaly candidate by using select_recovery_action."
     } else {
@@ -300,8 +283,37 @@ fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Resul
     };
     let text = format!(
         "You are a constrained SAFE recovery advisor. {next_step} Use only the provided tool and supplied values. Never invent IDs. Context: {}",
-        serde_json::to_string(&value)?
+        serde_json::to_string(&planning_context(request, scenarios))?
     );
+    bounded_prompt(request, text)
+}
+
+fn selection_prompt(
+    request: &PlanningRequest,
+    scenarios: &[&SimulationScenario],
+    result: &ToolResult,
+) -> Result<String> {
+    let text = format!(
+        "You are a constrained SAFE recovery advisor. Use select_recovery_action to choose the best eligible action for one supplied anomaly candidate based on the simulation result. Use only the provided tool and supplied values. Never invent IDs. Simulation result: {} Context: {}",
+        bounded_json(result)?,
+        serde_json::to_string(&planning_context(request, scenarios))?
+    );
+    bounded_prompt(request, text)
+}
+
+fn fresh_selection_messages(content: String) -> Vec<ChatMessage> {
+    vec![ChatMessage {
+        role: "user".into(),
+        content,
+        tool_calls: None,
+    }]
+}
+
+fn planning_context(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Value {
+    json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| &m.id).collect::<Vec<_>>() })).collect::<Vec<_>>()})
+}
+
+fn bounded_prompt(request: &PlanningRequest, text: String) -> Result<String> {
     if text.chars().count() > request.config.max_prompt_chars {
         bail!("tool prompt exceeds max_prompt_chars");
     }
@@ -666,21 +678,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_names_the_executed_tool() {
-        let message = ChatMessage {
-            role: "tool".into(),
-            content: "{}".into(),
-            tool_calls: None,
-            tool_name: Some("run_eds_simulation".into()),
-        };
-        let value = serde_json::to_value(message).unwrap();
-        assert_eq!(value["tool_name"], "run_eds_simulation");
-        assert!(value.get("tool_calls").is_none());
-    }
-
-    #[test]
-    fn selection_phase_instruction_supersedes_simulation_step() {
-        assert!(SELECT_INSTRUCTION.contains("select_recovery_action"));
-        assert!(!SELECT_INSTRUCTION.contains("run_eds_simulation"));
+    fn selection_phase_starts_with_fresh_user_history() {
+        let messages = fresh_selection_messages("select now".into());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "select now");
+        assert!(messages[0].tool_calls.is_none());
     }
 }
