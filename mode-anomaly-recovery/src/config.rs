@@ -301,6 +301,39 @@ impl LlmConfig {
     }
 }
 
+impl AnomalyRecoveryModeConfig {
+    pub(crate) fn ollama_chat_connection(&self) -> Result<(String, u16, String)> {
+        if self.llm.adapter.kind != "ollama" {
+            bail!("simulation tool calls require the ollama adapter");
+        }
+        let endpoint = self
+            .llm
+            .adapter
+            .config
+            .get("endpoint")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("ollama adapter requires a string endpoint"))?;
+        let authority = endpoint
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow!("simulation tool calls require an http Ollama endpoint"))?
+            .split_once('/')
+            .map_or_else(|| endpoint.trim_start_matches("http://"), |(host, _)| host);
+        let (host, port) = authority
+            .rsplit_once(':')
+            .map(|(host, port)| {
+                port.parse::<u16>()
+                    .map(|port| (host.to_string(), port))
+                    .map_err(|_| anyhow!("Ollama endpoint has an invalid port"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| (authority.to_string(), 80));
+        if host.is_empty() {
+            bail!("Ollama endpoint must include a host");
+        }
+        Ok((host, port, "/api/chat".to_string()))
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
