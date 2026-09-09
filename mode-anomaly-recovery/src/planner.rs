@@ -481,7 +481,7 @@ pub(crate) fn build_patches(
                 &binding.engine,
                 &binding.field,
                 &binding.type_,
-                &value.to_string(),
+                &format!("{value:?}"),
             )
         })
         .collect())
@@ -605,7 +605,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(patches.len(), 2);
-        assert_eq!(patches[0].value, "42");
+        assert_eq!(patches[0].value, "42.0");
         assert_eq!(patches[1].value, "1.5");
         assert!(
             build_patches(
