@@ -105,7 +105,9 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
     );
     let scenarios = applicable_scenarios(&request.config, &request.candidates);
     let mut messages = vec![ChatMessage {
-        role: "system".into(),
+        // Mistral receives concrete tool tasks reliably as a user turn. Tool
+        // definitions remain native Ollama fields rather than prompt syntax.
+        role: "user".into(),
         content: prompt(&request, &scenarios)?,
         tool_calls: None,
     }];
@@ -128,6 +130,13 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             );
         }
         let calls = response.message.tool_calls.clone().unwrap_or_default();
+        info!(
+            decision_trace = request.config.decision_trace,
+            stage = "ollama_tool_calls",
+            turn,
+            tool_call_count = calls.len(),
+            "anomaly recovery received Ollama tool-call response"
+        );
         if calls.len() != 1 {
             bail!("Ollama must issue exactly one sequential tool call per turn");
         }
