@@ -202,8 +202,8 @@ The advisor sends a plain HTTP `POST` to
 - `model`, chat `messages`, native `tools`, and `stream: false`.
 - `run_eds_simulation`, which accepts only a configured scenario ID and its
   configured bounded numeric parameters.
-- `select_recovery_action`, which may choose only a frozen candidate, its
-  eligible configured action, and that candidate's exact evidence path.
+- `select_recovery_action`, which may choose only a frozen candidate and one of
+  its eligible configured actions. Evidence is derived from that candidate.
 - `options.temperature` and `options.num_predict`.
 
 The configured Ollama model must support native tool calls. Unsupported tools,
