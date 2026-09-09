@@ -251,8 +251,13 @@ fn applicable_scenarios<'a>(
 
 fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Result<String> {
     let value = json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| &m.id).collect::<Vec<_>>() })).collect::<Vec<_>>()});
+    let next_step = if scenarios.is_empty() {
+        "Your next response MUST contain exactly one native select_recovery_action tool call. Do not return prose or JSON in message content."
+    } else {
+        "Your next response MUST contain exactly one native run_eds_simulation tool call for an applicable scenario. Do not return prose or JSON in message content."
+    };
     let text = format!(
-        "You are a constrained SAFE recovery advisor. Use only provided native tools. Run applicable EDS simulation before selecting an action. Never invent IDs. Final action must select a listed candidate/action and exact evidence path. Context: {}",
+        "You are a constrained SAFE recovery advisor. {next_step} Use only provided native tools. Never invent IDs. A final action must select a listed candidate/action and exact evidence path. Context: {}",
         serde_json::to_string(&value)?
     );
     if text.chars().count() > request.config.max_prompt_chars {
