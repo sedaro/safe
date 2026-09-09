@@ -120,9 +120,15 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         if started.elapsed() >= planning_limit {
             bail!("planning time budget exhausted");
         }
+        let mut all_tools = tools();
+        let phase_tools = if scenarios.is_empty() || runs > 0 {
+            vec![all_tools.remove(1)]
+        } else {
+            vec![all_tools.remove(0)]
+        };
         let response = tokio::select! {
             _ = request.cancel.cancelled() => return Ok(()),
-            result = chat(&request.config, messages.clone()) => result?,
+            result = chat(&request.config, messages.clone(), phase_tools) => result?,
         };
         if response.done_reason.as_deref() == Some("length") {
             bail!(
@@ -276,11 +282,12 @@ fn tools() -> Vec<Value> {
 async fn chat(
     config: &AnomalyRecoveryModeConfig,
     messages: Vec<ChatMessage>,
+    tools: Vec<Value>,
 ) -> Result<ChatResponse> {
     let body = serde_json::to_string(&ChatRequest {
         model: config.model.clone(),
         messages,
-        tools: tools(),
+        tools,
         stream: false,
         options: ChatOptions {
             temperature: config.response_temperature,
