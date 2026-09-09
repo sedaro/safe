@@ -32,10 +32,6 @@ pub async fn post_json(host: &str, port: u16, path: &str, body: &str) -> Result<
         .write_all(request.as_bytes())
         .await
         .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|e| anyhow!("HTTP request shutdown failed: {e}"))?;
 
     let mut response = Vec::new();
     let mut chunk = [0u8; 8192];
