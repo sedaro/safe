@@ -433,7 +433,68 @@ async fn execute_scenario(
         .run_collect(scenario.duration_days)
         .await
         .map_err(|e| anyhow!("local EDS run failed: {}", sanitize(&e.to_string())))?;
+    if config.decision_trace {
+        log_simulation_outputs(scenario, &result);
+    }
     extract_metrics(scenario, &result)
+}
+
+fn log_simulation_outputs(scenario: &SimulationScenario, result: &SimulationResult) {
+    let mut files = result
+        .frames_by_file
+        .iter()
+        .map(|(name, frames)| {
+            let fields = frames
+                .first()
+                .map(|frame| frame.field_names().into_iter().take(32).collect::<Vec<_>>())
+                .unwrap_or_default();
+            (name.as_str(), frames.len(), fields)
+        })
+        .collect::<Vec<_>>();
+    files.sort_unstable_by_key(|(name, _, _)| *name);
+    files.truncate(16);
+    info!(
+        decision_trace = true,
+        stage = "simulation_outputs",
+        success = result.success,
+        exit_code = ?result.exit_code,
+        total_frames = result.total_frames(),
+        files = ?files,
+        "anomaly recovery collected EDS simulation outputs"
+    );
+
+    for metric in &scenario.metrics {
+        let matched = result
+            .frames_by_file
+            .get_key_value(&metric.target_file)
+            .or_else(|| {
+                result
+                    .frames_by_file
+                    .iter()
+                    .find(|(name, _)| name.ends_with(&metric.target_file))
+            });
+        let (matched_file, frame_count, fields) = matched.map_or_else(
+            || (None, 0, Vec::new()),
+            |(name, frames)| {
+                let fields = frames
+                    .first()
+                    .map(|frame| frame.field_names().into_iter().take(32).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (Some(name.as_str()), frames.len(), fields)
+            },
+        );
+        info!(
+            decision_trace = true,
+            stage = "simulation_metric_target",
+            metric_id = %metric.id,
+            configured_file = %metric.target_file,
+            configured_field = %metric.field,
+            matched_file = ?matched_file,
+            frame_count,
+            available_fields = ?fields,
+            "anomaly recovery matched configured metric against EDS outputs"
+        );
+    }
 }
 
 pub(crate) fn build_patches(
