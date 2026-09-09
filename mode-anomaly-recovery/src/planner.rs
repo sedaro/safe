@@ -144,7 +144,15 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             "anomaly recovery received Ollama tool-call response"
         );
         if calls.len() != 1 {
-            bail!("Ollama must issue exactly one sequential tool call per turn");
+            // Do not reinterpret content as a tool request. Give tool-capable
+            // models one bounded repair opportunity per remaining turn.
+            messages.push(response.message);
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: "Your prior response was rejected because it did not contain exactly one native tool call. Reply now with exactly one call to the only available tool and no prose.".into(),
+                tool_calls: None,
+            });
+            continue;
         }
         let call = &calls[0].function;
         match call.name.as_str() {
