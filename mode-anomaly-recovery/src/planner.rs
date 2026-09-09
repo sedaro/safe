@@ -273,6 +273,16 @@ async fn chat(
             num_predict: config.num_predict,
         },
     })?;
+    info!(
+        decision_trace = config.decision_trace,
+        stage = "ollama_request",
+        host = %config.ollama_host,
+        port = config.ollama_port,
+        path = %config.ollama_path,
+        model = %config.model,
+        request_bytes = body.len(),
+        "anomaly recovery sending Ollama chat request"
+    );
     let result = timeout(
         Duration::from_millis(config.request_timeout_ms),
         http_client::post_json(
@@ -284,6 +294,13 @@ async fn chat(
     )
     .await
     .map_err(|_| anyhow!("Ollama chat request timed out; verify local tool-capable model"))??;
+    info!(
+        decision_trace = config.decision_trace,
+        stage = "ollama_response",
+        status = result.status,
+        response_bytes = result.body.len(),
+        "anomaly recovery received Ollama chat response"
+    );
     if !(200..300).contains(&result.status) {
         bail!("Ollama HTTP {}: {}", result.status, sanitize(&result.body));
     }
