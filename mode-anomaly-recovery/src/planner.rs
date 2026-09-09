@@ -359,14 +359,15 @@ async fn chat(
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
 ) -> Result<ChatResponse> {
+    let (host, port, path) = config.ollama_chat_connection()?;
     let body = serde_json::to_string(&ChatRequest {
-        model: config.model.clone(),
+        model: config.llm.model.clone(),
         messages,
         tools,
         stream: false,
         options: ChatOptions {
-            temperature: config.response_temperature,
-            num_predict: config.num_predict,
+            temperature: config.llm.response_temperature,
+            num_predict: config.llm.max_output_tokens,
         },
     })?;
     if config.decision_trace {
@@ -380,19 +381,19 @@ async fn chat(
     info!(
         decision_trace = config.decision_trace,
         stage = "ollama_request",
-        host = %config.ollama_host,
-        port = config.ollama_port,
-        path = %config.ollama_path,
-        model = %config.model,
+        host = %host,
+        port,
+        path = %path,
+        model = %config.llm.model,
         request_bytes = body.len(),
         "anomaly recovery sending Ollama chat request"
     );
     let result = timeout(
-        Duration::from_millis(config.request_timeout_ms),
+        Duration::from_millis(config.llm.request_timeout_ms),
         http_client::post_json(
-            &config.ollama_host,
-            config.ollama_port,
-            &config.ollama_path,
+            &host,
+            port,
+            &path,
             &body,
         ),
     )
