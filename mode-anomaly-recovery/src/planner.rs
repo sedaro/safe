@@ -22,7 +22,7 @@ use crate::types::{AnomalyCandidate, TelemetrySample};
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
-const SELECT_INSTRUCTION: &str = "The required simulation is complete. Reply with exactly one native select_recovery_action tool call using the simulation result and listed candidate values. Do not return prose or JSON in message content.";
+const SELECT_INSTRUCTION: &str = "The required simulation is complete. Use select_recovery_action to choose the best eligible action for one supplied anomaly candidate based on the simulation result.";
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -64,6 +64,10 @@ struct ChatResponse {
     message: ChatMessage,
     #[serde(default)]
     done_reason: Option<String>,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    eval_count: Option<u32>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct ToolCall {
@@ -87,7 +91,6 @@ struct SelectArguments {
     anomaly_id: String,
     action_id: String,
     reason: String,
-    evidence_paths: Vec<String>,
 }
 #[derive(Serialize)]
 struct ToolResult {
@@ -139,6 +142,18 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             );
         }
         let calls = response.message.tool_calls.clone().unwrap_or_default();
+        if request.config.decision_trace {
+            info!(
+                decision_trace = true,
+                stage = "ollama_message",
+                turn,
+                done = response.done,
+                done_reason = ?response.done_reason,
+                eval_count = ?response.eval_count,
+                assistant_content = %sanitize(&response.message.content),
+                "anomaly recovery parsed Ollama assistant message"
+            );
+        }
         info!(
             decision_trace = request.config.decision_trace,
             stage = "ollama_tool_calls",
@@ -152,7 +167,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             messages.push(response.message);
             messages.push(ChatMessage {
                 role: "user".into(),
-                content: "Your prior response was rejected because it did not contain exactly one native tool call. Reply now with exactly one call to the only available tool and no prose.".into(),
+                content: "Use the only available tool now to complete the requested task with the supplied values.".into(),
                 tool_calls: None,
                 tool_name: None,
             });
@@ -277,12 +292,12 @@ fn applicable_scenarios<'a>(
 fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Result<String> {
     let value = json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| &m.id).collect::<Vec<_>>() })).collect::<Vec<_>>()});
     let next_step = if scenarios.is_empty() {
-        "Your next response MUST contain exactly one native select_recovery_action tool call. Do not return prose or JSON in message content."
+        "Choose the best eligible recovery action for one supplied anomaly candidate by using select_recovery_action."
     } else {
-        "Start by returning exactly one native run_eds_simulation tool call for an applicable scenario. Do not return prose or JSON in message content."
+        "Start by using run_eds_simulation for one applicable supplied scenario."
     };
     let text = format!(
-        "You are a constrained SAFE recovery advisor. {next_step} Use only provided native tools. Never invent IDs. A final action must select a listed candidate/action and exact evidence path. Context: {}",
+        "You are a constrained SAFE recovery advisor. {next_step} Use only the provided tool and supplied values. Never invent IDs. Context: {}",
         serde_json::to_string(&value)?
     );
     if text.chars().count() > request.config.max_prompt_chars {
@@ -311,13 +326,9 @@ fn simulation_tool(scenarios: &[&SimulationScenario]) -> Value {
 fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
     let mut anomaly_ids = Vec::new();
     let mut action_ids = Vec::new();
-    let mut evidence_paths = Vec::new();
     for candidate in candidates {
         if !anomaly_ids.contains(&candidate.anomaly_id.as_str()) {
             anomaly_ids.push(candidate.anomaly_id.as_str());
-        }
-        if !evidence_paths.contains(&candidate.path.as_str()) {
-            evidence_paths.push(candidate.path.as_str());
         }
         for action in &candidate.eligible_actions {
             let action = action.as_str();
@@ -326,7 +337,7 @@ fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
             }
         }
     }
-    json!({"type":"function","function":{"name":"select_recovery_action","description":"Select one validated SAFE action for one listed anomaly","parameters":{"type":"object","required":["anomaly_id","action_id","reason","evidence_paths"],"properties":{"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"},"evidence_paths":{"type":"array","description":"The selected candidate's exact evidence path as a one-item array","items":{"type":"string","enum":evidence_paths}}}}}})
+    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action for one supplied anomaly","parameters":{"type":"object","required":["anomaly_id","action_id","reason"],"properties":{"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"}}}}})
 }
 
 async fn chat(
@@ -502,9 +513,6 @@ fn evaluate<'a>(
         .iter()
         .find(|c| c.anomaly_id == args.anomaly_id || c.rule_id == args.anomaly_id)
         .ok_or_else(|| anyhow!("final anomaly is not a frozen candidate"))?;
-    if args.evidence_paths != vec![candidate.path.clone()] {
-        bail!("final evidence path is not exactly candidate evidence");
-    }
     let action = candidate
         .eligible_actions
         .iter()
@@ -628,6 +636,15 @@ mod tests {
         assert_eq!(
             selection["function"]["parameters"]["properties"]["action_id"]["enum"][0],
             "point_nadir"
+        );
+        assert_eq!(
+            selection["function"]["parameters"]["required"],
+            json!(["anomaly_id", "action_id", "reason"])
+        );
+        assert!(
+            selection["function"]["parameters"]["properties"]
+                .get("evidence_paths")
+                .is_none()
         );
     }
 
