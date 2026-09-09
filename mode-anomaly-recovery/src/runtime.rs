@@ -757,11 +757,35 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
 
-        let envelope = self.build_decision_envelope(actionable);
-        let decision = self.plan_decision_with_feedback_loop(&envelope).await?;
-        let (candidate, action) = self.evaluate_decision(&decision, &envelope.candidates)?;
-        self.emit_action(runtime, candidate, action, &decision.reason)
-            .await?;
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = safe_sim::CancellationToken::new();
+        let generation = self
+            .planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let telemetry = self
+            .latest_telemetry
+            .clone()
+            .ok_or_else(|| anyhow!("missing telemetry snapshot"))?;
+        let request = crate::planner::PlanningRequest {
+            config: self.config.clone(),
+            candidates: actionable,
+            telemetry,
+            mode_id: runtime.mode_id(),
+            generation,
+            generations: self.planning_generation.clone(),
+            active: self.active.clone(),
+            cancel: cancel.clone(),
+            output: runtime.output_tx(),
+        };
+        tokio::spawn(async move {
+            if let Err(error) = crate::planner::run(request).await {
+                warn!(reason = %error, "anomaly recovery background planning failed without emitting a command");
+            }
+        });
+        self.planning_cancel = Some(cancel);
         self.last_plan_signature = Some(signature);
         Ok(())
     }
@@ -779,7 +803,7 @@ fn command_for_action(action: AllowedAction) -> Result<Command> {
     }
 }
 
-fn value_at_payload_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
+pub(crate) fn value_at_payload_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(payload, |value, segment| match value {
             Value::Object(values) => values.get(segment),
@@ -853,10 +877,17 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         self.has_board_snapshot = false;
         self.last_plan_signature = None;
         self.warned_missing_board_snapshot = false;
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
         Ok(())
     }
 
     async fn on_activate(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Err(err) = self.plan_current_candidates(runtime).await {
             self.log_planning_error(
                 "on_activate",
@@ -869,6 +900,13 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     }
 
     async fn on_deactivate(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
         self.last_plan_signature = None;
         Ok(())
     }
@@ -918,6 +956,17 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
                 &err,
                 self.latest_telemetry.as_ref(),
             );
+        }
+        Ok(())
+    }
+
+    async fn on_shutdown(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
         }
         Ok(())
     }

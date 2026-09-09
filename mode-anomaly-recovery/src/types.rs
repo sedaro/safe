@@ -1,4 +1,9 @@
+use safe_sim::CancellationToken;
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64},
+};
 
 use safe::protocol::AutonomyModeBoardState;
 use serde::Serialize;
@@ -41,6 +46,9 @@ pub(crate) struct AnomalyRecoveryMode {
     pub(crate) has_board_snapshot: bool,
     pub(crate) last_plan_signature: Option<String>,
     pub(crate) warned_missing_board_snapshot: bool,
+    pub(crate) planning_generation: Arc<AtomicU64>,
+    pub(crate) active: Arc<AtomicBool>,
+    pub(crate) planning_cancel: Option<CancellationToken>,
 }
 
 impl AnomalyRecoveryMode {
@@ -54,6 +62,9 @@ impl AnomalyRecoveryMode {
             has_board_snapshot: false,
             last_plan_signature: None,
             warned_missing_board_snapshot: false,
+            planning_generation: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicBool::new(false)),
+            planning_cancel: None,
         }
     }
 }

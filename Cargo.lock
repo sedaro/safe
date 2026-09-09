@@ -1065,6 +1065,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "safe",
+ "safe-sim",
  "serde",
  "serde_json",
  "tempfile",
