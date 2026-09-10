@@ -1,0 +1,22 @@
+[package]
+name = "mode-mission-planning"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+safe = { path = "../safe" }
+safe-sim = { path = "../safe-sim" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+uuid = "1.23.3"
+
+[[bin]]
+name = "mode_mission_planning"
+path = "src/main.rs"

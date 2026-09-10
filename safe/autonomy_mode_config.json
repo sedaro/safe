@@ -53,5 +53,54 @@
         }
       ]
     }
+  },
+  {
+    "name": "MissionPlanning",
+    "priority": 1,
+    "enabled": false,
+    "bin_path": "target/debug/mode_mission_planning",
+    "args": [],
+    "sandbox_resources": {
+      "cpu": 250.0,
+      "memory": 1000000000,
+      "disk": 1000000000
+    },
+    "persist_work_dir": false,
+    "mode_config": {
+      "eds_path": "/path/to/eds/workspace",
+      "input_adapter_command": ["/path/to/input-adapter", "mission-planning-input"],
+      "input_adapter_config": {},
+      "planning_horizon_secs": 21600.0,
+      "min_replan_interval_secs": 300,
+      "telemetry_gps_time_pointer": "/telemetry/gps_time",
+      "telemetry_state_of_charge_pointer": "/telemetry/state_of_charge",
+      "result_file": "result.jsonl",
+      "state_of_charge_field": "state_of_charge",
+      "low_power_state_of_charge": 0.3,
+      "recovered_state_of_charge": 0.6,
+      "minimum_elevation_deg": 10.0,
+      "default_pointing": { "kind": "nadir" },
+      "targets": [
+        { "name": "example-target", "in_fov_field": "target.in_fov" }
+      ],
+      "ground_stations": [
+        {
+          "name": "example-station",
+          "latitude_deg": 0.0,
+          "longitude_deg": 0.0,
+          "altitude_m": 0.0,
+          "elevation_field": "station.elevation_deg"
+        }
+      ],
+      "validation_checks": [
+        {
+          "target_file": "result.jsonl",
+          "field": "constraint_margin",
+          "aggregation": "min",
+          "op": "gte",
+          "threshold": 0.0
+        }
+      ]
+    }
   }
 ]

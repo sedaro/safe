@@ -6,6 +6,7 @@ members = [
     "safe-gatekeeper",
     "safectl",
     "mode-anomaly-recovery",
+    "mode-mission-planning",
 ]
 exclude = [
     "mode-coorbital-evasion",
