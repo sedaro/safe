@@ -118,23 +118,42 @@ pub(crate) fn extract_planning_samples(
     for (index, frame) in frames.iter().enumerate() {
         let time_mjd =
             numeric(frame, &config.time_field).with_context(|| format!("sample {index} time"))?;
-        let state_of_charge = numeric(frame, &config.state_of_charge_field)
-            .with_context(|| format!("sample {index} state of charge"))?;
+        let state_of_charge = numeric(
+            frame_with_field(
+                result,
+                time_mjd,
+                &config.time_field,
+                &config.state_of_charge_field,
+            )?,
+            &config.state_of_charge_field,
+        )
+        .with_context(|| format!("sample {index} state of charge"))?;
         if !time_mjd.is_finite() || !state_of_charge.is_finite() {
             bail!("sample {index} contains non-finite time or state of charge");
         }
 
         let target_visible = config.targets.iter().try_fold(false, |visible, target| {
-            boolean(frame, &target.in_fov_field)
-                .with_context(|| format!("sample {index} target '{}'", target.name))
-                .map(|value| visible || value)
+            boolean(
+                frame_with_field(result, time_mjd, &config.time_field, &target.in_fov_field)?,
+                &target.in_fov_field,
+            )
+            .with_context(|| format!("sample {index} target '{}'", target.name))
+            .map(|value| visible || value)
         })?;
         let station_elevations_deg = config
             .ground_stations
             .iter()
             .map(|station| {
-                numeric(frame, &station.elevation_field)
-                    .with_context(|| format!("sample {index} station '{}'", station.name))
+                numeric(
+                    frame_with_field(
+                        result,
+                        time_mjd,
+                        &config.time_field,
+                        &station.elevation_field,
+                    )?,
+                    &station.elevation_field,
+                )
+                .with_context(|| format!("sample {index} station '{}'", station.name))
             })
             .collect::<Result<Vec<_>>>()?;
         if station_elevations_deg
@@ -205,6 +224,27 @@ fn result_frames<'a>(result: &'a SimulationResult, target_file: &str) -> Result<
         })
         .map(Vec::as_slice)
         .with_context(|| format!("missing simulation result file '{target_file}'"))
+}
+
+fn frame_with_field<'a>(
+    result: &'a SimulationResult,
+    time_mjd: f64,
+    time_field: &str,
+    field: &str,
+) -> Result<&'a EdsFrame> {
+    result
+        .frames_by_file
+        .values()
+        .flat_map(|frames| frames.iter())
+        .filter(|frame| frame.get_by_field(field).is_ok())
+        .filter_map(|frame| {
+            numeric(frame, time_field)
+                .ok()
+                .map(|frame_time| ((frame_time - time_mjd).abs(), frame))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, frame)| frame)
+        .with_context(|| format!("missing simulation field '{field}' near time {time_mjd}"))
 }
 
 fn numeric(frame: &EdsFrame, field: &str) -> Result<f64> {

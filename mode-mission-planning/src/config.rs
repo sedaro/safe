@@ -308,7 +308,7 @@ fn default_min_replan_interval_secs() -> u64 {
     300
 }
 fn default_command_lead_secs() -> f64 {
-    5.0
+    60.0
 }
 fn default_command_dedup_tolerance_secs() -> f64 {
     1.0

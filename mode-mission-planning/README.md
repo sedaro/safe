@@ -60,7 +60,7 @@ This illustrative mode configuration intentionally uses placeholders:
   "simulation_timeout_secs": 120,
   "planning_horizon_secs": 21600.0,
   "min_replan_interval_secs": 300,
-  "command_lead_secs": 5.0,
+  "command_lead_secs": 60.0,
   "command_dedup_tolerance_secs": 1.0,
   "telemetry_gps_time_pointer": "/telemetry/gps_time",
   "telemetry_state_of_charge_pointer": "/telemetry/state_of_charge",
