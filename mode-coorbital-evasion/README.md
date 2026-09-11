@@ -146,6 +146,7 @@ Positive `c_i` is outside the physical FOV, zero is on its boundary, and negativ
 - `fov_half_angle`: half-angle of the FOV in degrees
 - `fov_guard_angle`: additional angle guard for planning in degrees. When relevant, added to `fov_half_angle` to produce `alpha_plan`.
 - `threat_ids`: list of threat IDs to consider in the planner and when running the EDS. The planner ignores threats not in this list.
+- `threat_max_range_km`: maximum range in kilometers at which a configured threat is considered. Threats beyond this range do not constrain pointing or count as exposure. The default is unlimited.
 - `ground_threat_locations`: dictionary of ground threat IDs to their latitude, longitude, and altitude locations. The locations are given in a list `[latitude (deg), longitude (deg), altitude (km)]`.
 - `space_threat_epoch_states`: dictionary of space threat IDs to their state at a given epoch. The state is given in a list `[epoch (MJD), position (km, ECI), velocity (km/s, ECI)]`.
 - `planning_horizon`: time horizon for planning in days

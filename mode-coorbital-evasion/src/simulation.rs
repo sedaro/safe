@@ -8,8 +8,9 @@ use safe_sim::{EdsFrame, EdsPatch, SimulationResult};
 use safe_telemetry::augmented::AugmentedTelemetry;
 use safe_telemetry::model::Telemetry;
 
+use crate::planning::threat_is_within_range;
 use crate::types::{
-    EdsPointingSchedule, CoorbitalEvasionMode, GeometrySample, ModeScheduleEntry, PointingTarget,
+    CoorbitalEvasionMode, EdsPointingSchedule, GeometrySample, ModeScheduleEntry, PointingTarget,
     QuaternionScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport,
 };
 
@@ -516,7 +517,10 @@ impl CoorbitalEvasionMode {
             let sample = &samples[index];
             let mut exposed = false;
             for (threat_index, threat) in sample.threats.iter().enumerate() {
-                if threat.line_of_sight && threat.in_field_of_view {
+                if threat_is_within_range(threat, self.config.threat_max_range_km)
+                    && threat.line_of_sight
+                    && threat.in_field_of_view
+                {
                     exposed = true;
                     let id = &self.config.threat_ids[threat_index];
                     if !report.exposed_threat_ids.contains(id) {
@@ -550,6 +554,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::types::ScheduleScore;
 
     #[test]
     fn accepted_mixed_schedule_preserves_latest_pre_epoch_target() {
@@ -662,5 +667,30 @@ mod tests {
             vec![(1.0, "sun".to_string()), (1.5, mode.config.nadir_mode_id)]
         );
         assert!(result.quaternion_schedule.is_empty());
+    }
+
+    #[test]
+    fn validation_ignores_threats_beyond_max_range() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_ids = vec!["threat".to_string()];
+        mode.config.threat_max_range_km = 9.0;
+        let samples = (0..=1)
+            .map(|index| GeometrySample {
+                time_mjd: 60_000.0 + index as f64 / SECONDS_PER_DAY,
+                position_eci: Vector3::z(),
+                velocity_eci: Vector3::y(),
+                attitude_body_to_eci: UnitQuaternion::identity(),
+                boresight_eci: Vector3::z(),
+                threats: vec![ThreatGeometry {
+                    relative_position_eci: -10.0 * Vector3::z(),
+                    line_of_sight: true,
+                    in_field_of_view: true,
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let report = mode.validation_report(&samples, 60_000.0, 30_f64.to_radians());
+        assert_eq!(report.score, ScheduleScore::default());
+        assert!(report.exposed_threat_ids.is_empty());
     }
 }

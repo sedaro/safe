@@ -21,12 +21,20 @@ pub(crate) fn threat_los_direction(relative_position_eci: &Vector3<f64>) -> Vect
     -relative_position_eci.normalize()
 }
 
-fn accepted_schedule_exposed(samples: &[GeometrySample]) -> bool {
+pub(crate) fn threat_is_within_range(
+    threat: &crate::types::ThreatGeometry,
+    max_range_km: f64,
+) -> bool {
+    threat.relative_position_eci.norm() <= max_range_km
+}
+
+fn accepted_schedule_exposed(samples: &[GeometrySample], max_range_km: f64) -> bool {
     samples.iter().any(|sample| {
-        sample
-            .threats
-            .iter()
-            .any(|threat| threat.line_of_sight && threat.in_field_of_view)
+        sample.threats.iter().any(|threat| {
+            threat_is_within_range(threat, max_range_km)
+                && threat.line_of_sight
+                && threat.in_field_of_view
+        })
     })
 }
 
@@ -43,6 +51,7 @@ fn score_is_better(left: ScheduleScore, right: ScheduleScore) -> bool {
 pub(crate) fn unsafe_periods(
     samples: &[GeometrySample],
     guarded_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> Vec<UnsafePeriod> {
     let cap_cos = guarded_half_angle_rad.cos();
     let mut periods = Vec::new();
@@ -51,7 +60,8 @@ pub(crate) fn unsafe_periods(
     for (index, sample) in samples.iter().enumerate() {
         let nadir = nadir_direction(sample);
         let unsafe_now = sample.threats.iter().any(|threat| {
-            threat.line_of_sight
+            threat_is_within_range(threat, max_range_km)
+                && threat.line_of_sight
                 && nadir.dot(&threat_los_direction(&threat.relative_position_eci)) >= cap_cos
         });
         match (first, unsafe_now) {
@@ -108,6 +118,7 @@ fn fixed_direction_score(
     last: usize,
     direction: Vector3<f64>,
     fov_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> ScheduleScore {
     let mut score = ScheduleScore::default();
     let end_interval = (last + 1).min(samples.len().saturating_sub(1));
@@ -115,7 +126,8 @@ fn fixed_direction_score(
     for index in first..end_interval {
         let dt_secs = (samples[index + 1].time_mjd - samples[index].time_mjd) * SECONDS_PER_DAY;
         let exposed = samples[index].threats.iter().any(|threat| {
-            threat.line_of_sight
+            threat_is_within_range(threat, max_range_km)
+                && threat.line_of_sight
                 && direction.dot(&threat_los_direction(&threat.relative_position_eci)) >= cap_cos
         });
         if exposed {
@@ -132,11 +144,13 @@ fn fixed_direction_is_safe(
     last: usize,
     direction: Vector3<f64>,
     guarded_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> bool {
     let cap_cos = guarded_half_angle_rad.cos();
     samples[first..=last].iter().all(|sample| {
         sample.threats.iter().all(|threat| {
-            !threat.line_of_sight
+            !threat_is_within_range(threat, max_range_km)
+                || !threat.line_of_sight
                 || direction.dot(&threat_los_direction(&threat.relative_position_eci))
                     < cap_cos + 1.0e-10
         })
@@ -175,6 +189,7 @@ fn fixed_window_boresight(
     earliest: usize,
     guarded_half_angle_rad: f64,
     fov_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> Vector3<f64> {
     const MAX_PROJECTION_ITERATIONS: usize = 128;
     let first = period.first.max(earliest);
@@ -183,13 +198,22 @@ fn fixed_window_boresight(
     let cap_sin = guarded_half_angle_rad.sin();
     let mut direction = aggregate_nadir_direction(samples, first, last);
     let mut best_direction = direction;
-    let mut best_score = fixed_direction_score(samples, first, last, direction, fov_half_angle_rad);
+    let mut best_score = fixed_direction_score(
+        samples,
+        first,
+        last,
+        direction,
+        fov_half_angle_rad,
+        max_range_km,
+    );
 
     for _ in 0..MAX_PROJECTION_ITERATIONS {
         let mut worst: Option<(f64, Vector3<f64>)> = None;
         for sample in &samples[first..=last] {
             for threat in &sample.threats {
-                if !threat.line_of_sight {
+                if !threat_is_within_range(threat, max_range_km)
+                    || !threat.line_of_sight
+                {
                     continue;
                 }
                 let threat_direction = threat_los_direction(&threat.relative_position_eci);
@@ -210,7 +234,14 @@ fn fixed_window_boresight(
             return direction;
         }
 
-        let score = fixed_direction_score(samples, first, last, direction, fov_half_angle_rad);
+        let score = fixed_direction_score(
+            samples,
+            first,
+            last,
+            direction,
+            fov_half_angle_rad,
+            max_range_km,
+        );
         if score_is_better(score, best_score) {
             best_direction = direction;
             best_score = score;
@@ -218,11 +249,25 @@ fn fixed_window_boresight(
         direction = project_to_cap_boundary(direction, threat_direction, cap_cos, cap_sin);
     }
 
-    let final_score = fixed_direction_score(samples, first, last, direction, fov_half_angle_rad);
+    let final_score = fixed_direction_score(
+        samples,
+        first,
+        last,
+        direction,
+        fov_half_angle_rad,
+        max_range_km,
+    );
     if score_is_better(final_score, best_score) {
         best_direction = direction;
     }
-    if fixed_direction_is_safe(samples, first, last, direction, guarded_half_angle_rad) {
+    if fixed_direction_is_safe(
+        samples,
+        first,
+        last,
+        direction,
+        guarded_half_angle_rad,
+        max_range_km,
+    ) {
         direction
     } else {
         best_direction
@@ -294,13 +339,15 @@ pub(crate) fn score_boresights(
     first_interval: usize,
     end_interval: usize,
     fov_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> ScheduleScore {
     let cap_cos = fov_half_angle_rad.cos();
     let mut score = ScheduleScore::default();
     for index in first_interval..end_interval.min(samples.len().saturating_sub(1)) {
         let dt_secs = (samples[index + 1].time_mjd - samples[index].time_mjd) * SECONDS_PER_DAY;
         let exposed = samples[index].threats.iter().any(|threat| {
-            threat.line_of_sight
+            threat_is_within_range(threat, max_range_km)
+                && threat.line_of_sight
                 && boresights[index].dot(&threat_los_direction(&threat.relative_position_eci))
                     >= cap_cos
         });
@@ -436,6 +483,7 @@ fn score_commands_through(
     commands: &[ModelCommand],
     max_slew_rate_rad_s: f64,
     fov_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> ScheduleScore {
     let end_interval = end_interval.min(samples.len().saturating_sub(1));
     let planning_samples = &samples[..=end_interval];
@@ -446,6 +494,7 @@ fn score_commands_through(
         earliest,
         end_interval,
         fov_half_angle_rad,
+        max_range_km,
     )
 }
 
@@ -457,6 +506,7 @@ fn choose_route(
     right: Vec<ModelCommand>,
     max_slew_rate_rad_s: f64,
     fov_half_angle_rad: f64,
+    max_range_km: f64,
 ) -> Vec<ModelCommand> {
     let left_score = score_commands_through(
         samples,
@@ -465,6 +515,7 @@ fn choose_route(
         &left,
         max_slew_rate_rad_s,
         fov_half_angle_rad,
+        max_range_km,
     );
     let right_score = score_commands_through(
         samples,
@@ -473,6 +524,7 @@ fn choose_route(
         &right,
         max_slew_rate_rad_s,
         fov_half_angle_rad,
+        max_range_km,
     );
     if compare_schedules(left_score, &left, right_score, &right) != Ordering::Greater {
         left
@@ -559,6 +611,10 @@ impl CoorbitalEvasionMode {
         if self.config.max_slew_rate_rad_s <= 0.0 {
             anyhow::bail!("mode_config.max_slew_rate_rad_s must be greater than zero");
         }
+        if self.config.threat_max_range_km.is_nan() || self.config.threat_max_range_km < 0.0
+        {
+            anyhow::bail!("mode_config.threat_max_range_km must be non-negative");
+        }
         Ok(())
     }
 
@@ -584,16 +640,20 @@ impl CoorbitalEvasionMode {
             .iter()
             .position(|sample| sample.time_mjd >= command_time_mjd)
             .context("simulation has no sample at or after the earliest commandable time")?;
-        if !accepted_schedule_exposed(&baseline[earliest..]) {
+        if !accepted_schedule_exposed(&baseline[earliest..], self.config.threat_max_range_km) {
             return Ok(PlanningOutcome::NoBoardChange);
         }
         let fov_half_angle_rad = self.config.fov_half_angle_deg.to_radians();
         let guarded_half_angle_rad =
             (self.config.fov_half_angle_deg + self.config.fov_guard_angle_deg).to_radians();
-        let periods = unsafe_periods(&baseline, guarded_half_angle_rad)
-            .into_iter()
-            .filter(|period| period.last >= earliest)
-            .collect::<Vec<_>>();
+        let periods = unsafe_periods(
+            &baseline,
+            guarded_half_angle_rad,
+            self.config.threat_max_range_km,
+        )
+        .into_iter()
+        .filter(|period| period.last >= earliest)
+        .collect::<Vec<_>>();
         let mut commands = vec![ModelCommand {
             sample_index: earliest,
             target: ModeledTarget::Nadir,
@@ -607,6 +667,7 @@ impl CoorbitalEvasionMode {
                 earliest,
                 guarded_half_angle_rad,
                 fov_half_angle_rad,
+                self.config.threat_max_range_km,
             );
 
             let start_floor = previous_period
@@ -648,6 +709,7 @@ impl CoorbitalEvasionMode {
                         via_nadir,
                         self.config.max_slew_rate_rad_s,
                         fov_half_angle_rad,
+                        self.config.threat_max_range_km,
                     )
                 } else {
                     direct
@@ -674,6 +736,7 @@ impl CoorbitalEvasionMode {
                     canonicalize_model_commands(return_to_nadir),
                     self.config.max_slew_rate_rad_s,
                     fov_half_angle_rad,
+                    self.config.threat_max_range_km,
                 );
             }
         }
@@ -690,6 +753,7 @@ impl CoorbitalEvasionMode {
             earliest,
             baseline.len() - 1,
             fov_half_angle_rad,
+            self.config.threat_max_range_km,
         );
         let commands = lift_commands(&baseline, &commands);
         let selected_schedule = self.selected_pointing_schedule(
@@ -767,11 +831,36 @@ mod tests {
             sample(3.0, -Vector3::z(), vec![threat(Vector3::z(), true)]),
         ];
         assert_eq!(
-            unsafe_periods(&samples, 31_f64.to_radians()),
+            unsafe_periods(&samples, 31_f64.to_radians(), f64::INFINITY),
             vec![
                 UnsafePeriod { first: 0, last: 1 },
                 UnsafePeriod { first: 3, last: 3 }
             ]
+        );
+    }
+
+    #[test]
+    fn threats_beyond_max_range_are_ignored() {
+        let samples = vec![
+            sample(0.0, Vector3::z(), vec![threat(-10.0 * Vector3::z(), true)]),
+            sample(1.0, Vector3::z(), vec![]),
+        ];
+
+        assert!(unsafe_periods(&samples, 31_f64.to_radians(), 9.0).is_empty());
+        assert_eq!(
+            score_boresights(
+                &samples,
+                &[Vector3::z(), Vector3::z()],
+                0,
+                1,
+                30_f64.to_radians(),
+                9.0,
+            ),
+            ScheduleScore::default()
+        );
+        assert_eq!(
+            unsafe_periods(&samples, 31_f64.to_radians(), 10.0),
+            vec![UnsafePeriod { first: 0, last: 0 }]
         );
     }
 
@@ -788,13 +877,15 @@ mod tests {
             0,
             31_f64.to_radians(),
             30_f64.to_radians(),
+            f64::INFINITY,
         );
         assert!(fixed_direction_is_safe(
             &samples,
             0,
             2,
             target,
-            31_f64.to_radians()
+            31_f64.to_radians(),
+            f64::INFINITY
         ));
         assert!((target.dot(&Vector3::z()) - 31_f64.to_radians().cos()).abs() < 1.0e-10);
     }
@@ -820,6 +911,7 @@ mod tests {
             0,
             1,
             30_f64.to_radians(),
+            f64::INFINITY,
         );
         assert!((score.exposure_secs - 10.0).abs() < 1.0e-6);
     }
@@ -834,7 +926,7 @@ mod tests {
             Vector3::z(),
             vec![occulted_in_fov, visible_outside_fov],
         )];
-        assert!(!accepted_schedule_exposed(&samples));
+        assert!(!accepted_schedule_exposed(&samples, f64::INFINITY));
     }
 
     #[test]
@@ -857,13 +949,15 @@ mod tests {
             0,
             31_f64.to_radians(),
             30_f64.to_radians(),
+            f64::INFINITY,
         );
         assert!(fixed_direction_is_safe(
             &samples,
             0,
             1,
             target,
-            31_f64.to_radians()
+            31_f64.to_radians(),
+            f64::INFINITY
         ));
     }
 
@@ -951,7 +1045,7 @@ mod tests {
             .collect::<Vec<_>>();
         samples[2].threats = vec![threat(-Vector3::z(), true)];
         samples[6].threats = vec![threat(-Vector3::z(), true)];
-        let periods = unsafe_periods(&samples, 31_f64.to_radians());
+        let periods = unsafe_periods(&samples, 31_f64.to_radians(), f64::INFINITY);
         let mut commands = vec![ModelCommand {
             sample_index: 0,
             target: ModeledTarget::Nadir,
@@ -964,6 +1058,7 @@ mod tests {
                 0,
                 31_f64.to_radians(),
                 30_f64.to_radians(),
+                f64::INFINITY,
             );
             let direct = add_fixed_target(
                 &samples,
