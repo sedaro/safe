@@ -38,6 +38,9 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     pub(crate) field_of_view_id: String,
     #[serde(default)]
     pub(crate) threat_ids: Vec<String>,
+    /// Maximum threat range to consider, in kilometers.
+    #[serde(default = "default_threat_max_range_km")]
+    pub(crate) threat_max_range_km: f64,
     #[serde(default)]
     pub(crate) ground_threat_locations: BTreeMap<String, GroundThreatLocation>,
     #[serde(default)]
@@ -98,6 +101,7 @@ impl Default for CoorbitalEvasionModeConfig {
             agent_id: default_agent_id(),
             field_of_view_id: default_field_of_view_id(),
             threat_ids: Vec::new(),
+            threat_max_range_km: default_threat_max_range_km(),
             ground_threat_locations: BTreeMap::new(),
             space_threat_epoch_states: BTreeMap::new(),
             fov_half_angle_deg: default_fov_half_angle_deg(),
@@ -149,6 +153,9 @@ fn default_agent_id() -> String {
 }
 fn default_field_of_view_id() -> String {
     DEFAULT_FOV_ID.to_string()
+}
+fn default_threat_max_range_km() -> f64 {
+    f64::INFINITY
 }
 fn default_fov_half_angle_deg() -> f64 {
     30.0
@@ -216,6 +223,7 @@ mod tests {
         let config = CoorbitalEvasionModeConfig::default();
         assert_eq!(config.fov_half_angle_deg, 30.0);
         assert_eq!(config.fov_guard_angle_deg, 1.0);
+        assert!(config.threat_max_range_km.is_infinite());
         assert_eq!(config.max_slew_rate_rad_s, 0.010_472);
         assert_eq!(config.position_field, "root.position");
         assert_eq!(config.velocity_field, "root.velocity");
@@ -228,5 +236,11 @@ mod tests {
             config.pointing_quaternion_schedule_field,
             "6VPcwrnbQS6HBHdy3kWtDC.quaternion_schedule"
         );
+    }
+
+    #[test]
+    fn omitted_threat_max_range_preserves_unlimited_range() {
+        let config: CoorbitalEvasionModeConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.threat_max_range_km.is_infinite());
     }
 }

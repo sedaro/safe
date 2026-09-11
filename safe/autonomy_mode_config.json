@@ -102,5 +102,55 @@
         }
       ]
     }
+  },
+  {
+    "name": "CoorbitalEvasion",
+    "priority": 1,
+    "enabled": false,
+    "bin_path": "target/debug/mode_coorbital_evasion",
+    "args": [],
+    "sandbox_resources": {
+      "cpu": 250.0,
+      "memory": 1000000000,
+      "disk": 1000000000
+    },
+    "persist_work_dir": false,
+    "mode_config": {
+      "eds_path": "/path/to/coorbital-evasion-eds/workspace",
+      "gnc_time_step_limits": [0.01, 3.0],
+      "cdh_time_step_limits": [0.1, 60.0],
+      "power_time_step_limits": [0.1, 60.0],
+      "sim_duration_days": 0.05,
+      "simulation_timeout_secs": 60,
+      "min_replan_interval_secs": 60,
+      "command_lead_secs": 5.0,
+      "agent_id": "example-spacecraft",
+      "field_of_view_id": "example-field-of-view",
+      "threat_ids": ["example-ground-threat"],
+      "threat_max_range_km": 1000.0,
+      "ground_threat_locations": {
+        "example-ground-threat": [0.0, 0.0, 0.0]
+      },
+      "space_threat_epoch_states": {},
+      "fov_half_angle_deg": 30.0,
+      "fov_guard_angle_deg": 1.0,
+      "max_slew_rate_rad_s": 0.010472,
+      "command_dedup_angle_rad": 1.0e-6,
+      "command_dedup_time_secs": 1.0,
+      "result_engine": "gnc",
+      "time_field": "time",
+      "position_field": "root.position",
+      "velocity_field": "root.velocity",
+      "attitude_field": "root.attitude",
+      "boresight_field": "boresight_eci",
+      "relative_position_field": "relative_position_eci",
+      "line_of_sight_field": "line_of_sight",
+      "in_field_of_view_field": "in_field_of_view",
+      "schedule_patch_engine": "cdh",
+      "pointing_mode_schedule_field": "example-pointing-controller.mode_schedule",
+      "pointing_quaternion_schedule_field": "example-pointing-controller.quaternion_schedule",
+      "nadir_mode_id": "example-nadir-mode",
+      "sun_yaw_mode_id": "example-sun-yaw-mode"
+    }
   }
 ]
