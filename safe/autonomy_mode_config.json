@@ -23,44 +23,94 @@
       },
       "action_catalog": [
         {
-          "id": "point_nadir",
-          "description": "DEMO ONLY: point nadir after a configured thermal, rail, or wheel-speed anomaly.",
-          "preconditions": ["Demo configuration only; not flight-approved."]
+          "id": "point_sun_yaw",
+          "description": "Place the spacecraft in the approved sun-yaw recovery posture."
         },
         {
-          "id": "point_sun_yaw",
-          "description": "DEMO ONLY: point toward the sun after a configured power, GPS, or mode anomaly.",
-          "preconditions": ["Demo configuration only; not flight-approved."]
+          "id": "point_nadir",
+          "description": "Place the spacecraft in the approved nadir recovery posture."
         }
       ],
+
       "nominal_profiles": [
         {
-          "id": "demo-v1",
+          "id": "thermal-v1",
           "source": "example",
           "rules": [
             {
-              "id": "battery_temperature_out_of_nominal",
-              "path": "telemetry.batt_c",
+              "id": "temperature_high",
+              "path": "telemetry.temperature_c",
               "kind": "number_range",
-              "min": 20.0,
-              "max": 60.0,
-              "min_consecutive_samples": 10,
+              "max": 45.0,
+              "min_consecutive_samples": 2,
               "severity": "high",
-              "eligible_actions": ["point_nadir"]
-            },
-            {
-              "id": "battery_voltage_out_of_nominal",
-              "path": "telemetry.batt_v",
-              "kind": "number_range",
-              "min": 7.5,
-              "max": 8.6,
-              "min_consecutive_samples": 10,
-              "severity": "high",
-              "eligible_actions": ["point_sun_yaw"]
+              "eligible_actions": [
+                "point_sun_yaw",
+                "point_nadir"
+              ]
             }
           ]
         }
-      ]
+      ],
+
+      "simulation": {
+        "eds_path": "/Users/wdaughtridge/Downloads/bundle/eds",
+        "max_runs": 2,
+        "run_timeout_ms": 10000,
+        "scenarios": [
+          {
+            "id": "thermal_recovery",
+            "description": "Evaluate approved thermal-recovery postures.",
+            "applicable_rule_ids": ["temperature_high"],
+            "allowed_actions": [
+              "point_sun_yaw",
+              "point_nadir"
+            ],
+            "duration_days": 0.05,
+
+            "patches": [
+              {
+                "agent_id": "spacecraft",
+                "engine": "power",
+                "field": "root!.battery_temperature_c",
+                "type": "f64",
+                "telemetry_path": "telemetry.temperature_c"
+              },
+              {
+                "agent_id": "spacecraft",
+                "engine": "power",
+                "field": "root!.thermal_gain",
+                "type": "f64",
+                "value": 1.0
+              }
+            ],
+
+            "parameters": [
+              {
+                "id": "thermal_gain",
+                "patch_index": 1,
+                "min": 0.8,
+                "max": 1.2
+              }
+            ],
+
+            "metrics": [
+              {
+                "id": "peak_temperature_c",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery_temperature_c",
+                "aggregation": "max"
+              },
+              {
+                "id": "final_temperature_c",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery_temperature_c",
+                "aggregation": "last"
+              }
+            ]
+          }
+        ]
+      }
     }
   },
   {
