@@ -32,17 +32,54 @@ pub async fn post_json(host: &str, port: u16, path: &str, body: &str) -> Result<
         .write_all(request.as_bytes())
         .await
         .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|e| anyhow!("HTTP request shutdown failed: {e}"))?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|e| anyhow!("failed reading HTTP response: {e}"))?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| anyhow!("failed reading HTTP response: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+        // Ollama may retain an HTTP/1.1 connection after sending its body. Do
+        // not wait for EOF once its framed response is complete.
+        if response_is_complete(&response) {
+            break;
+        }
+    }
     parse_response(&response)
+}
+
+fn response_is_complete(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(header) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let body = &response[header_end + 4..];
+    let chunked = header.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+        })
+    });
+    if chunked {
+        return body.windows(5).any(|window| window == b"0\r\n\r\n");
+    }
+    header
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .is_some_and(|length| body.len() >= length)
 }
 
 fn parse_response(response: &[u8]) -> Result<Response> {
@@ -110,7 +147,7 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response;
+    use super::{parse_response, response_is_complete};
 
     #[test]
     fn parses_plain_response() {
@@ -127,5 +164,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.body, "hello");
+    }
+
+    #[test]
+    fn detects_complete_framed_responses_without_eof() {
+        assert!(response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        ));
+        assert!(response_is_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        ));
+        assert!(!response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello"
+        ));
     }
 }

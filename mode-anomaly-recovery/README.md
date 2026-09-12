@@ -2,8 +2,8 @@
 
 `mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
 configured static nominal profiles locally and emits profile-backed commands.
-It contacts Ollama only when local evaluation leaves more than one actionable
-choice.
+For ambiguous choices it uses native Ollama `/api/chat` tool calling; model and
+local EDS work execute in a cancellable background job, never in SAFE callbacks.
 
 Profiles are selected by an exact `TelemetryFrame.source` match. Rule paths are
 dot-separated and relative to `TelemetryFrame.payload`; numeric path segments
@@ -82,7 +82,7 @@ any rule has eligible actions; actionless schema profiles are valid.
 | --- | --- |
 | `ollama_host` | `127.0.0.1` |
 | `ollama_port` | `11434` |
-| `ollama_path` | `/api/generate` |
+| `ollama_path` | `/api/chat` |
 | `model` | `mistral:7b` |
 | `request_timeout_ms` | `10000` |
 | `max_prompt_chars` | `3500` |
@@ -199,17 +199,25 @@ to use the canonical scoped ID.
 The advisor sends a plain HTTP `POST` to
 `http://<ollama_host>:<ollama_port><ollama_path>` with a JSON body containing:
 
-- `model`, `prompt`, and `stream: false`.
-- A strict JSON response schema requiring `anomaly_id`, `action_id`, `reason`,
-  and `evidence_paths`.
+- `model`, chat `messages`, native `tools`, and `stream: false`.
+- `run_eds_simulation`, which accepts only a configured scenario ID and its
+  configured bounded numeric parameters.
+- `select_recovery_action`, which may choose only a frozen candidate and one of
+  its eligible configured actions. Evidence is derived from that candidate.
 - `options.temperature` and `options.num_predict`.
 
-The response must contain a non-empty `response` string containing strict JSON.
-The selected anomaly ID, action ID, and evidence path must exactly match the
-configured candidates. HTTP errors, timeouts, malformed JSON, token-limit
-truncation, empty responses, oversized responses, and validation failures are
-retried up to `max_decision_attempts`. Parse and validation failures include a
-bounded repair-feedback prompt.
+The configured Ollama model must support native tool calls. Unsupported tools,
+parallel calls, extra or malformed arguments, HTTP failures, oversized payloads,
+timeouts, and exhausted turn/run budgets fail safely without a command.
+
+## Local EDS Scenarios
+
+`simulation` is optional. It names one trusted local `eds_path` and allow-listed
+scenarios. A scenario declares applicable nominal-rule IDs, allowed actions,
+duration, trusted constant or telemetry-derived patch bindings, optional bounded
+parameters, and compact numeric output metrics. The model never receives EDS
+paths, patches, raw frames, stdout, stderr, shell arguments, or filesystem paths.
+Each call creates an independent `SedaroSimulator` run. There is no cloud API.
 
 ## SAFE Integration
 
