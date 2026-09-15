@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use nalgebra::{UnitQuaternion, Vector3};
 use safe::protocol::AutonomyModeBoardState;
-use safe_telemetry::model::Telemetry;
+use safe::telemetry_frame::TelemetryFrame;
 
 use crate::config::CoorbitalEvasionModeConfig;
 
@@ -93,7 +93,7 @@ pub(crate) enum PlanningOutcome {
 
 pub(crate) struct CoorbitalEvasionMode {
     pub(crate) config: CoorbitalEvasionModeConfig,
-    pub(crate) latest_telemetry: Option<Telemetry>,
+    pub(crate) latest_telemetry: Option<TelemetryFrame>,
     pub(crate) latest_board_snapshot: AutonomyModeBoardState,
     pub(crate) has_board_snapshot: bool,
     pub(crate) last_replan_start: Option<Instant>,

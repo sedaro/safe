@@ -1,20 +1,39 @@
+use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 use safe::protocol::{Command, TimedCommand};
+use safe::telemetry_frame::TelemetryFrame;
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
 use safe_sim::{EdsFrame, EdsPatch, SimulationResult};
-use safe_telemetry::augmented::AugmentedTelemetry;
-use safe_telemetry::model::Telemetry;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as ProcessCommand;
 
+use crate::planning::threat_is_within_range;
 use crate::types::{
-    EdsPointingSchedule, CoorbitalEvasionMode, GeometrySample, ModeScheduleEntry, PointingTarget,
+    CoorbitalEvasionMode, EdsPointingSchedule, GeometrySample, ModeScheduleEntry, PointingTarget,
     QuaternionScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport,
 };
 
 const POINTING_MODE_SCHEDULE_TYPE: &str = "[(f64, str)]";
 const POINTING_QUATERNION_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64, f64))]";
+
+/// Wire-compatible with the gatekeeper input adapter contract without making
+/// this autonomy mode depend on an adapter implementation.
+#[derive(Debug, Clone, Serialize)]
+struct SimulationInputRequest {
+    telemetry: TelemetryFrame,
+    commands: Vec<TimedCommand>,
+    config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SimulationInput {
+    pub(crate) start_time_mjd: f64,
+    pub(crate) patches: Vec<EdsPatch>,
+}
 
 impl CoorbitalEvasionMode {
     fn add_command_to_schedule(
@@ -188,8 +207,7 @@ impl CoorbitalEvasionMode {
         schedule
     }
 
-    fn base_patches(&self, telemetry: &Telemetry) -> Vec<EdsPatch> {
-        let augmented = AugmentedTelemetry::from(telemetry);
+    fn mode_patches(&self) -> Vec<EdsPatch> {
         let mut patches = vec![
             EdsPatch::new(
                 &self.config.agent_id,
@@ -220,50 +238,6 @@ impl CoorbitalEvasionMode {
                     "({:.6}, {:.6})",
                     self.config.power_time_step_limits.0, self.config.power_time_step_limits.1
                 ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.position",
-                "eci",
-                &format!(
-                    "[{:.3}, {:.3}, {:.3}]",
-                    augmented.telemetry.adcs_tlm.fulldata.position_x_km,
-                    augmented.telemetry.adcs_tlm.fulldata.position_y_km,
-                    augmented.telemetry.adcs_tlm.fulldata.position_z_km
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.velocity",
-                "eci",
-                &format!(
-                    "[{:.6}, {:.6}, {:.6}]",
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_x_m_s / 1000.0,
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_y_m_s / 1000.0,
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_z_m_s / 1000.0
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.attitude",
-                "body_eci",
-                &format!(
-                    "[{:.9}, {:.9}, {:.9}, {:.9}]",
-                    augmented.attitude_x,
-                    augmented.attitude_y,
-                    augmented.attitude_z,
-                    augmented.attitude_w
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.idealized_pointing",
-                "bool",
-                "false",
             ),
         ];
 
@@ -318,7 +292,66 @@ impl CoorbitalEvasionMode {
         patches
     }
 
-    fn frames_for_result<'a>(&self, result: &'a SimulationResult) -> anyhow::Result<&'a [EdsFrame]> {
+    pub(crate) async fn simulation_input(
+        &self,
+        telemetry: &TelemetryFrame,
+    ) -> anyhow::Result<SimulationInput> {
+        let (executable, args) = self
+            .config
+            .input_adapter_command
+            .split_first()
+            .context("input_adapter_command is empty")?;
+        let mut child = ProcessCommand::new(executable)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start simulation input adapter '{executable}'"))?;
+        let request = SimulationInputRequest {
+            telemetry: telemetry.clone(),
+            commands: Vec::new(),
+            config: self.config.input_adapter_config.clone(),
+        };
+        let mut stdin = child.stdin.take().context("input adapter has no stdin")?;
+        stdin.write_all(&serde_json::to_vec(&request)?).await?;
+        stdin.write_all(b"\n").await?;
+        drop(stdin);
+        let output = tokio::time::timeout(
+            Duration::from_secs(self.config.input_adapter_timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "simulation input adapter timed out after {} seconds",
+                self.config.input_adapter_timeout_secs
+            )
+        })??;
+        if !output.status.success() {
+            bail!(
+                "simulation input adapter failed (code={:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let input: SimulationInput = serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "simulation input adapter returned invalid JSON: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )
+        })?;
+        if !input.start_time_mjd.is_finite() {
+            bail!("simulation input adapter returned a non-finite start_time_mjd");
+        }
+        Ok(input)
+    }
+
+    fn frames_for_result<'a>(
+        &self,
+        result: &'a SimulationResult,
+    ) -> anyhow::Result<&'a [EdsFrame]> {
         if !result.success {
             anyhow::bail!(
                 "simulation failed (code={:?}): {}",
@@ -459,12 +492,12 @@ impl CoorbitalEvasionMode {
 
     pub(crate) async fn run_geometry_simulation(
         &self,
-        telemetry: &Telemetry,
+        input: &SimulationInput,
         schedule: &EdsPointingSchedule,
     ) -> anyhow::Result<Vec<GeometrySample>> {
-        let sim_start_mjd = gps_to_utc_mjd(telemetry.onboard_time_ms as f64 / 1_000.0)
-            .context("could not convert telemetry onboard time to simulation epoch")?;
-        let mut patches = self.base_patches(telemetry);
+        let sim_start_mjd = input.start_time_mjd;
+        let mut patches = input.patches.clone();
+        patches.extend(self.mode_patches());
         patches.push(EdsPatch::new(
             &self.config.agent_id,
             &self.config.schedule_patch_engine,
@@ -516,7 +549,10 @@ impl CoorbitalEvasionMode {
             let sample = &samples[index];
             let mut exposed = false;
             for (threat_index, threat) in sample.threats.iter().enumerate() {
-                if threat.line_of_sight && threat.in_field_of_view {
+                if threat_is_within_range(threat, self.config.threat_max_range_km)
+                    && threat.line_of_sight
+                    && threat.in_field_of_view
+                {
                     exposed = true;
                     let id = &self.config.threat_ids[threat_index];
                     if !report.exposed_threat_ids.contains(id) {
@@ -550,7 +586,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-
     #[test]
     fn accepted_mixed_schedule_preserves_latest_pre_epoch_target() {
         let start = 60_000.0;
@@ -662,5 +697,30 @@ mod tests {
             vec![(1.0, "sun".to_string()), (1.5, mode.config.nadir_mode_id)]
         );
         assert!(result.quaternion_schedule.is_empty());
+    }
+
+    #[test]
+    fn validation_ignores_threats_beyond_max_range() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_ids = vec!["threat".to_string()];
+        mode.config.threat_max_range_km = 9.0;
+        let samples = (0..=1)
+            .map(|index| GeometrySample {
+                time_mjd: 60_000.0 + index as f64 / SECONDS_PER_DAY,
+                position_eci: Vector3::z(),
+                velocity_eci: Vector3::y(),
+                attitude_body_to_eci: UnitQuaternion::identity(),
+                boresight_eci: Vector3::z(),
+                threats: vec![ThreatGeometry {
+                    relative_position_eci: -10.0 * Vector3::z(),
+                    line_of_sight: true,
+                    in_field_of_view: true,
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let report = mode.validation_report(&samples, 60_000.0, 30_f64.to_radians());
+        assert_eq!(report.score.exposure_secs, 0.0);
+        assert!(report.exposed_threat_ids.is_empty());
     }
 }
