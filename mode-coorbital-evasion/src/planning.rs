@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 
 use anyhow::Context;
 use nalgebra::{Matrix3, Quaternion, Rotation3, Unit, UnitQuaternion, Vector3};
-use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
-use safe_telemetry::model::Telemetry;
+use safe::telemetry_frame::TelemetryFrame;
+use safe::utils::SECONDS_PER_DAY;
 
 use crate::types::{
     CoorbitalEvasionMode, CoorbitalEvasionPlan, GeometrySample, ModelCommand, ModeledTarget,
@@ -211,9 +211,7 @@ fn fixed_window_boresight(
         let mut worst: Option<(f64, Vector3<f64>)> = None;
         for sample in &samples[first..=last] {
             for threat in &sample.threats {
-                if !threat_is_within_range(threat, max_range_km)
-                    || !threat.line_of_sight
-                {
+                if !threat_is_within_range(threat, max_range_km) || !threat.line_of_sight {
                     continue;
                 }
                 let threat_direction = threat_los_direction(&threat.relative_position_eci);
@@ -602,6 +600,35 @@ fn lift_commands(samples: &[GeometrySample], commands: &[ModelCommand]) -> Vec<S
 
 impl CoorbitalEvasionMode {
     fn validate_config(&self) -> anyhow::Result<()> {
+        if self.config.eds_path.as_os_str().is_empty() {
+            anyhow::bail!("mode_config.eds_path must be configured");
+        }
+        if self.config.input_adapter_command.is_empty()
+            || self.config.input_adapter_command[0].trim().is_empty()
+        {
+            anyhow::bail!("mode_config.input_adapter_command must contain an executable");
+        }
+        if self.config.input_adapter_timeout_secs == 0 || self.config.simulation_timeout_secs == 0 {
+            anyhow::bail!("adapter and simulation timeouts must be greater than zero");
+        }
+        for (name, value) in [
+            ("agent_id", &self.config.agent_id),
+            ("field_of_view_id", &self.config.field_of_view_id),
+            (
+                "pointing_mode_schedule_field",
+                &self.config.pointing_mode_schedule_field,
+            ),
+            (
+                "pointing_quaternion_schedule_field",
+                &self.config.pointing_quaternion_schedule_field,
+            ),
+            ("nadir_mode_id", &self.config.nadir_mode_id),
+            ("sun_yaw_mode_id", &self.config.sun_yaw_mode_id),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("mode_config.{name} must be configured");
+            }
+        }
         if self.config.threat_ids.is_empty() {
             anyhow::bail!("mode_config.threat_ids must contain at least one threat ID");
         }
@@ -611,8 +638,7 @@ impl CoorbitalEvasionMode {
         if self.config.max_slew_rate_rad_s <= 0.0 {
             anyhow::bail!("mode_config.max_slew_rate_rad_s must be greater than zero");
         }
-        if self.config.threat_max_range_km.is_nan() || self.config.threat_max_range_km < 0.0
-        {
+        if self.config.threat_max_range_km.is_nan() || self.config.threat_max_range_km < 0.0 {
             anyhow::bail!("mode_config.threat_max_range_km must be non-negative");
         }
         Ok(())
@@ -620,11 +646,11 @@ impl CoorbitalEvasionMode {
 
     pub(crate) async fn build_plan(
         &self,
-        telemetry: &Telemetry,
+        telemetry: &TelemetryFrame,
     ) -> anyhow::Result<PlanningOutcome> {
         self.validate_config()?;
-        let sim_start_mjd = gps_to_utc_mjd(telemetry.onboard_time_ms as f64 / 1_000.0)
-            .context("could not convert telemetry onboard time to simulation epoch")?;
+        let input = self.simulation_input(telemetry).await?;
+        let sim_start_mjd = input.start_time_mjd;
         let horizon_end_mjd = sim_start_mjd + self.config.sim_duration_days;
         let command_time_mjd = sim_start_mjd + self.config.command_lead_secs / SECONDS_PER_DAY;
         if command_time_mjd >= horizon_end_mjd {
@@ -633,7 +659,7 @@ impl CoorbitalEvasionMode {
 
         let accepted_schedule = self.accepted_pointing_schedule(sim_start_mjd, horizon_end_mjd);
         let baseline = self
-            .run_geometry_simulation(telemetry, &accepted_schedule)
+            .run_geometry_simulation(&input, &accepted_schedule)
             .await
             .context("failed to simulate accepted pointing schedule")?;
         let earliest = baseline
@@ -762,7 +788,7 @@ impl CoorbitalEvasionMode {
             &commands,
         );
         let validated_samples = self
-            .run_geometry_simulation(telemetry, &selected_schedule)
+            .run_geometry_simulation(&input, &selected_schedule)
             .await
             .context("failed to validate selected pointing schedule")?;
         let validation = self.validation_report(
