@@ -22,6 +22,11 @@ Planning performs two simulations:
    schedule. EDS must succeed and every `validation_checks` entry must pass
    before any candidate command is emitted.
 
+When `monte_carlo` is configured, the candidate schedule is also run once for
+each sample through `safe_sim::MonteCarloStudy` before emission. Every sample
+must satisfy the same `validation_checks`; the mode rejects the plan unless the configured
+`minimum_pass_fraction` passes. Samples execute sequentially.
+
 Priority is deterministic:
 
 1. State of charge at or below `low_power_state_of_charge` selects
@@ -91,7 +96,24 @@ This illustrative mode configuration intentionally uses placeholders:
       "op": "gte",
       "threshold": 0.0
     }
-  ]
+  ],
+  "monte_carlo": {
+    "samples": 20,
+    "seed": 42,
+    "minimum_pass_fraction": 0.95,
+    "parameters": [
+      {
+        "name": "capture_power_draw_w",
+        "target": {
+          "agent_id": "spacecraft",
+          "engine": "power",
+          "field": "payload.capture_power_draw_w",
+          "type_": "f64"
+        },
+        "distribution": { "Normal": { "mean": 20.0, "std_dev": 3.0 } }
+      }
+    ]
+  }
 }
 ```
 
@@ -103,6 +125,16 @@ The result file must contain every configured field in each planning sample.
 FoV fields are booleans. Time, state of charge, station elevation, and
 validation fields are floating-point values. Transition times use simulation
 sample timestamps rather than interpolation.
+
+`monte_carlo.parameters` are the native `safe_sim::MonteCarloParameter` type.
+They apply sampled replacement patches in addition to the schedule patches
+produced by the adapter. The native distributions are `Normal`, `Uniform`,
+`LogNormal`, `Triangular`, and `Discrete`.
+
+Parameters must not target a patch already returned by the input adapter.
+`MonteCarloStudy` appends its sampled patches and cannot safely replace or
+offset adapter-provided values. Relative perturbations and bounded resampling
+would need to be added to `safe-sim`, then shared with the gatekeeper.
 
 ## Verification
 

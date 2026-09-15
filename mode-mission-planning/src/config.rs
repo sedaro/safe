@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
+use safe_sim::MonteCarloParameter;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -76,6 +77,17 @@ pub(crate) struct FieldCheck {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MonteCarloConfig {
+    pub(crate) samples: usize,
+    #[serde(default)]
+    pub(crate) seed: u64,
+    #[serde(default = "default_minimum_pass_fraction")]
+    pub(crate) minimum_pass_fraction: f64,
+    pub(crate) parameters: Vec<MonteCarloParameter>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MissionPlanningConfig {
     pub(crate) eds_path: PathBuf,
     pub(crate) input_adapter_command: Vec<String>,
@@ -110,6 +122,8 @@ pub(crate) struct MissionPlanningConfig {
     pub(crate) ground_stations: Vec<GroundStationConfig>,
     #[serde(default)]
     pub(crate) validation_checks: Vec<FieldCheck>,
+    #[serde(default)]
+    pub(crate) monte_carlo: Option<MonteCarloConfig>,
 }
 
 impl Default for MissionPlanningConfig {
@@ -136,6 +150,7 @@ impl Default for MissionPlanningConfig {
             targets: Vec::new(),
             ground_stations: Vec::new(),
             validation_checks: Vec::new(),
+            monte_carlo: None,
         }
     }
 }
@@ -222,8 +237,24 @@ impl MissionPlanningConfig {
                 bail!("validation check values must be finite and tolerance non-negative");
             }
         }
+        if let Some(monte_carlo) = &self.monte_carlo {
+            validate_monte_carlo(monte_carlo)?;
+        }
         Ok(())
     }
+}
+
+fn validate_monte_carlo(config: &MonteCarloConfig) -> Result<()> {
+    if config.samples == 0 || config.parameters.is_empty() {
+        bail!("monte_carlo requires samples and parameters");
+    }
+    if !config.minimum_pass_fraction.is_finite()
+        || !(0.0..=1.0).contains(&config.minimum_pass_fraction)
+        || config.minimum_pass_fraction == 0.0
+    {
+        bail!("monte_carlo minimum_pass_fraction must be in (0, 1]");
+    }
+    Ok(())
 }
 
 fn validate_pointing(pointing: &PointingConfig) -> Result<()> {
@@ -318,6 +349,9 @@ fn default_time_field() -> String {
 }
 fn default_check_tolerance() -> f64 {
     1.0e-9
+}
+fn default_minimum_pass_fraction() -> f64 {
+    1.0
 }
 
 #[cfg(test)]
