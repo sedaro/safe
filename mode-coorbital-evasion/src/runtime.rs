@@ -8,13 +8,11 @@ use safe::protocol::{
 };
 use safe::telemetry_frame::TelemetryFrame;
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd, utc_mjd_to_gps};
-use safe_telemetry::model::Telemetry;
 use tracing::{debug, info, warn};
 
 use crate::config::CoorbitalEvasionModeConfig;
 use crate::types::{
-    CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget,
-    ScheduledPointing,
+    CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget, ScheduledPointing,
 };
 
 impl CoorbitalEvasionMode {
@@ -193,7 +191,7 @@ impl CoorbitalEvasionMode {
     async fn maybe_plan(
         &mut self,
         runtime: &mut ModeRuntime,
-        telemetry: &Telemetry,
+        telemetry: &TelemetryFrame,
     ) -> anyhow::Result<()> {
         if self.config.threat_ids.is_empty() {
             return Ok(());
@@ -228,18 +226,24 @@ impl CoorbitalEvasionMode {
         if self.config.eds_path.as_os_str().is_empty() {
             warn!("CoorbitalEvasion mode_config.eds_path is not configured; simulation disabled");
         }
+        if self.config.input_adapter_command.is_empty() {
+            warn!(
+                "CoorbitalEvasion mode_config.input_adapter_command is not configured; simulation disabled"
+            );
+        }
+        if self.config.agent_id.is_empty() {
+            warn!("CoorbitalEvasion mode_config.agent_id is empty");
+        }
         if self.config.field_of_view_id.is_empty() {
             warn!("CoorbitalEvasion mode_config.field_of_view_id is empty");
         }
         if self.config.threat_ids.is_empty() {
-            warn!(
-                "CoorbitalEvasion mode_config.threat_ids is empty; no threats will be evaluated"
-            );
+            warn!("CoorbitalEvasion mode_config.threat_ids is empty; no threats will be evaluated");
         }
         self.warned_missing_config = true;
     }
 
-    async fn replan_if_ready(&mut self, runtime: &mut ModeRuntime, telemetry: &Telemetry) {
+    async fn replan_if_ready(&mut self, runtime: &mut ModeRuntime, telemetry: &TelemetryFrame) {
         if !self.can_replan_now() {
             return;
         }
@@ -278,17 +282,10 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         frame: TelemetryFrame,
     ) -> anyhow::Result<()> {
-        let telemetry = match frame.decode_payload::<Telemetry>() {
-            Ok(telemetry) => telemetry,
-            Err(error) => {
-                warn!("coorbital-evasion received incompatible telemetry: {error}");
-                return Ok(());
-            }
-        };
-        self.latest_telemetry = Some(telemetry.clone());
+        self.latest_telemetry = Some(frame.clone());
         if runtime.is_active() && self.has_board_snapshot {
             self.warn_missing_config_once();
-            self.replan_if_ready(runtime, &telemetry).await;
+            self.replan_if_ready(runtime, &frame).await;
         }
         Ok(())
     }

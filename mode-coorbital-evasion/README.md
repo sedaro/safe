@@ -2,6 +2,46 @@
 
 This document describes the co-orbital threat evasion autonomy mode. The mode commands spacecraft attitude to minimize exposure to known threats while maintaining alignment with Nadir. It uses a satellite EDS for simulation, planning, and validation.
 
+## Telemetry Adapter
+
+The mode retains `TelemetryFrame` without decoding its payload. Before planning,
+it invokes `input_adapter_command` once and sends this JSON object to its stdin:
+
+```json
+{
+  "telemetry": {"source":"example-source","ts_mono":42,"payload":"{}"},
+  "commands": [],
+  "config": {}
+}
+```
+
+The adapter returns the simulation epoch and EDS initialization patches:
+
+```json
+{
+  "start_time_mjd": 60000.0,
+  "patches": [
+    {
+      "agent_id": "agent-id",
+      "engine": "gnc",
+      "field": "root!.position",
+      "type_": "eci",
+      "value": "[7000.0, 0.0, 0.0]"
+    }
+  ]
+}
+```
+
+The adapter owns telemetry decoding, epoch derivation, units, and spacecraft
+state projection. The mode adds only its configured threat, time-step, and
+pointing-schedule patches. Adapter logs must go to stderr because stdout is
+reserved for its JSON response.
+
+`input_adapter_config` is opaque JSON forwarded to the adapter. Configure all
+EDS identifiers, including `agent_id`, `field_of_view_id`, pointing schedule
+fields, and pointing-mode IDs, per deployment. The defaults intentionally
+contain no deployment identifiers.
+
 ## Current Implementation
 
 The implementation identifies sampled periods where Nadir would expose configured threats. For each period it solves for one fixed body-to-ECI boresight that satisfies every visible threat/sample constraint, schedules the latest reachable slew, and compares direct transitions with transitions through Nadir.
@@ -136,6 +176,9 @@ Positive `c_i` is outside the physical FOV, zero is on its boundary, and negativ
 ## Autonomy Mode Configurable Parameters
 
 - `eds_path`: path to the EDS executable
+- `input_adapter_command`: command and arguments for the external telemetry-to-EDS adapter
+- `input_adapter_config`: opaque JSON passed to the adapter
+- `input_adapter_timeout_secs`: maximum time to wait for the adapter
 - `gnc_time_step_limits`: minimum and maximum time step for the GNC engine in seconds
 - `cdh_time_step_limits`: minimum and maximum time step for the CDH engine in seconds
 - `power_time_step_limits`: minimum and maximum time step for the Power engine in seconds
