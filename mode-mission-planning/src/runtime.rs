@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::config::MissionPlanningConfig;
 use crate::planning::build_plan;
-use crate::simulation::{extract_planning_samples, run_schedule, validate_result};
+use crate::simulation::{extract_planning_samples, run_schedule, validate_candidate_schedule};
 
 #[derive(Default)]
 pub(crate) struct MissionPlanningMode {
@@ -113,10 +113,9 @@ impl MissionPlanningMode {
             execution_time(left, current_gps_time)
                 .total_cmp(&execution_time(right, current_gps_time))
         });
-        let (_, validation_result) = run_schedule(&self.config, telemetry, validation_schedule)
+        validate_candidate_schedule(&self.config, telemetry, validation_schedule)
             .await
-            .context("candidate-command simulation")?;
-        validate_result(&self.config, &validation_result)?;
+            .context("candidate-command Monte Carlo validation")?;
 
         let command_count = candidates.len();
         for command in candidates {

@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use safe::protocol::TimedCommand;
 use safe::telemetry_frame::TelemetryFrame;
-use safe_sim::{EdsFrame, EdsPatch, SedaroSimulator, SimulationResult};
+use safe_sim::{EdsFrame, EdsPatch, MonteCarloStudy, SedaroSimulator, SimulationResult};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -33,12 +34,98 @@ pub(crate) async fn run_schedule(
     commands: Vec<TimedCommand>,
 ) -> Result<(f64, SimulationResult)> {
     let input = invoke_adapter(config, telemetry, commands).await?;
+    let result = run_patches(config, input.start_time_mjd, input.patches).await?;
+    Ok((input.start_time_mjd, result))
+}
+
+/// Runs the nominal and configured uncertainty simulations for a proposed schedule.
+pub(crate) async fn validate_candidate_schedule(
+    config: &MissionPlanningConfig,
+    telemetry: &TelemetryFrame,
+    commands: Vec<TimedCommand>,
+) -> Result<()> {
+    let input = invoke_adapter(config, telemetry, commands).await?;
     if !input.start_time_mjd.is_finite() {
         bail!("simulation input adapter returned a non-finite start_time_mjd");
     }
+    let nominal = run_patches(config, input.start_time_mjd, input.patches.clone())
+        .await
+        .context("candidate-command simulation")?;
+    validate_result(config, &nominal)?;
+    let Some(monte_carlo) = &config.monte_carlo else {
+        return Ok(());
+    };
+    reject_conflicting_monte_carlo_targets(&input.patches, monte_carlo)?;
     let simulator = SedaroSimulator::new(&config.eds_path)
         .at_epoch(input.start_time_mjd)
         .patch_multi(input.patches)
+        .timeout(Duration::from_secs(config.simulation_timeout_secs));
+    let mut study = MonteCarloStudy::new(
+        simulator,
+        config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY,
+    )
+    .samples(monte_carlo.samples)
+    .seed(monte_carlo.seed);
+    for parameter in &monte_carlo.parameters {
+        study = study.parameter(parameter.clone());
+    }
+    let study_result = study.run().await.context("monte_carlo study execution")?;
+    let mut passed = 0;
+    let mut failures = Vec::new();
+    for run in study_result.runs {
+        let id = run.case.id.clone();
+        if !run.succeeded() {
+            failures.push(format!("{id}: EDS simulation failed"));
+        } else if let Some(result) = run.simulation_result() {
+            match validate_result(config, result) {
+                Ok(()) => passed += 1,
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+    }
+    let fraction = passed as f64 / monte_carlo.samples as f64;
+    if fraction < monte_carlo.minimum_pass_fraction {
+        bail!(
+            "monte_carlo rejected candidate: {passed}/{} samples passed ({fraction:.3}, required {:.3}); failures [{}]",
+            monte_carlo.samples,
+            monte_carlo.minimum_pass_fraction,
+            failures.into_iter().take(5).collect::<Vec<_>>().join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn reject_conflicting_monte_carlo_targets(
+    baseline_patches: &[EdsPatch],
+    monte_carlo: &crate::config::MonteCarloConfig,
+) -> Result<()> {
+    let baseline_targets = baseline_patches
+        .iter()
+        .map(|patch| (&patch.agent_id, &patch.engine, &patch.field))
+        .collect::<HashSet<_>>();
+    for parameter in &monte_carlo.parameters {
+        let target = &parameter.target;
+        if baseline_targets.contains(&(&target.agent_id, &target.engine, &target.field)) {
+            bail!(
+                "monte_carlo parameter '{}' targets an adapter patch; safe_sim::MonteCarloStudy cannot replace adapter-produced patches",
+                parameter.name
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_patches(
+    config: &MissionPlanningConfig,
+    start_time_mjd: f64,
+    patches: Vec<EdsPatch>,
+) -> Result<SimulationResult> {
+    if !start_time_mjd.is_finite() {
+        bail!("simulation input adapter returned a non-finite start_time_mjd");
+    }
+    let simulator = SedaroSimulator::new(&config.eds_path)
+        .at_epoch(start_time_mjd)
+        .patch_multi(patches)
         .timeout(Duration::from_secs(config.simulation_timeout_secs));
     let result = simulator
         .run_collect(config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY)
@@ -51,7 +138,7 @@ pub(crate) async fn run_schedule(
             result.stderr.trim()
         );
     }
-    Ok((input.start_time_mjd, result))
+    Ok(result)
 }
 
 async fn invoke_adapter(

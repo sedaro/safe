@@ -100,7 +100,24 @@
           "op": "gte",
           "threshold": 0.0
         }
-      ]
+      ],
+      "monte_carlo": {
+        "samples": 20,
+        "seed": 42,
+        "minimum_pass_fraction": 0.95,
+        "parameters": [
+          {
+            "name": "capture_power_draw_w",
+            "target": {
+              "agent_id": "spacecraft",
+              "engine": "power",
+              "field": "payload.capture_power_draw_w",
+              "type_": "f64"
+            },
+            "distribution": { "Normal": { "mean": 20.0, "std_dev": 3.0 } }
+          }
+        ]
+      }
     }
   },
   {
