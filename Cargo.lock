@@ -1074,6 +1074,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mode-coorbital-evasion"
+version = "1.2.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nalgebra",
+ "safe",
+ "safe-sim",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "mode-mission-planning"
 version = "1.2.3"
 dependencies = [
