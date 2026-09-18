@@ -8,6 +8,7 @@ use safe::telemetry_frame::TelemetryFrame;
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
 use safe_sim::{EdsFrame, EdsPatch, SimulationResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as ProcessCommand;
 
@@ -19,6 +20,23 @@ use crate::types::{
 
 const POINTING_MODE_SCHEDULE_TYPE: &str = "[(f64, str)]";
 const POINTING_QUATERNION_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64, f64))]";
+
+fn telemetry_vec3(value: &Value) -> anyhow::Result<[f64; 3]> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 3)
+        .context("must be a three-element numeric array")?;
+    let values = values
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .context("contains a non-finite value")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok([values[0], values[1], values[2]])
+}
 
 /// Wire-compatible with the gatekeeper input adapter contract without making
 /// this autonomy mode depend on an adapter implementation.
@@ -207,7 +225,7 @@ impl CoorbitalEvasionMode {
         schedule
     }
 
-    fn mode_patches(&self) -> Vec<EdsPatch> {
+    fn mode_patches(&self, telemetry: &TelemetryFrame) -> anyhow::Result<Vec<EdsPatch>> {
         let mut patches = vec![
             EdsPatch::new(
                 &self.config.agent_id,
@@ -241,55 +259,99 @@ impl CoorbitalEvasionMode {
             ),
         ];
 
-        for (id, [latitude_deg, longitude_deg, altitude_km]) in &self.config.ground_threat_locations
-        {
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.latitude_deg"),
-                "deg",
-                &latitude_deg.to_string(),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.longitude_deg"),
-                "deg",
-                &longitude_deg.to_string(),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.altitude_km"),
-                "f64",
-                &altitude_km.to_string(),
-            ));
+        let augmented = telemetry
+            .payload
+            .get("augmented")
+            .and_then(Value::as_object)
+            .context("telemetry is missing object payload.augmented")?;
+        let ground = augmented
+            .get("ground_threat_locations")
+            .and_then(Value::as_object);
+        let space = augmented
+            .get("space_threat_epoch_states")
+            .and_then(Value::as_object);
+
+        for id in &self.config.threat_ids {
+            match (
+                ground.and_then(|locations| locations.get(id)),
+                space.and_then(|states| states.get(id)),
+            ) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "telemetry provides both ground and space state for threat '{id}'"
+                ),
+                (Some(location), None) => {
+                    let [latitude_deg, longitude_deg, altitude_km] = telemetry_vec3(location)
+                        .with_context(|| format!("ground threat '{id}'"))?;
+                    if !(-90.0..=90.0).contains(&latitude_deg)
+                        || !(-180.0..=180.0).contains(&longitude_deg)
+                    {
+                        anyhow::bail!("ground threat '{id}' has an invalid latitude or longitude");
+                    }
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.latitude_deg"),
+                        "deg",
+                        &latitude_deg.to_string(),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.longitude_deg"),
+                        "deg",
+                        &longitude_deg.to_string(),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.altitude_km"),
+                        "f64",
+                        &altitude_km.to_string(),
+                    ));
+                }
+                (None, Some(state)) => {
+                    let state = state
+                        .as_array()
+                        .filter(|state| state.len() == 3)
+                        .with_context(|| {
+                            format!("space threat '{id}' must be [epoch_mjd, position, velocity]")
+                        })?;
+                    let epoch_mjd = state[0]
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .with_context(|| format!("space threat '{id}' has an invalid epoch"))?;
+                    let position = telemetry_vec3(&state[1])
+                        .with_context(|| format!("space threat '{id}' position"))?;
+                    let velocity = telemetry_vec3(&state[2])
+                        .with_context(|| format!("space threat '{id}' velocity"))?;
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_mjd"),
+                        "f64",
+                        &epoch_mjd.to_string(),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_position"),
+                        "eci",
+                        &format!("[{}, {}, {}]", position[0], position[1], position[2]),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_velocity"),
+                        "#[f64; 3]",
+                        &format!("[{}, {}, {}]", velocity[0], velocity[1], velocity[2]),
+                    ));
+                }
+                (None, None) => {
+                    anyhow::bail!("telemetry is missing state for configured threat '{id}'")
+                }
+            }
         }
-        // Space-threat altitude is derived by the EDS coordinate state manager, not an init field.
-        for (id, (epoch_mjd, position, velocity)) in &self.config.space_threat_epoch_states {
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_mjd"),
-                "f64",
-                &epoch_mjd.to_string(),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_position"),
-                "eci",
-                &format!("[{}, {}, {}]", position[0], position[1], position[2]),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_velocity"),
-                "#[f64; 3]",
-                &format!("[{}, {}, {}]", velocity[0], velocity[1], velocity[2]),
-            ));
-        }
-        patches
+        Ok(patches)
     }
 
     pub(crate) async fn simulation_input(
@@ -494,10 +556,11 @@ impl CoorbitalEvasionMode {
         &self,
         input: &SimulationInput,
         schedule: &EdsPointingSchedule,
+        telemetry: &TelemetryFrame,
     ) -> anyhow::Result<Vec<GeometrySample>> {
         let sim_start_mjd = input.start_time_mjd;
         let mut patches = input.patches.clone();
-        patches.extend(self.mode_patches());
+        patches.extend(self.mode_patches(telemetry)?);
         patches.push(EdsPatch::new(
             &self.config.agent_id,
             &self.config.schedule_patch_engine,
@@ -582,10 +645,84 @@ impl CoorbitalEvasionMode {
 #[cfg(test)]
 mod tests {
     use safe::protocol::{AutonomyModeBoardState, AutonomyModeId, BoardCmdId};
+    use safe::telemetry_frame::TelemetryFrame;
     use safe::utils::utc_mjd_to_gps;
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn mode_patches_use_ground_threat_state_from_telemetry() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_ids = vec!["ground-threat".to_string()];
+        let telemetry = TelemetryFrame::new(serde_json::json!({
+            "augmented": {
+                "ground_threat_locations": {
+                    "ground-threat": [-23.0, -67.0, 0.5]
+                }
+            }
+        }));
+
+        let patches = mode.mode_patches(&telemetry).unwrap();
+
+        assert!(
+            patches.iter().any(|patch| {
+                patch.field == "ground-threat.latitude_deg" && patch.value == "-23"
+            })
+        );
+        assert!(
+            patches.iter().any(|patch| {
+                patch.field == "ground-threat.longitude_deg" && patch.value == "-67"
+            })
+        );
+        assert!(
+            patches.iter().any(|patch| {
+                patch.field == "ground-threat.altitude_km" && patch.value == "0.5"
+            })
+        );
+    }
+
+    #[test]
+    fn mode_patches_use_space_threat_state_from_telemetry() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_ids = vec!["space-threat".to_string()];
+        let telemetry = TelemetryFrame::new(serde_json::json!({
+            "augmented": {
+                "space_threat_epoch_states": {
+                    "space-threat": [60000.0, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+                }
+            }
+        }));
+
+        let patches = mode.mode_patches(&telemetry).unwrap();
+
+        assert!(
+            patches
+                .iter()
+                .any(|patch| { patch.field == "space-threat.epoch_mjd" && patch.value == "60000" })
+        );
+        assert!(patches.iter().any(|patch| {
+            patch.field == "space-threat.epoch_position" && patch.value == "[1, 2, 3]"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "space-threat.epoch_velocity" && patch.value == "[4, 5, 6]"
+        }));
+    }
+
+    #[test]
+    fn mode_patches_reject_missing_configured_threat_state() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_ids = vec!["missing-threat".to_string()];
+        let telemetry = TelemetryFrame::new(serde_json::json!({"augmented": {}}));
+
+        assert!(
+            mode.mode_patches(&telemetry)
+                .unwrap_err()
+                .to_string()
+                .contains("missing state for configured threat 'missing-threat'")
+        );
+    }
+
     #[test]
     fn accepted_mixed_schedule_preserves_latest_pre_epoch_target() {
         let start = 60_000.0;

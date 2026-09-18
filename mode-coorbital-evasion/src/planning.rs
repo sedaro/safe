@@ -659,7 +659,7 @@ impl CoorbitalEvasionMode {
 
         let accepted_schedule = self.accepted_pointing_schedule(sim_start_mjd, horizon_end_mjd);
         let baseline = self
-            .run_geometry_simulation(&input, &accepted_schedule)
+            .run_geometry_simulation(&input, &accepted_schedule, telemetry)
             .await
             .context("failed to simulate accepted pointing schedule")?;
         let earliest = baseline
@@ -788,7 +788,7 @@ impl CoorbitalEvasionMode {
             &commands,
         );
         let validated_samples = self
-            .run_geometry_simulation(&input, &selected_schedule)
+            .run_geometry_simulation(&input, &selected_schedule, telemetry)
             .await
             .context("failed to validate selected pointing schedule")?;
         let validation = self.validation_report(

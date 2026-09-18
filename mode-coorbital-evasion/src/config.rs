@@ -1,12 +1,6 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-
-/// `[latitude_deg, longitude_deg, altitude_km]`.
-pub(crate) type GroundThreatLocation = [f64; 3];
-/// `(epoch_mjd, position_km_eci, velocity_km_s_eci)`.
-pub(crate) type SpaceThreatEpochState = (f64, [f64; 3], [f64; 3]);
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CoorbitalEvasionModeConfig {
@@ -44,10 +38,6 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     /// Maximum threat range to consider, in kilometers.
     #[serde(default = "default_threat_max_range_km")]
     pub(crate) threat_max_range_km: f64,
-    #[serde(default)]
-    pub(crate) ground_threat_locations: BTreeMap<String, GroundThreatLocation>,
-    #[serde(default)]
-    pub(crate) space_threat_epoch_states: BTreeMap<String, SpaceThreatEpochState>,
     /// Physical circular FOV half-angle in degrees.
     #[serde(default = "default_fov_half_angle_deg")]
     pub(crate) fov_half_angle_deg: f64,
@@ -108,8 +98,6 @@ impl Default for CoorbitalEvasionModeConfig {
             field_of_view_id: default_field_of_view_id(),
             threat_ids: Vec::new(),
             threat_max_range_km: default_threat_max_range_km(),
-            ground_threat_locations: BTreeMap::new(),
-            space_threat_epoch_states: BTreeMap::new(),
             fov_half_angle_deg: default_fov_half_angle_deg(),
             fov_guard_angle_deg: default_fov_guard_angle_deg(),
             max_slew_rate_rad_s: default_max_slew_rate_rad_s(),
