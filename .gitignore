@@ -1,6 +1,9 @@
 /safe/target
 .DS_Store
 /target
+/target-*/
+target/
+/artifacts/
 /safe/logs
 /safectl/target
 /tmp/target
