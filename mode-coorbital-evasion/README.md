@@ -4,8 +4,9 @@ This document describes the co-orbital threat evasion autonomy mode. The mode co
 
 ## Telemetry Adapter
 
-The mode retains `TelemetryFrame` without decoding its payload. Before planning,
-it invokes `input_adapter_command` once and sends this JSON object to its stdin:
+Before planning, the mode reads configured threat state from the current
+telemetry payload. It then invokes `input_adapter_command` once and sends this
+JSON object to its stdin:
 
 ```json
 {
@@ -33,9 +34,17 @@ The adapter returns the simulation epoch and EDS initialization patches:
 ```
 
 The adapter owns telemetry decoding, epoch derivation, units, and spacecraft
-state projection. The mode adds only its configured threat, time-step, and
-pointing-schedule patches. Adapter logs must go to stderr because stdout is
-reserved for its JSON response.
+state projection. The mode reads its configured threats from
+`payload.augmented.ground_threat_locations` and
+`payload.augmented.space_threat_epoch_states`, then adds those state patches,
+time-step patches, and pointing-schedule patches. Adapter logs must go to stderr
+because stdout is reserved for its JSON response.
+
+`threat_ids` is the fixed allowlist of EDS threat entities. Every configured ID
+must have exactly one valid telemetry state for a planning run: either a ground
+location `[latitude_deg, longitude_deg, altitude_km]`, or a space state
+`[epoch_mjd, position_eci_km, velocity_eci_km_s]`. A missing, malformed, or
+ambiguous state rejects the plan; telemetry cannot introduce arbitrary EDS IDs.
 
 `input_adapter_config` is opaque JSON forwarded to the adapter. Configure all
 EDS identifiers, including `agent_id`, `field_of_view_id`, pointing schedule
@@ -190,8 +199,6 @@ Positive `c_i` is outside the physical FOV, zero is on its boundary, and negativ
 - `fov_guard_angle`: additional angle guard for planning in degrees. When relevant, added to `fov_half_angle` to produce `alpha_plan`.
 - `threat_ids`: list of threat IDs to consider in the planner and when running the EDS. The planner ignores threats not in this list.
 - `threat_max_range_km`: maximum range in kilometers at which a configured threat is considered. Threats beyond this range do not constrain pointing or count as exposure. The default is unlimited.
-- `ground_threat_locations`: dictionary of ground threat IDs to their latitude, longitude, and altitude locations. The locations are given in a list `[latitude (deg), longitude (deg), altitude (km)]`.
-- `space_threat_epoch_states`: dictionary of space threat IDs to their state at a given epoch. The state is given in a list `[epoch (MJD), position (km, ECI), velocity (km/s, ECI)]`.
 - `planning_horizon`: time horizon for planning in days
 - `command_lead_secs`: time in seconds from the current time to the permitted start of the commanded pointing. The planner may propose commands that start at or after this time. This is meant to account for command processing and verification delays.
 
