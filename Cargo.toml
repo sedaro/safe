@@ -7,8 +7,6 @@ members = [
     "safectl",
     "mode-anomaly-recovery",
     "mode-mission-planning",
-]
-exclude = [
     "mode-coorbital-evasion",
 ]
 resolver = "2"
