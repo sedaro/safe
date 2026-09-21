@@ -105,6 +105,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
     let planning_limit = Duration::from_millis(
         request
             .config
+            .llm
             .request_timeout_ms
             .saturating_mul(MAX_TURNS as u64),
     );
