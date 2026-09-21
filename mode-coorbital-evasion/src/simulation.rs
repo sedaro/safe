@@ -292,21 +292,21 @@ impl CoorbitalEvasionMode {
                         "gnc",
                         &format!("{id}.latitude_deg"),
                         "deg",
-                        &latitude_deg.to_string(),
+                        &format!("{latitude_deg:.15}"),
                     ));
                     patches.push(EdsPatch::new(
                         &self.config.agent_id,
                         "gnc",
                         &format!("{id}.longitude_deg"),
                         "deg",
-                        &longitude_deg.to_string(),
+                        &format!("{longitude_deg:.15}"),
                     ));
                     patches.push(EdsPatch::new(
                         &self.config.agent_id,
                         "gnc",
                         &format!("{id}.altitude_km"),
                         "f64",
-                        &altitude_km.to_string(),
+                        &format!("{altitude_km:.15}"),
                     ));
                 }
                 (None, Some(state)) => {
@@ -667,17 +667,17 @@ mod tests {
 
         assert!(
             patches.iter().any(|patch| {
-                patch.field == "ground-threat.latitude_deg" && patch.value == "-23"
+                patch.field == "ground-threat.latitude_deg" && patch.value == "-23.000000000000000"
             })
         );
         assert!(
             patches.iter().any(|patch| {
-                patch.field == "ground-threat.longitude_deg" && patch.value == "-67"
+                patch.field == "ground-threat.longitude_deg" && patch.value == "-67.000000000000000"
             })
         );
         assert!(
             patches.iter().any(|patch| {
-                patch.field == "ground-threat.altitude_km" && patch.value == "0.5"
+                patch.field == "ground-threat.altitude_km" && patch.value == "0.500000000000000"
             })
         );
     }
