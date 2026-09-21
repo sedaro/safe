@@ -197,6 +197,7 @@ impl CoorbitalEvasionMode {
             return Ok(());
         }
         let PlanningOutcome::Schedule(plan) = self.build_plan(telemetry).await? else {
+            info!("coorbital-evasion baseline is clear; no pointing change required");
             return Ok(());
         };
         if plan.validation.score.exposure_secs > 0.0 {
