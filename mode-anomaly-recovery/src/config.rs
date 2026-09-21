@@ -267,7 +267,7 @@ pub(crate) struct SimulationConfig {
     pub(crate) scenarios: Vec<SimulationScenario>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LlmConfig {
     pub(crate) adapter: AdapterSelection,
