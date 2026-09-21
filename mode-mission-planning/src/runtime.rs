@@ -47,6 +47,11 @@ impl MissionPlanningMode {
     ) -> Result<()> {
         self.plan_on_next_telemetry = false;
         if let Err(error) = self.plan_and_emit(runtime, &telemetry).await {
+            if telemetry_is_not_ready(&error) {
+                self.plan_on_next_telemetry = true;
+                info!(reason = %error, "mission planning waiting for simulation-ready telemetry");
+                return Ok(());
+            }
             let message = format!("mission planning failed without emitting commands: {error:#}");
             warn!(reason = %message);
             runtime.fault(message).await?;
@@ -173,6 +178,15 @@ impl ModeHandler<MissionPlanningConfig> for MissionPlanningMode {
         self.latest_board = board;
         Ok(())
     }
+}
+
+fn telemetry_is_not_ready(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("telemetry has no ")
+        || message.contains("telemetry GPS time at JSON Pointer")
+        || message.contains("telemetry state of charge at JSON Pointer")
+        || message.contains("OTP-2 simulation input is missing derived ")
+        || message.contains("OTP-2 simulation input is missing battery voltage")
 }
 
 fn telemetry_number(telemetry: &TelemetryFrame, pointer: &str, label: &str) -> Result<f64> {
