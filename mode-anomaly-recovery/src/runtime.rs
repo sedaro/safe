@@ -6,13 +6,12 @@ use async_trait::async_trait;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
 use safe::protocol::{AutonomyModeBoardState, Command, CommandEnvelope, TimedCommand};
 use safe::telemetry_frame::TelemetryFrame;
+use safe_llm_adapter::{CompletionFinishReason, CompletionRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
-use crate::http_client;
 use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,17 +35,6 @@ struct ActionPromptEntry {
     id: AllowedAction,
     description: String,
     preconditions: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponse {
-    response: String,
-    #[serde(default)]
-    done: bool,
-    #[serde(default)]
-    done_reason: Option<String>,
-    #[serde(default)]
-    eval_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -197,13 +185,14 @@ impl AnomalyRecoveryMode {
             self.log_decision_trace(
                 "request",
                 format!(
-                    "attempt {attempt}/{max_attempts} | asking {} to select one action from {} configured candidate(s)",
-                    self.config.model,
+                    "attempt {attempt}/{max_attempts} | asking {} via {} to select one action from {} configured candidate(s)",
+                    self.config.llm.model,
+                    self.config.llm.adapter.kind,
                     envelope.candidates.len(),
                 ),
             );
 
-            let response_text = match self.query_ollama(&prompt).await {
+            let response_text = match self.query_model(&prompt).await {
                 Ok(response) => response,
                 Err(err) if attempt < max_attempts => {
                     self.log_decision_trace(
@@ -324,103 +313,58 @@ impl AnomalyRecoveryMode {
         Err(anyhow!("anomaly recovery exhausted decision attempts"))
     }
 
-    fn build_ollama_request_body(&self, prompt: &str) -> Result<String> {
-        #[derive(Serialize)]
-        struct OllamaGenerateRequest<'a> {
-            model: &'a str,
-            prompt: &'a str,
-            stream: bool,
-            format: &'a Value,
-            options: OllamaOptions,
-        }
-        #[derive(Serialize)]
-        struct OllamaOptions {
-            temperature: f64,
-            num_predict: u32,
-        }
-
-        let format = decision_response_schema();
-        Ok(serde_json::to_string(&OllamaGenerateRequest {
-            model: self.config.model.as_str(),
-            prompt,
-            stream: false,
-            format: &format,
-            options: OllamaOptions {
-                temperature: self.config.response_temperature,
-                num_predict: self.config.num_predict,
-            },
-        })?)
-    }
-
-    async fn query_ollama(&self, prompt: &str) -> Result<String> {
-        let body = self.build_ollama_request_body(prompt)?;
+    async fn query_model(&self, prompt: &str) -> Result<String> {
+        let adapter = self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| anyhow!("anomaly recovery LLM adapter has not been configured"))?;
         let request_start = Instant::now();
 
         info!(
-            host = %self.config.ollama_host,
-            port = self.config.ollama_port,
-            path = %self.config.ollama_path,
-            model = %self.config.model,
-            timeout_ms = self.config.request_timeout_ms,
+            adapter = adapter.kind(),
+            model = %self.config.llm.model,
+            timeout_ms = self.config.llm.request_timeout_ms,
             prompt_chars = prompt.chars().count(),
-            "anomaly recovery sending constrained ollama request"
+            "anomaly recovery sending constrained LLM request"
         );
 
-        let request_future = async {
-            let response = http_client::post_json(
-                &self.config.ollama_host,
-                self.config.ollama_port,
-                &self.config.ollama_path,
-                &body,
-            )
+        let completion = adapter
+            .complete(CompletionRequest {
+                prompt: prompt.to_string(),
+                response_schema: decision_response_schema(),
+                model: self.config.llm.model.clone(),
+                temperature: self.config.llm.response_temperature,
+                max_output_tokens: self.config.llm.max_output_tokens,
+                timeout: Duration::from_millis(self.config.llm.request_timeout_ms),
+            })
             .await
-            .map_err(|e| anyhow!("ollama HTTP request failed: {e}"))?;
-            if !(200..300).contains(&response.status) {
-                return Err(anyhow!(
-                    "ollama returned HTTP status {}: {}",
-                    response.status,
-                    clip_chars(&response.body, 400)
-                ));
-            }
-            Result::<String>::Ok(response.body)
-        };
-
-        let body_text = match timeout(
-            Duration::from_millis(self.config.request_timeout_ms),
-            request_future,
-        )
-        .await
-        {
-            Ok(Ok(body)) => body,
-            Ok(Err(err)) => return Err(err),
-            Err(_) => return Err(anyhow!("ollama request timed out")),
-        };
+            .map_err(|error| anyhow!("{} adapter request failed: {error}", adapter.kind()))?;
+        if completion.finish_reason == CompletionFinishReason::Length {
+            return Err(anyhow!(
+                "{} response stopped at token limit",
+                adapter.kind()
+            ));
+        }
 
         info!(
             elapsed_ms = request_start.elapsed().as_millis() as u64,
-            response_chars = body_text.chars().count(),
-            "anomaly recovery completed ollama request"
+            response_chars = completion.text.chars().count(),
+            "anomaly recovery completed constrained LLM request"
         );
-
-        let response: OllamaResponse = serde_json::from_str(&body_text)
-            .map_err(|e| anyhow!("invalid ollama JSON payload: {e}"))?;
-        if response.done_reason.as_deref() == Some("length") {
-            return Err(anyhow!("ollama response stopped at token limit"));
-        }
         debug!(
-            done = response.done,
-            done_reason = ?response.done_reason,
-            eval_count = ?response.eval_count,
-            "anomaly recovery parsed ollama completion metadata"
+            adapter = adapter.kind(),
+            finish_reason = ?completion.finish_reason,
+            "anomaly recovery received normalized LLM completion"
         );
 
-        let response_text = response.response.trim();
+        let response_text = completion.text.trim();
         if response_text.is_empty() {
-            return Err(anyhow!("ollama response was empty"));
+            return Err(anyhow!("{} response was empty", adapter.kind()));
         }
         if response_text.chars().count() > self.config.max_response_chars {
             return Err(anyhow!(
-                "ollama response exceeded max_response_chars ({})",
+                "{} response exceeded max_response_chars ({})",
+                adapter.kind(),
                 self.config.max_response_chars
             ));
         }
@@ -757,11 +701,35 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
 
-        let envelope = self.build_decision_envelope(actionable);
-        let decision = self.plan_decision_with_feedback_loop(&envelope).await?;
-        let (candidate, action) = self.evaluate_decision(&decision, &envelope.candidates)?;
-        self.emit_action(runtime, candidate, action, &decision.reason)
-            .await?;
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = safe_sim::CancellationToken::new();
+        let generation = self
+            .planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let telemetry = self
+            .latest_telemetry
+            .clone()
+            .ok_or_else(|| anyhow!("missing telemetry snapshot"))?;
+        let request = crate::planner::PlanningRequest {
+            config: self.config.clone(),
+            candidates: actionable,
+            telemetry,
+            mode_id: runtime.mode_id(),
+            generation,
+            generations: self.planning_generation.clone(),
+            active: self.active.clone(),
+            cancel: cancel.clone(),
+            output: runtime.output_tx(),
+        };
+        tokio::spawn(async move {
+            if let Err(error) = crate::planner::run(request).await {
+                warn!(reason = %error, "anomaly recovery background planning failed without emitting a command");
+            }
+        });
+        self.planning_cancel = Some(cancel);
         self.last_plan_signature = Some(signature);
         Ok(())
     }
@@ -779,7 +747,7 @@ fn command_for_action(action: AllowedAction) -> Result<Command> {
     }
 }
 
-fn value_at_payload_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
+pub(crate) fn value_at_payload_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(payload, |value, segment| match value {
             Value::Object(values) => values.get(segment),
@@ -836,27 +804,37 @@ fn trace_text(input: &str) -> String {
 impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     fn set_config(&mut self, config: AnomalyRecoveryModeConfig) -> Result<()> {
         config.validate()?;
+        let adapter = self
+            .adapter_registry
+            .build(&config.llm.adapter)
+            .map_err(|error| anyhow!("could not initialize configured LLM adapter: {error}"))?;
         info!(
-            host = %config.ollama_host,
-            port = config.ollama_port,
-            path = %config.ollama_path,
-            model = %config.model,
-            timeout_ms = config.request_timeout_ms,
+            adapter = adapter.kind(),
+            model = %config.llm.model,
+            timeout_ms = config.llm.request_timeout_ms,
             profiles = config.nominal_profiles.len(),
             actions = config.action_catalog.len(),
             "anomaly recovery static nominal profile config loaded"
         );
         self.config = config;
+        self.adapter = Some(adapter);
         self.latest_telemetry = None;
         self.current_candidates.clear();
         self.rule_states.clear();
         self.has_board_snapshot = false;
         self.last_plan_signature = None;
         self.warned_missing_board_snapshot = false;
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
         Ok(())
     }
 
     async fn on_activate(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Err(err) = self.plan_current_candidates(runtime).await {
             self.log_planning_error(
                 "on_activate",
@@ -869,6 +847,13 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     }
 
     async fn on_deactivate(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
         self.last_plan_signature = None;
         Ok(())
     }
@@ -921,20 +906,54 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         }
         Ok(())
     }
+
+    async fn on_shutdown(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use safe_llm_adapter::{AdapterError, AdapterRegistry, Completion, LlmAdapter};
 
     const PROFILE_FIXTURE: &str = include_str!("../testdata/static_nominal_profile.json");
     const TELEMETRY_FIXTURE: &str = include_str!("../testdata/static_nominal_telemetry.jsonl");
 
     fn configured_mode() -> AnomalyRecoveryMode {
         let config = serde_json::from_str(PROFILE_FIXTURE).expect("fixture should parse");
-        let mut mode = AnomalyRecoveryMode::new();
+        let mut mode = AnomalyRecoveryMode::new(AdapterRegistry::with_builtin_adapters());
         mode.set_config(config).expect("fixture should validate");
         mode
+    }
+
+    struct RecordingAdapter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        completion: Completion,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAdapter for RecordingAdapter {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
+            self.requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .push(request);
+            Ok(self.completion.clone())
+        }
     }
 
     fn sample(ts_mono: u64, payload: Value) -> TelemetrySample {
@@ -1132,14 +1151,45 @@ mod tests {
         assert!(!prompt.contains("telemetry_latest"));
     }
 
-    #[test]
-    fn ollama_request_uses_json_schema_format() {
-        let mode = configured_mode();
-        let body = mode
-            .build_ollama_request_body("test prompt")
-            .expect("request should serialize");
-        let value: Value = serde_json::from_str(&body).expect("request should be JSON");
-        assert_eq!(value["format"]["required"][0], "anomaly_id");
-        assert_eq!(value["options"]["temperature"], 0.0);
+    #[tokio::test]
+    async fn generic_adapter_receives_constrained_completion_request() {
+        let mut mode = configured_mode();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        mode.adapter = Some(Box::new(RecordingAdapter {
+            requests: Arc::clone(&requests),
+            completion: Completion {
+                text: "{}".to_string(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        }));
+
+        assert_eq!(mode.query_model("test prompt").await.unwrap(), "{}");
+        let request = requests
+            .lock()
+            .expect("request lock should not be poisoned")
+            .pop()
+            .expect("adapter should receive a request");
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.response_schema["required"][0], "anomaly_id");
+        assert_eq!(request.temperature, 0.0);
+        assert_eq!(request.max_output_tokens, 256);
+    }
+
+    #[tokio::test]
+    async fn truncated_completion_is_rejected_before_decision_parsing() {
+        let mut mode = configured_mode();
+        mode.adapter = Some(Box::new(RecordingAdapter {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            completion: Completion {
+                text: "{\"action_id\":\"point_nadir\"}".to_string(),
+                finish_reason: CompletionFinishReason::Length,
+            },
+        }));
+
+        let error = mode
+            .query_model("test prompt")
+            .await
+            .expect_err("truncated completions must not reach decision parsing");
+        assert!(error.to_string().contains("stopped at token limit"));
     }
 }
