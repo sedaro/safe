@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
+use safe_llm_adapter::AdapterSelection;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -197,27 +200,163 @@ pub(crate) struct NominalProfile {
     pub(crate) rules: Vec<NominalRule>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationPatchBinding {
+    pub(crate) agent_id: String,
+    pub(crate) engine: String,
+    pub(crate) field: String,
+    #[serde(rename = "type")]
+    pub(crate) type_: String,
+    #[serde(default)]
+    pub(crate) value: Option<f64>,
+    #[serde(default)]
+    pub(crate) telemetry_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationParameter {
+    pub(crate) id: String,
+    pub(crate) patch_index: usize,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MetricAggregation {
+    Last,
+    Min,
+    Max,
+    Mean,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationMetric {
+    pub(crate) id: String,
+    pub(crate) target_file: String,
+    pub(crate) field: String,
+    pub(crate) aggregation: MetricAggregation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationScenario {
+    pub(crate) id: String,
+    pub(crate) description: String,
+    pub(crate) applicable_rule_ids: Vec<String>,
+    pub(crate) allowed_actions: Vec<AllowedAction>,
+    pub(crate) duration_days: f64,
+    #[serde(default)]
+    pub(crate) patches: Vec<SimulationPatchBinding>,
+    #[serde(default)]
+    pub(crate) parameters: Vec<SimulationParameter>,
+    pub(crate) metrics: Vec<SimulationMetric>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationConfig {
+    pub(crate) eds_path: PathBuf,
+    #[serde(default = "default_max_simulation_runs")]
+    pub(crate) max_runs: u8,
+    #[serde(default = "default_simulation_timeout_ms")]
+    pub(crate) run_timeout_ms: u64,
+    pub(crate) scenarios: Vec<SimulationScenario>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnomalyRecoveryModeConfig {
-    #[serde(default = "default_ollama_host")]
-    pub(crate) ollama_host: String,
-    #[serde(default = "default_ollama_port")]
-    pub(crate) ollama_port: u16,
-    #[serde(default = "default_ollama_path")]
-    pub(crate) ollama_path: String,
-    #[serde(default = "default_model")]
+pub(crate) struct LlmConfig {
+    pub(crate) adapter: AdapterSelection,
     pub(crate) model: String,
     #[serde(default = "default_request_timeout_ms")]
     pub(crate) request_timeout_ms: u64,
+    #[serde(default = "default_response_temperature")]
+    pub(crate) response_temperature: f64,
+    #[serde(default = "default_max_output_tokens")]
+    pub(crate) max_output_tokens: u32,
+}
+
+impl LlmConfig {
+    fn validate(&self) -> Result<()> {
+        if self.adapter.kind.trim().is_empty() {
+            bail!("llm.adapter.kind must not be empty");
+        }
+        if self.model.trim().is_empty() {
+            bail!("llm.model must not be empty");
+        }
+        if self.request_timeout_ms == 0 {
+            bail!("llm.request_timeout_ms must be greater than zero");
+        }
+        if !self.response_temperature.is_finite() || self.response_temperature < 0.0 {
+            bail!("llm.response_temperature must be finite and non-negative");
+        }
+        if self.max_output_tokens == 0 {
+            bail!("llm.max_output_tokens must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl AnomalyRecoveryModeConfig {
+    pub(crate) fn ollama_chat_connection(&self) -> Result<(String, u16, String)> {
+        if self.llm.adapter.kind != "ollama" {
+            bail!("simulation tool calls require the ollama adapter");
+        }
+        let endpoint = self
+            .llm
+            .adapter
+            .config
+            .get("endpoint")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("ollama adapter requires a string endpoint"))?;
+        let authority = endpoint
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow!("simulation tool calls require an http Ollama endpoint"))?
+            .split_once('/')
+            .map_or_else(|| endpoint.trim_start_matches("http://"), |(host, _)| host);
+        let (host, port) = authority
+            .rsplit_once(':')
+            .map(|(host, port)| {
+                port.parse::<u16>()
+                    .map(|port| (host.to_string(), port))
+                    .map_err(|_| anyhow!("Ollama endpoint has an invalid port"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| (authority.to_string(), 80));
+        if host.is_empty() {
+            bail!("Ollama endpoint must include a host");
+        }
+        Ok((host, port, "/api/chat".to_string()))
+    }
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            adapter: AdapterSelection {
+                kind: "ollama".to_string(),
+                config: json!({"endpoint": "http://127.0.0.1:11434/api/generate"}),
+            },
+            model: default_model(),
+            request_timeout_ms: default_request_timeout_ms(),
+            response_temperature: default_response_temperature(),
+            max_output_tokens: default_max_output_tokens(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnomalyRecoveryModeConfig {
+    pub(crate) llm: LlmConfig,
     #[serde(default = "default_max_prompt_chars")]
     pub(crate) max_prompt_chars: usize,
     #[serde(default = "default_max_response_chars")]
     pub(crate) max_response_chars: usize,
-    #[serde(default = "default_response_temperature")]
-    pub(crate) response_temperature: f64,
-    #[serde(default = "default_num_predict")]
-    pub(crate) num_predict: u32,
     #[serde(default = "default_max_decision_attempts")]
     pub(crate) max_decision_attempts: u8,
     #[serde(default = "default_max_feedback_chars")]
@@ -234,6 +373,8 @@ pub(crate) struct AnomalyRecoveryModeConfig {
     pub(crate) action_catalog: Vec<ActionDefinition>,
     #[serde(default)]
     pub(crate) nominal_profiles: Vec<NominalProfile>,
+    #[serde(default)]
+    pub(crate) simulation: Option<SimulationConfig>,
 }
 
 impl AnomalyRecoveryModeConfig {
@@ -244,19 +385,13 @@ impl AnomalyRecoveryModeConfig {
         if self.action_catalog.is_empty() {
             bail!("anomaly recovery requires an action_catalog");
         }
-        if self.request_timeout_ms == 0 {
-            bail!("request_timeout_ms must be greater than zero");
-        }
+        self.llm.validate()?;
         if self.max_prompt_chars == 0 || self.max_response_chars == 0 {
             bail!("prompt and response character limits must be greater than zero");
         }
-        if !self.response_temperature.is_finite() || self.response_temperature < 0.0 {
-            bail!("response_temperature must be finite and non-negative");
+        if self.max_decision_attempts == 0 {
+            bail!("max_decision_attempts must be greater than zero");
         }
-        if self.num_predict == 0 || self.max_decision_attempts == 0 {
-            bail!("num_predict and max_decision_attempts must be greater than zero");
-        }
-
         let mut action_ids = HashSet::new();
         for action in &self.action_catalog {
             if !action.id.is_recommendable() {
@@ -316,6 +451,107 @@ impl AnomalyRecoveryModeConfig {
             }
         }
 
+        if let Some(simulation) = &self.simulation {
+            if simulation.eds_path.as_os_str().is_empty()
+                || simulation.max_runs == 0
+                || simulation.run_timeout_ms == 0
+            {
+                bail!("simulation requires eds_path, max_runs > 0, and run_timeout_ms > 0");
+            }
+            let mut scenario_ids = HashSet::new();
+            for scenario in &simulation.scenarios {
+                if scenario.id.trim().is_empty()
+                    || scenario.description.trim().is_empty()
+                    || !scenario.duration_days.is_finite()
+                    || scenario.duration_days <= 0.0
+                {
+                    bail!("simulation scenario has invalid id, description, or duration");
+                }
+                if !scenario_ids.insert(scenario.id.as_str())
+                    || scenario.applicable_rule_ids.is_empty()
+                    || scenario.allowed_actions.is_empty()
+                    || scenario.metrics.is_empty()
+                {
+                    bail!(
+                        "simulation scenario '{}': duplicate id or missing applicability, actions, or metrics",
+                        scenario.id
+                    );
+                }
+                for rule_id in &scenario.applicable_rule_ids {
+                    if !rule_ids.contains(rule_id.as_str()) {
+                        bail!(
+                            "simulation scenario '{}': unknown rule '{}'",
+                            scenario.id,
+                            rule_id
+                        );
+                    }
+                }
+                for action in &scenario.allowed_actions {
+                    if !action_ids.contains(action) {
+                        bail!(
+                            "simulation scenario '{}': action '{}' is not configured",
+                            scenario.id,
+                            action.as_str()
+                        );
+                    }
+                }
+                let mut parameter_ids = HashSet::new();
+                for patch in &scenario.patches {
+                    if patch.agent_id.trim().is_empty()
+                        || patch.engine.trim().is_empty()
+                        || patch.field.trim().is_empty()
+                        || patch.type_.trim().is_empty()
+                        || (patch.value.is_some() == patch.telemetry_path.is_some())
+                        || patch.value.is_some_and(|v| !v.is_finite())
+                    {
+                        bail!(
+                            "simulation scenario '{}': invalid trusted patch binding",
+                            scenario.id
+                        );
+                    }
+                    if let Some(path) = &patch.telemetry_path {
+                        validate_path(path)
+                            .map_err(|e| anyhow!("simulation scenario '{}': {e}", scenario.id))?;
+                    }
+                }
+                for parameter in &scenario.parameters {
+                    if parameter.id.trim().is_empty()
+                        || !parameter_ids.insert(parameter.id.as_str())
+                        || parameter.patch_index >= scenario.patches.len()
+                        || !parameter.min.is_finite()
+                        || !parameter.max.is_finite()
+                        || parameter.min > parameter.max
+                    {
+                        bail!(
+                            "simulation scenario '{}': invalid bounded parameter",
+                            scenario.id
+                        );
+                    }
+                    if scenario.patches[parameter.patch_index]
+                        .telemetry_path
+                        .is_some()
+                    {
+                        bail!(
+                            "simulation scenario '{}': parameter cannot replace telemetry patch",
+                            scenario.id
+                        );
+                    }
+                }
+                let mut metric_ids = HashSet::new();
+                for metric in &scenario.metrics {
+                    if metric.id.trim().is_empty()
+                        || !metric_ids.insert(metric.id.as_str())
+                        || metric.target_file.trim().is_empty()
+                        || metric.target_file.contains('/')
+                        || metric.target_file.contains('\\')
+                        || metric.field.trim().is_empty()
+                    {
+                        bail!("simulation scenario '{}': invalid metric", scenario.id);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -335,15 +571,9 @@ impl AnomalyRecoveryModeConfig {
 impl Default for AnomalyRecoveryModeConfig {
     fn default() -> Self {
         Self {
-            ollama_host: default_ollama_host(),
-            ollama_port: default_ollama_port(),
-            ollama_path: default_ollama_path(),
-            model: default_model(),
-            request_timeout_ms: default_request_timeout_ms(),
+            llm: LlmConfig::default(),
             max_prompt_chars: default_max_prompt_chars(),
             max_response_chars: default_max_response_chars(),
-            response_temperature: default_response_temperature(),
-            num_predict: default_num_predict(),
             max_decision_attempts: default_max_decision_attempts(),
             max_feedback_chars: default_max_feedback_chars(),
             require_board_snapshot: default_require_board_snapshot(),
@@ -352,6 +582,7 @@ impl Default for AnomalyRecoveryModeConfig {
             analysis_instructions: default_analysis_instructions(),
             action_catalog: Vec::new(),
             nominal_profiles: Vec::new(),
+            simulation: None,
         }
     }
 }
@@ -371,16 +602,11 @@ fn default_min_consecutive_samples() -> usize {
     1
 }
 
-fn default_ollama_host() -> String {
-    "127.0.0.1".to_string()
+fn default_max_simulation_runs() -> u8 {
+    2
 }
-
-fn default_ollama_port() -> u16 {
-    11434
-}
-
-fn default_ollama_path() -> String {
-    "/api/generate".to_string()
+fn default_simulation_timeout_ms() -> u64 {
+    10_000
 }
 
 fn default_model() -> String {
@@ -403,7 +629,7 @@ fn default_response_temperature() -> f64 {
     0.0
 }
 
-fn default_num_predict() -> u32 {
+fn default_max_output_tokens() -> u32 {
     256
 }
 
@@ -434,6 +660,13 @@ mod tests {
 
     fn valid_config() -> AnomalyRecoveryModeConfig {
         serde_json::from_value(serde_json::json!({
+            "llm": {
+                "adapter": {
+                    "kind": "ollama",
+                    "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}
+                },
+                "model": "mistral:7b"
+            },
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
             ],
@@ -468,6 +701,13 @@ mod tests {
         assert!(!config.decision_trace);
 
         let config: AnomalyRecoveryModeConfig = serde_json::from_value(serde_json::json!({
+            "llm": {
+                "adapter": {
+                    "kind": "ollama",
+                    "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}
+                },
+                "model": "mistral:7b"
+            },
             "decision_trace": true,
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
@@ -516,5 +756,34 @@ mod tests {
         let mut config = valid_config();
         config.nominal_profiles[0].rules[0].eligible_actions = vec![AllowedAction::Noop];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_untrusted_or_invalid_simulation_contract() {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["simulation"] = serde_json::json!({
+            "eds_path": "/trusted/eds",
+            "scenarios": [{
+                "id": "thermal", "description": "thermal check",
+                "applicable_rule_ids": ["temperature_out_of_nominal"],
+                "allowed_actions": ["point_sun_yaw"], "duration_days": 0.1,
+                "patches": [{"agent_id":"a", "engine":"power", "field":"temp", "type":"f64", "telemetry_path":"telemetry.temperature_c"}],
+                "parameters": [{"id":"bad", "patch_index":0, "min":0.0, "max":1.0}],
+                "metrics": [{"id":"temp", "target_file":"a.power.jsonl", "field":"temp", "aggregation":"max"}]
+            }]
+        });
+        let config: AnomalyRecoveryModeConfig = serde_json::from_value(value).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "parameter cannot override telemetry binding"
+        );
+    }
+
+    fn rejects_legacy_ollama_configuration() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/static_nominal_profile.json"))
+                .expect("fixture should parse");
+        value["ollama_host"] = serde_json::json!("127.0.0.1");
+        assert!(serde_json::from_value::<AnomalyRecoveryModeConfig>(value).is_err());
     }
 }

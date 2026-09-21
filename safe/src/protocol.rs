@@ -17,6 +17,7 @@ pub enum Command {
     PointNadir,
     PointQuaternion { x: f64, y: f64, z: f64, w: f64 },
     CaptureImage,
+    CaptureImageWithCamera { camera_id: u32 },
     PointThruster,
     ThrusterOn,
     ThrusterOff,
@@ -32,6 +33,9 @@ pub enum Command {
         roll_deg: f64,
         pitch_deg: f64,
         yaw_deg: f64,
+    },
+    CancelScheduled {
+        schedule_id: String,
     },
 }
 
@@ -50,6 +54,9 @@ impl Into<String> for &Command {
                 format!("PointQuaternion({x}, {y}, {z}, {w})")
             }
             Command::CaptureImage => "CaptureImage".to_string(),
+            Command::CaptureImageWithCamera { camera_id } => {
+                format!("CaptureImageWithCamera({camera_id})")
+            }
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
             Command::ThrusterOff => "ThrusterOff".to_string(),
@@ -66,6 +73,9 @@ impl Into<String> for &Command {
                 pitch_deg,
                 yaw_deg,
             } => format!("PointYpr({roll_deg}, {pitch_deg}, {yaw_deg})"),
+            Command::CancelScheduled { schedule_id } => {
+                format!("CancelScheduled({schedule_id})")
+            }
         }
     }
 }
@@ -85,6 +95,9 @@ impl Into<String> for Command {
                 format!("PointQuaternion({x}, {y}, {z}, {w})")
             }
             Command::CaptureImage => "CaptureImage".to_string(),
+            Command::CaptureImageWithCamera { camera_id } => {
+                format!("CaptureImageWithCamera({camera_id})")
+            }
             Command::PointThruster => "PointThruster".to_string(),
             Command::ThrusterOn => "ThrusterOn".to_string(),
             Command::ThrusterOff => "ThrusterOff".to_string(),
@@ -101,6 +114,9 @@ impl Into<String> for Command {
                 pitch_deg,
                 yaw_deg,
             } => format!("PointYpr({roll_deg}, {pitch_deg}, {yaw_deg})"),
+            Command::CancelScheduled { schedule_id } => {
+                format!("CancelScheduled({schedule_id})")
+            }
         }
     }
 }

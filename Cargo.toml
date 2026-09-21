@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "safe",
+    "safe-llm-adapter",
     "safe-time",
     "safe-sim",
     "safe-gatekeeper",

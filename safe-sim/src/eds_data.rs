@@ -60,6 +60,13 @@ impl EdsType {
         Ok(ty)
     }
 
+    /// Returns the named fields at this level in deterministic order.
+    pub fn field_names(&self) -> Vec<&str> {
+        let mut names = self.fields.keys().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
     fn field_index(&self, field: &str) -> Result<usize> {
         self.fields
             .get(field)
@@ -154,6 +161,11 @@ impl EdsFrame {
     /// Encodes this value using its EDS type signature.
     pub fn encode(&self) -> Result<Vec<u8>> {
         encode(&self.ty, &self.data)
+    }
+
+    /// Returns the named fields available for direct lookup on this frame.
+    pub fn field_names(&self) -> Vec<&str> {
+        self.ty.field_names()
     }
 
     pub fn get_by_field(&self, field: &str) -> Result<Self> {
@@ -806,6 +818,10 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+        assert_eq!(
+            frame.field_names(),
+            vec!["position", "threat.relative_position", "time", "visible"]
         );
     }
 

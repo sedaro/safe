@@ -51,12 +51,12 @@ cargo run -p safe
 
 The default configuration leverages two Autonomy Modes:
 1. `AM01`: Anomaly Recovery Agent: A agentic harness around an LLM to detect and respond to anomalies in the host vehicles telemetry
-  - Note: This mode requires access to a language model.  See instructions below for running Mistral.
+  - Note: This mode requires access to a configured LLM adapter. The checked-in demo uses Ollama and Mistral.
 2. `AM02`: Overpass Predictor: A simple Autonomy Mode that forecasts overpasses over pre-configured ground sites based on forward TLE propagation.
 
 See `safe/autonomy_mode_config.json` for each mode's specific configuration.
 
-To run Mistral for `AM01`:
+To run the checked-in Ollama/Mistral demo for `AM01`:
 ```bash
 docker run -d -v ollama:/root/.ollama -p 11434:11434 --name ollama ollama/ollama
 docker exec -it ollama ollama run mistral:7b

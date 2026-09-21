@@ -1,4 +1,13 @@
 {
+  "llm": {
+    "adapter": {
+      "kind": "ollama",
+      "config": {
+        "endpoint": "http://127.0.0.1:11434/api/generate"
+      }
+    },
+    "model": "mistral:7b"
+  },
   "action_catalog": [
     {
       "id": "point_sun_yaw",
