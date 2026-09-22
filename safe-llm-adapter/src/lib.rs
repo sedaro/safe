@@ -435,19 +435,18 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         .await?;
         let response: OpenAiCompatibleResponse =
             serde_json::from_str(&body_text).map_err(|error| {
-                AdapterError::Response(format!("invalid OpenAI-compatible JSON payload: {error}"))
+                AdapterError::Response(format!(
+                    "invalid OpenAI-compatible JSON payload: {error}; body={}",
+                    clip_chars(&body_text, 600)
+                ))
             })?;
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             AdapterError::Response(
                 "OpenAI-compatible response did not include a choice".to_string(),
             )
         })?;
-        let text = choice
-            .message
-            .content
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let message = choice_message(&choice)?;
+        let text = message.content.unwrap_or_default().trim().to_string();
         if text.is_empty() {
             return Err(AdapterError::Response(
                 "OpenAI-compatible response content was empty".to_string(),
@@ -489,26 +488,26 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         .await?;
         let response: OpenAiCompatibleResponse =
             serde_json::from_str(&body_text).map_err(|error| {
-                AdapterError::Response(format!("invalid OpenAI-compatible JSON payload: {error}"))
+                AdapterError::Response(format!(
+                    "invalid OpenAI-compatible JSON payload: {error}; body={}",
+                    clip_chars(&body_text, 600)
+                ))
             })?;
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             AdapterError::Response(
                 "OpenAI-compatible response did not include a choice".to_string(),
             )
         })?;
-        let tool_calls = choice
-            .message
+        let message = choice_message(&choice)?;
+        let tool_calls = message
             .tool_calls
             .into_iter()
             .map(parse_openai_tool_call)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ToolChatCompletion {
             message: ToolChatMessage {
-                role: choice
-                    .message
-                    .role
-                    .unwrap_or_else(|| "assistant".to_string()),
-                content: choice.message.content.unwrap_or_default(),
+                role: message.role.unwrap_or_else(|| "assistant".to_string()),
+                content: message.content.unwrap_or_default(),
                 tool_calls,
             },
             finish_reason: openai_finish_reason(choice.finish_reason.as_deref()),
@@ -516,19 +515,22 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleResponse {
     choices: Vec<OpenAiCompatibleChoice>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleChoice {
-    message: OpenAiCompatibleMessage,
+    #[serde(default)]
+    message: Option<OpenAiCompatibleMessage>,
+    #[serde(default)]
+    delta: Option<OpenAiCompatibleMessage>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenAiCompatibleMessage {
     #[serde(default)]
     role: Option<String>,
@@ -538,14 +540,29 @@ struct OpenAiCompatibleMessage {
     tool_calls: Vec<OpenAiCompatibleToolCall>,
 }
 
-#[derive(Debug, Deserialize)]
+fn choice_message(
+    choice: &OpenAiCompatibleChoice,
+) -> Result<OpenAiCompatibleMessage, AdapterError> {
+    choice
+        .message
+        .clone()
+        .or_else(|| choice.delta.clone())
+        .ok_or_else(|| {
+            AdapterError::Response(format!(
+                "OpenAI-compatible choice contained neither message nor delta: {}",
+                serde_json::to_string(choice).unwrap_or_else(|_| "<unserializable choice>".into())
+            ))
+        })
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleToolCall {
     #[serde(rename = "type")]
     kind: String,
     function: OpenAiCompatibleToolFunction,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleToolFunction {
     name: String,
     arguments: String,
