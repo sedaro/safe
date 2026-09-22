@@ -498,6 +498,17 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                 "OpenAI-compatible response did not include a choice".to_string(),
             )
         })?;
+        let finish_reason = openai_finish_reason(choice.finish_reason.as_deref());
+        if finish_reason == CompletionFinishReason::Length {
+            return Ok(ToolChatCompletion {
+                message: ToolChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason,
+            });
+        }
         let message = choice_message(&choice)?;
         let tool_calls = message
             .tool_calls
@@ -510,7 +521,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                 content: message.content.unwrap_or_default(),
                 tool_calls,
             },
-            finish_reason: openai_finish_reason(choice.finish_reason.as_deref()),
+            finish_reason,
         })
     }
 }
@@ -917,6 +928,29 @@ mod tests {
             .await
             .expect_err("missing choice message must fail closed");
         assert!(error.to_string().contains("neither message nor delta"));
+        let _ = server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_preserves_length_without_message() {
+        let response = json!({
+            "choices": [{"message": null, "finish_reason": "length"}]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let completion = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect("length response should remain classified");
+        assert_eq!(completion.finish_reason, CompletionFinishReason::Length);
+        assert!(completion.message.tool_calls.is_empty());
         let _ = server.await.expect("test server should finish");
     }
 
