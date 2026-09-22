@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 use tokio::{process::Command as TokioCommand, time::timeout};
 
 mod eds_data;
@@ -366,9 +367,35 @@ impl SedaroSimulator {
         self
     }
 
-    /// Runs EDS for the requested number of simulation days.
-    pub async fn run(&self, duration_days: f64) -> Result<std::process::Output> {
-        let (workspace_dir, executable_path) = self.resolve_workspace_and_executable()?;
+    fn isolated_workspace(&self, source_workspace: &std::path::Path) -> Result<TempDir> {
+        let workspace = tempfile::Builder::new()
+            .prefix("safe-eds-")
+            .tempdir()
+            .context("failed to create isolated EDS workspace")?;
+        let source_data = source_workspace.join("data");
+        if source_data.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&source_data, workspace.path().join("data")).with_context(
+                || {
+                    format!(
+                        "failed to link EDS data directory '{}' into isolated workspace '{}'",
+                        source_data.display(),
+                        workspace.path().display()
+                    )
+                },
+            )?;
+            #[cfg(not(unix))]
+            anyhow::bail!("isolated EDS workspaces require Unix symlink support");
+        }
+        Ok(workspace)
+    }
+
+    async fn run_in_workspace(
+        &self,
+        duration_days: f64,
+        workspace_dir: &std::path::Path,
+        executable_path: &std::path::Path,
+    ) -> Result<std::process::Output> {
         let mut command_args = vec!["--duration".to_string(), duration_days.to_string()];
         if let Some(epoch_mjd) = self.epoch {
             command_args.push("--start".to_string());
@@ -376,8 +403,10 @@ impl SedaroSimulator {
         }
         command_args.push("--target-config".to_string());
         command_args.push(self.target_config.clone());
+        command_args.push("--workspace-dir".to_string());
+        command_args.push(workspace_dir.display().to_string());
 
-        let mut cmd = TokioCommand::new(&executable_path);
+        let mut cmd = TokioCommand::new(executable_path);
         let cmd = cmd
             .args(command_args)
             .args(self.args.clone())
@@ -433,34 +462,43 @@ impl SedaroSimulator {
         }
     }
 
-    /// Runs EDS, collects only this instance's target files, and removes that directory.
+    /// Runs EDS for the requested number of simulation days.
+    pub async fn run(&self, duration_days: f64) -> Result<std::process::Output> {
+        let (workspace_dir, executable_path) = self.resolve_workspace_and_executable()?;
+        self.run_in_workspace(duration_days, &workspace_dir, &executable_path)
+            .await
+    }
+
+    /// Runs EDS in an isolated workspace and collects only this instance's target files.
     pub async fn run_collect(&self, duration_days: f64) -> Result<SimulationResult> {
-        let workspace_dir = self.workspace_dir()?;
-        let target_dir = workspace_dir.join(&self.target_config);
-        let output = match self.run(duration_days).await {
+        let (source_workspace, executable_path) = self.resolve_workspace_and_executable()?;
+        // Target configs do not isolate EDS workspace-relative state such as local/.
+        let workspace = self.isolated_workspace(&source_workspace)?;
+        let target_dir = workspace.path().join(&self.target_config);
+        let output = match self
+            .run_in_workspace(duration_days, workspace.path(), &executable_path)
+            .await
+        {
             Ok(output) => output,
             Err(error) => {
-                if should_delete_eds_results() {
-                    let _ = std::fs::remove_dir_all(&target_dir);
+                if !should_delete_eds_results() {
+                    let retained_workspace = workspace.path().to_path_buf();
+                    std::mem::forget(workspace);
+                    tracing::debug!(
+                        workspace = %retained_workspace.display(),
+                        "Keeping isolated EDS workspace (SAFE_DELETE_EDS_RESULTS=false)"
+                    );
                 }
                 return Err(error);
             }
         };
         let result = SimulationResult::from_target_dir(&output, &target_dir);
-        if should_delete_eds_results() {
-            if let Err(error) = std::fs::remove_dir_all(&target_dir) {
-                if target_dir.exists() {
-                    tracing::warn!(
-                        target_dir = %target_dir.display(),
-                        %error,
-                        "Failed to remove EDS results directory"
-                    );
-                }
-            }
-        } else {
+        if !should_delete_eds_results() {
+            let retained_workspace = workspace.path().to_path_buf();
+            std::mem::forget(workspace);
             tracing::debug!(
-                target_dir = %target_dir.display(),
-                "Keeping EDS results directory (SAFE_DELETE_EDS_RESULTS=false)"
+                workspace = %retained_workspace.display(),
+                "Keeping isolated EDS workspace (SAFE_DELETE_EDS_RESULTS=false)"
             );
         }
         result

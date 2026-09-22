@@ -649,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn simulator_uses_and_cleans_unique_target_config() {
         let workspace = fake_eds(
-            "printf '%s\\n' \"$*\" >> invocations && for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\"; fi; previous=\"$arg\"; done",
+            "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/invocations\" && for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\"; fi; previous=\"$arg\"; done",
         );
         let first = simulator(&workspace);
         let second = first.clone();
