@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use safe::protocol::{
-    AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, Command, ModeToSafe, SafeToMode,
-    TimedCommand,
+    AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, ModeToSafe, SafeToMode,
 };
 use safe::telemetry_frame::TelemetryFrame;
 use safe::transports::Transport;
@@ -29,7 +28,7 @@ fn high_temperature_frame(ts_mono: u64) -> TelemetryFrame {
 }
 
 #[tokio::test]
-async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
+async fn persisted_static_anomaly_does_not_auto_emit_a_single_configured_action() {
     let mode_id = AutonomyModeId(Uuid::from_u128(1));
     let temp_dir = tempdir().expect("temporary directory");
     let socket_path = temp_dir.path().join("mode_anomaly_recovery.sock");
@@ -89,21 +88,13 @@ async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
         .await
         .expect("activate advisor");
 
-    let mut emitted_command = None;
-    for _ in 0..6 {
-        let output = timeout(Duration::from_secs(5), stream.read())
-            .await
-            .expect("advisor output timeout")
-            .expect("advisor output failed");
-        if let ModeToSafe::Output(AutonomyModeOutput::Command(envelope)) = output {
-            emitted_command = Some(envelope.cmd);
-            break;
-        }
+    // The fixture points at no local model. Assessment-first behavior must not
+    // replace that unavailable evidence with the former single-action shortcut.
+    if let Ok(Ok(ModeToSafe::Output(output))) =
+        timeout(Duration::from_millis(300), stream.read()).await
+    {
+        assert!(!matches!(output, AutonomyModeOutput::Command(_)));
     }
-    assert!(matches!(
-        emitted_command,
-        Some(TimedCommand::Now(Command::PointSunYaw))
-    ));
 
     stream
         .write(SafeToMode::Input(AutonomyModeInput::Shutdown))
