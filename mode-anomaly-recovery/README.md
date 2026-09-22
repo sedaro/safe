@@ -138,8 +138,10 @@ generation settings:
 | --- | --- |
 | `llm.request_timeout_ms` | `20000` |
 | `llm.response_temperature` | `0.0` |
-| `llm.max_output_tokens` | `2048` (maximum) |
-| `max_prompt_chars` | `3500` |
+| `llm.max_output_tokens` | `256` |
+| `llm.context_window_tokens` | `2048` |
+| `llm.context_safety_margin_tokens` | `256` |
+| `max_prompt_chars` | `1600` |
 | `max_response_chars` | `800` |
 | `max_decision_attempts` | `3` |
 | `max_feedback_chars` | `400` |
@@ -151,7 +153,7 @@ The supported adapter kinds are:
 | Kind | Provider config |
 | --- | --- |
 | `ollama` | `endpoint`: absolute Ollama generate URL, usually `http://127.0.0.1:11434/api/generate`. |
-| `openai_compatible` | `endpoint`: absolute chat-completions URL. `api_key_env` is optional and names the environment variable containing the bearer token. |
+| `openai_compatible` | `endpoint`: absolute chat-completions URL. `api_key_env` is optional and names the environment variable containing the bearer token. HTTPS requires the `https` Cargo feature. |
 
 For example, an OpenAI-compatible service can be configured without storing a
 secret in `mode_config`:
@@ -169,10 +171,17 @@ secret in `mode_config`:
     "model": "example-model",
     "request_timeout_ms": 20000,
     "response_temperature": 0.0,
-    "max_output_tokens": 2048
+    "max_output_tokens": 256,
+    "context_window_tokens": 2048,
+    "context_safety_margin_tokens": 256
   }
 }
 ```
+
+The default build contains only the adapter's small HTTP/1.1 client. Build with
+`cargo build -p mode-anomaly-recovery --features https` to add native-root TLS
+support for hosted endpoints such as the example above. The focused client does
+not follow redirects; configure the final HTTP or HTTPS endpoint directly.
 
 The adapter validates its own `config` object and rejects unknown provider
 fields. `ollama_host`, `ollama_port`, `ollama_path`, top-level `model`, and
@@ -187,12 +196,19 @@ loading is not supported.
 `goal` and `analysis_instructions` also have safe default text and may be
 overridden to constrain the decision prompt.
 
-The 2048-token ceiling is sufficient for the advertised tool calls: context
-tools take no arguments, assessment rationale and uncertainty are bounded to
-800 and 400 characters, up to four 200-character forecast risks are allowed,
-and recovery-selection rationale is bounded to 400 characters. Configuration
-validation rejects larger token budgets, and host validation enforces the same
-text limits even when a provider does not honor JSON Schema length keywords.
+`context_window_tokens` is the server's total context window, not a completion
+allowance. Before every native-tool request, the mode conservatively estimates
+the serialized messages and tools, adds `max_output_tokens` and the safety
+margin, and fails closed if the total exceeds that window. Context-only tools
+use at most 64 output tokens; assessment and selection use the configured
+allowance. For a 2048-token server, keep the defaults unless the server's
+chat-template overhead has been measured.
+
+Prompts contain only phase-relevant candidate IDs, observations, action IDs,
+and bounded evidence summaries. Assessment rationale and uncertainty are
+bounded to 400 and 160 characters, up to two 100-character forecast risks are
+allowed, and recovery-selection rationale is bounded to 200 characters. Host
+validation enforces these limits even when a provider ignores JSON Schema.
 
 ## Live Decision Trace
 
@@ -443,7 +459,8 @@ baseline/recovery viability check. It requires `OPENAI_API_KEY` and the
 configured EDS workspace (the checked-in example uses `/workspace/bundle_juno`):
 
 ```bash
-cargo test -p mode-anomaly-recovery --test live_openai_simulation_e2e \
+cargo test -p mode-anomaly-recovery --features https \
+  --test live_openai_simulation_e2e \
   -- --ignored --nocapture
 ```
 

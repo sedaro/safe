@@ -69,7 +69,7 @@ pub(crate) fn telemetry_summary(snapshot: &LiveContextSnapshot) -> Value {
             source,
             json!({
                 "sample_count": samples.len(),
-                "latest": latest,
+                "latest_ts_mono": latest.map(|sample| sample.ts_mono),
                 "trend": trend(samples.iter().map(|sample| (sample.ts_mono, &sample.payload))),
             }),
         );

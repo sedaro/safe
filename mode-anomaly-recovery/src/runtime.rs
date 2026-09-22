@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(request.prompt, "test prompt");
         assert_eq!(request.response_schema["required"][0], "anomaly_id");
         assert_eq!(request.temperature, 0.0);
-        assert_eq!(request.max_output_tokens, 2048);
+        assert_eq!(request.max_output_tokens, 256);
     }
 
     #[tokio::test]

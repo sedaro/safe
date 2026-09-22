@@ -3,11 +3,12 @@ use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::timeout;
+
+mod http_client;
+
+use http_client::Endpoint;
 
 /// Provider-neutral request issued by an LLM caller.
 #[derive(Debug, Clone)]
@@ -186,7 +187,6 @@ impl LlmAdapterFactory for OllamaAdapterFactory {
             })?;
         Ok(Box::new(OllamaAdapter {
             endpoint: parse_endpoint(&config.endpoint, "ollama")?,
-            client: Client::new(),
         }))
     }
 }
@@ -198,8 +198,7 @@ struct OllamaAdapterConfig {
 }
 
 struct OllamaAdapter {
-    endpoint: Url,
-    client: Client,
+    endpoint: Endpoint,
 }
 
 #[async_trait]
@@ -219,8 +218,7 @@ impl LlmAdapter for OllamaAdapter {
                 "num_predict": request.max_output_tokens,
             },
         });
-        let body_text =
-            post_json(&self.client, self.endpoint.clone(), body, request.timeout).await?;
+        let body_text = post_json(&self.endpoint, body, request.timeout).await?;
         let response: OllamaResponse = serde_json::from_str(&body_text).map_err(|error| {
             AdapterError::Response(format!("invalid Ollama JSON payload: {error}"))
         })?;
@@ -260,7 +258,7 @@ impl LlmAdapter for OllamaAdapter {
             "stream": false,
             "options": {"temperature": request.temperature, "num_predict": request.max_output_tokens},
         });
-        let body_text = post_json(&self.client, endpoint, body, request.timeout).await?;
+        let body_text = post_json(&endpoint, body, request.timeout).await?;
         let response: OllamaChatResponse = serde_json::from_str(&body_text).map_err(|error| {
             AdapterError::Response(format!("invalid Ollama chat JSON payload: {error}"))
         })?;
@@ -385,7 +383,6 @@ impl LlmAdapterFactory for OpenAiCompatibleAdapterFactory {
         Ok(Box::new(OpenAiCompatibleAdapter {
             endpoint: parse_endpoint(&config.endpoint, "openai_compatible")?,
             api_key,
-            client: Client::new(),
         }))
     }
 }
@@ -399,9 +396,8 @@ struct OpenAiCompatibleAdapterConfig {
 }
 
 struct OpenAiCompatibleAdapter {
-    endpoint: Url,
+    endpoint: Endpoint,
     api_key: Option<String>,
-    client: Client,
 }
 
 #[async_trait]
@@ -426,8 +422,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             },
         });
         let body_text = post_json_with_auth(
-            &self.client,
-            self.endpoint.clone(),
+            &self.endpoint,
             body.clone(),
             request.timeout,
             self.api_key.as_deref(),
@@ -479,8 +474,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             "max_completion_tokens": request.max_output_tokens,
         });
         let body_text = post_json_with_auth(
-            &self.client,
-            self.endpoint.clone(),
+            &self.endpoint,
             body.clone(),
             request.timeout,
             self.api_key.as_deref(),
@@ -496,21 +490,17 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                 object.insert("max_tokens".to_string(), json!(request.max_output_tokens));
             }
             if let Ok(legacy_text) = post_json_with_auth(
-                &self.client,
-                self.endpoint.clone(),
+                &self.endpoint,
                 legacy_body,
                 request.timeout,
                 self.api_key.as_deref(),
             )
             .await
+                && let Ok(legacy_result) = parse_tool_chat_response(&legacy_text)
+                && (legacy_result.finish_reason != CompletionFinishReason::Length
+                    || !legacy_result.message.tool_calls.is_empty())
             {
-                if let Ok(legacy_result) = parse_tool_chat_response(&legacy_text) {
-                    if legacy_result.finish_reason != CompletionFinishReason::Length
-                        || !legacy_result.message.tool_calls.is_empty()
-                    {
-                        return Ok(legacy_result);
-                    }
-                }
+                return Ok(legacy_result);
             }
         }
         Ok(first)
@@ -642,58 +632,25 @@ fn openai_finish_reason(reason: Option<&str>) -> CompletionFinishReason {
     }
 }
 
-fn parse_endpoint(endpoint: &str, adapter: &str) -> Result<Url, AdapterError> {
-    let url = Url::parse(endpoint).map_err(|error| {
-        AdapterError::Configuration(format!(
-            "{adapter} endpoint must be an absolute URL: {error}"
-        ))
-    })?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AdapterError::Configuration(format!(
-            "{adapter} endpoint must be an absolute HTTP(S) URL"
-        )));
-    }
-    Ok(url)
+fn parse_endpoint(endpoint: &str, adapter: &str) -> Result<Endpoint, AdapterError> {
+    Endpoint::parse(endpoint, adapter)
 }
 
 async fn post_json(
-    client: &Client,
-    endpoint: Url,
+    endpoint: &Endpoint,
     body: Value,
     request_timeout: Duration,
 ) -> Result<String, AdapterError> {
-    post_json_with_auth(client, endpoint, body, request_timeout, None).await
+    post_json_with_auth(endpoint, body, request_timeout, None).await
 }
 
 async fn post_json_with_auth(
-    client: &Client,
-    endpoint: Url,
+    endpoint: &Endpoint,
     body: Value,
     request_timeout: Duration,
     api_key: Option<&str>,
 ) -> Result<String, AdapterError> {
-    let mut request = client
-        .post(endpoint)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&body);
-    if let Some(api_key) = api_key {
-        request = request.header(AUTHORIZATION, format!("Bearer {api_key}"));
-    }
-    let response = timeout(request_timeout, request.send())
-        .await
-        .map_err(|_| AdapterError::Timeout)?
-        .map_err(|error| AdapterError::Transport(format!("{error:?}")))?;
-    let status = response.status();
-    let body_text = response.text().await.map_err(|error| {
-        AdapterError::Transport(format!("failed reading response body: {error}"))
-    })?;
-    if !status.is_success() {
-        return Err(AdapterError::Http {
-            status: status.as_u16(),
-            body: clip_chars(&body_text, 400),
-        });
-    }
-    Ok(body_text)
+    http_client::post_json(endpoint, &body.to_string(), request_timeout, api_key).await
 }
 
 fn clip_chars(input: &str, max_chars: usize) -> String {

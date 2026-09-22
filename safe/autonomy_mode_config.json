@@ -20,7 +20,9 @@
           }
         },
         "model": "mistral:7b",
-        "max_output_tokens": 2048
+        "max_output_tokens": 256,
+        "context_window_tokens": 2048,
+        "context_safety_margin_tokens": 256
       },
       "action_catalog": [
         {

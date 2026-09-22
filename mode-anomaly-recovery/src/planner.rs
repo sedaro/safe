@@ -30,11 +30,12 @@ use crate::types::{
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
-const MAX_ASSESSMENT_RATIONALE_CHARS: usize = 800;
-const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 400;
-const MAX_FORECAST_RISKS: usize = 4;
-const MAX_FORECAST_RISK_CHARS: usize = 200;
-const MAX_SELECTION_REASON_CHARS: usize = 400;
+const MAX_ASSESSMENT_RATIONALE_CHARS: usize = 400;
+const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 160;
+const MAX_FORECAST_RISKS: usize = 2;
+const MAX_FORECAST_RISK_CHARS: usize = 100;
+const MAX_SELECTION_REASON_CHARS: usize = 200;
+const CONTEXT_TOOL_OUTPUT_TOKENS: u32 = 64;
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -171,6 +172,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             assessment.as_ref(),
         );
         let available_tools = tool_names(&phase_tools);
+        let max_output_tokens = output_budget(&phase_tools, request.config.llm.max_output_tokens);
         let response = tokio::select! {
             _ = request.cancel.cancelled() => return Ok(()),
             result = chat(&request, messages.clone(), phase_tools) => result?,
@@ -181,7 +183,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 &available_tools,
                 request.adapter.kind(),
                 &request.config.llm.model,
-                request.config.llm.max_output_tokens,
+                max_output_tokens,
             );
             let available_tools = available_tools.join(",");
             warn!(
@@ -190,7 +192,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 available_tools,
                 adapter = request.adapter.kind(),
                 model = %request.config.llm.model,
-                max_output_tokens = request.config.llm.max_output_tokens,
+                max_output_tokens,
                 "anomaly recovery tool-call response stopped at token limit"
             );
             bail!(
@@ -254,7 +256,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     "get_command_board_state" => {
                         parse_read_context_arguments(call, "get_command_board_state")?;
                         let snapshot = request.live_context.snapshot();
-                        let result = command_board_result(&request.live_context)?;
+                        let _result = command_board_result(&request.live_context)?;
                         let status = if snapshot.board.is_some() {
                             "ok"
                         } else {
@@ -264,13 +266,13 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                             "board",
                             snapshot.board_version,
                             status,
-                            serde_json::from_str(&result)?,
+                            board_summary(&snapshot),
                         );
                     }
                     _ => unreachable!("parallel context-call allow-list checked above"),
                 }
             }
-            messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             continue;
         }
         if calls.len() != 1 {
@@ -307,12 +309,12 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     status,
                     telemetry_summary(&snapshot),
                 );
-                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+                messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             }
             "get_command_board_state" => {
                 parse_read_context_arguments(call, "get_command_board_state")?;
                 let snapshot = request.live_context.snapshot();
-                let result = command_board_result(&request.live_context)?;
+                let _result = command_board_result(&request.live_context)?;
                 let status = if snapshot.board.is_some() {
                     "ok"
                 } else {
@@ -322,9 +324,9 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     "board",
                     snapshot.board_version,
                     status,
-                    serde_json::from_str(&result)?,
+                    board_summary(&snapshot),
                 );
-                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+                messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             }
             "run_eds_simulation" => {
                 if runs >= request.config.simulation.as_ref().map_or(0, |s| s.max_runs) {
@@ -365,7 +367,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     serde_json::to_value(&tool_result)?,
                 );
                 info!(decision_trace = request.config.decision_trace, stage = "simulation_result", turn, runs, elapsed_ms = started_run.elapsed().as_millis() as u64, scenario = %scenario.id, status = tool_result.status, "anomaly recovery simulation tool completed");
-                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+                messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             }
             "complete_thermal_assessment" => {
                 let args: CompleteAssessmentArguments =
@@ -380,7 +382,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     return Ok(());
                 }
                 assessment = Some(completed);
-                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+                messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             }
             "select_recovery_action" => {
                 let assessment = assessment.as_ref().ok_or_else(|| {
@@ -391,7 +393,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     Err(error) => {
                         messages = fresh_selection_messages(format!(
                             "{} Selection validation failed: invalid arguments: {error}. Retry select_recovery_action with a non-empty reason and exact IDs.",
-                            context_prompt(&request, &scenarios, &ledger)?
+                            context_prompt(&request, &ledger)?
                         ));
                         continue;
                     }
@@ -399,7 +401,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 if args.assessment_id != assessment.episode_id {
                     messages = fresh_selection_messages(format!(
                         "{} Selection validation failed: assessment_id must be exactly '{}'. Retry select_recovery_action.",
-                        context_prompt(&request, &scenarios, &ledger)?,
+                        context_prompt(&request, &ledger)?,
                         assessment.episode_id
                     ));
                     continue;
@@ -413,7 +415,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     Err(error) => {
                         messages = fresh_selection_messages(format!(
                             "{} Selection validation failed: {error}. Retry select_recovery_action with a non-empty reason and exact configured IDs.",
-                            context_prompt(&request, &scenarios, &ledger)?
+                            context_prompt(&request, &ledger)?
                         ));
                         continue;
                     }
@@ -516,10 +518,10 @@ fn applicable_scenarios<'a>(
         .unwrap_or_default()
 }
 
-fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Result<String> {
+fn prompt(request: &PlanningRequest, _scenarios: &[&SimulationScenario]) -> Result<String> {
     let text = format!(
-        "You are a constrained SAFE thermal assessment advisor. First inspect telemetry and command-board context. Then complete an assessment with an explicit outcome; recovery is optional and can only follow an anomaly assessment. Use only supplied values. Never invent IDs. Context: {}",
-        serde_json::to_string(&planning_context(request, scenarios))?
+        "Inspect telemetry and command-board context using the available tools. Use only supplied values and never invent IDs. Candidates: {}",
+        serde_json::to_string(&compact_candidates(request))?
     );
     bounded_prompt(request, text)
 }
@@ -540,9 +542,10 @@ fn validate_assessment(
         bail!("assessment uncertainty is invalid");
     }
     if args.forecast_risks.len() > MAX_FORECAST_RISKS
-        || args.forecast_risks.iter().any(|risk| {
-            risk.trim().is_empty() || risk.chars().count() > MAX_FORECAST_RISK_CHARS
-        })
+        || args
+            .forecast_risks
+            .iter()
+            .any(|risk| risk.trim().is_empty() || risk.chars().count() > MAX_FORECAST_RISK_CHARS)
     {
         bail!("assessment forecast risks are invalid");
     }
@@ -600,15 +603,12 @@ fn validate_assessment(
     })
 }
 
-fn context_prompt(
-    request: &PlanningRequest,
-    scenarios: &[&SimulationScenario],
-    ledger: &EvidenceLedger,
-) -> Result<String> {
+fn context_prompt(request: &PlanningRequest, ledger: &EvidenceLedger) -> Result<String> {
     let text = format!(
-        "You are a constrained SAFE thermal assessment advisor. Build an evidence-backed assessment. Use only supplied values and never invent IDs. Cumulative evidence: {} Context: {}",
+        "Build an evidence-backed assessment or select an eligible action when available. Use only supplied values and never invent IDs. Evidence: {} Candidates: {} Actions: {}",
         serde_json::to_string(&ledger.prompt_value())?,
-        serde_json::to_string(&planning_context(request, scenarios))?
+        serde_json::to_string(&compact_candidates(request))?,
+        serde_json::to_string(&compact_actions(request))?
     );
     bounded_prompt(request, text)
 }
@@ -621,8 +621,35 @@ fn fresh_selection_messages(content: String) -> Vec<ToolChatMessage> {
     }]
 }
 
-fn planning_context(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Value {
-    json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "actions": request.config.action_catalog, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"thermal":s.thermal,"baseline_scenario_id":s.baseline_scenario_id,"modeled_action":s.modeled_action,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| json!({"id":m.id,"quantity":m.quantity,"units":m.units})).collect::<Vec<_>>() })).collect::<Vec<_>>()})
+fn compact_candidates(request: &PlanningRequest) -> Value {
+    json!(
+        request
+            .candidates
+            .iter()
+            .map(|candidate| json!({
+                "id": candidate.anomaly_id,
+                "source": candidate.source,
+                "observed": candidate.observed,
+                "expectation": candidate.expectation,
+                "severity": candidate.severity,
+                "eligible_actions": candidate.eligible_actions,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn compact_actions(request: &PlanningRequest) -> Value {
+    json!(
+        request
+            .config
+            .action_catalog
+            .iter()
+            .map(|action| json!({
+                "id": action.id,
+                "description": action.description,
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn bounded_prompt(request: &PlanningRequest, text: String) -> Result<String> {
@@ -746,6 +773,18 @@ async fn chat(
     messages: Vec<ToolChatMessage>,
     tools: Vec<Value>,
 ) -> Result<ToolChatCompletion> {
+    let max_output_tokens = output_budget(&tools, request.config.llm.max_output_tokens);
+    let estimated_input_tokens = estimate_request_tokens(&messages, &tools)?;
+    let estimated_total_tokens = estimated_input_tokens
+        .saturating_add(max_output_tokens)
+        .saturating_add(request.config.llm.context_safety_margin_tokens);
+    if estimated_total_tokens > request.config.llm.context_window_tokens {
+        bail!(
+            "tool-call request exceeds context window: estimated_input_tokens={estimated_input_tokens} max_output_tokens={max_output_tokens} context_safety_margin_tokens={} context_window_tokens={}",
+            request.config.llm.context_safety_margin_tokens,
+            request.config.llm.context_window_tokens,
+        );
+    }
     request
         .adapter
         .tool_chat(ToolChatRequest {
@@ -753,7 +792,7 @@ async fn chat(
             messages,
             tools,
             temperature: request.config.llm.response_temperature,
-            max_output_tokens: request.config.llm.max_output_tokens,
+            max_output_tokens,
             timeout: Duration::from_millis(request.config.llm.request_timeout_ms),
         })
         .await
@@ -763,6 +802,36 @@ async fn chat(
                 request.adapter.kind()
             )
         })
+}
+
+fn output_budget(tools: &[Value], configured_budget: u32) -> u32 {
+    if tools.iter().all(|tool| {
+        matches!(
+            tool.pointer("/function/name").and_then(Value::as_str),
+            Some("get_latest_telemetry" | "get_command_board_state")
+        )
+    }) {
+        configured_budget.min(CONTEXT_TOOL_OUTPUT_TOKENS)
+    } else {
+        configured_budget
+    }
+}
+
+fn estimate_request_tokens(messages: &[ToolChatMessage], tools: &[Value]) -> Result<u32> {
+    let payload = json!({
+        "messages": messages.iter().map(|message| json!({
+            "role": message.role,
+            "content": message.content,
+            "tool_calls": message.tool_calls.iter().map(|call| json!({
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "tools": tools,
+    });
+    let bytes = serde_json::to_vec(&payload)?.len();
+    // Three bytes per token deliberately overestimates typical JSON tokenization.
+    Ok(u32::try_from(bytes.div_ceil(3)).unwrap_or(u32::MAX))
 }
 
 fn parse_read_context_arguments(call: &safe_llm_adapter::ToolCall, name: &str) -> Result<()> {
@@ -803,6 +872,13 @@ fn command_board_result(context: &LiveContext) -> Result<String> {
         }),
     };
     bounded_context_json(value)
+}
+
+fn board_summary(snapshot: &crate::types::LiveContextSnapshot) -> Value {
+    json!({
+        "available": snapshot.board.is_some(),
+        "version": snapshot.board_version,
+    })
 }
 
 fn bounded_context_json(value: Value) -> Result<String> {
@@ -992,9 +1068,7 @@ fn evaluate<'a>(
     candidates: &'a [AnomalyCandidate],
     args: &SelectArguments,
 ) -> Result<(&'a AnomalyCandidate, AllowedAction)> {
-    if args.reason.trim().is_empty()
-        || args.reason.chars().count() > MAX_SELECTION_REASON_CHARS
-    {
+    if args.reason.trim().is_empty() || args.reason.chars().count() > MAX_SELECTION_REASON_CHARS {
         bail!("final reason is invalid");
     }
     let candidate = candidates
@@ -1188,10 +1262,7 @@ mod tests {
             properties["uncertainty"]["maxLength"],
             MAX_ASSESSMENT_UNCERTAINTY_CHARS
         );
-        assert_eq!(
-            properties["forecast_risks"]["maxItems"],
-            MAX_FORECAST_RISKS
-        );
+        assert_eq!(properties["forecast_risks"]["maxItems"], MAX_FORECAST_RISKS);
         assert_eq!(
             properties["forecast_risks"]["items"]["maxLength"],
             MAX_FORECAST_RISK_CHARS
@@ -1303,6 +1374,30 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "select now");
         assert!(messages[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn context_tools_use_a_small_output_budget() {
+        assert_eq!(
+            output_budget(&[latest_telemetry_tool(), command_board_tool()], 256),
+            CONTEXT_TOOL_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            output_budget(
+                &[assessment_tool(&[candidate()], &EvidenceLedger::default())],
+                256
+            ),
+            256
+        );
+    }
+
+    #[test]
+    fn request_token_estimate_counts_messages_and_tools() {
+        let messages = fresh_selection_messages("inspect context".into());
+        let without_tools = estimate_request_tokens(&messages, &[]).unwrap();
+        let with_tools = estimate_request_tokens(&messages, &[latest_telemetry_tool()]).unwrap();
+        assert!(without_tools > 0);
+        assert!(with_tools > without_tools);
     }
 
     #[test]
