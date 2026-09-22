@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const MAX_OUTPUT_TOKENS: u32 = 2_048;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 2_048;
+const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u32 = 256;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -327,6 +329,10 @@ pub(crate) struct LlmConfig {
     pub(crate) response_temperature: f64,
     #[serde(default = "default_max_output_tokens")]
     pub(crate) max_output_tokens: u32,
+    #[serde(default = "default_context_window_tokens")]
+    pub(crate) context_window_tokens: u32,
+    #[serde(default = "default_context_safety_margin_tokens")]
+    pub(crate) context_safety_margin_tokens: u32,
 }
 
 impl LlmConfig {
@@ -344,8 +350,19 @@ impl LlmConfig {
             bail!("llm.response_temperature must be finite and non-negative");
         }
         if self.max_output_tokens == 0 || self.max_output_tokens > MAX_OUTPUT_TOKENS {
+            bail!("llm.max_output_tokens must be between 1 and {MAX_OUTPUT_TOKENS}");
+        }
+        if self.context_window_tokens == 0 {
+            bail!("llm.context_window_tokens must be greater than zero");
+        }
+        if self.context_safety_margin_tokens >= self.context_window_tokens
+            || self
+                .max_output_tokens
+                .saturating_add(self.context_safety_margin_tokens)
+                >= self.context_window_tokens
+        {
             bail!(
-                "llm.max_output_tokens must be between 1 and {MAX_OUTPUT_TOKENS}"
+                "llm.max_output_tokens plus llm.context_safety_margin_tokens must be less than llm.context_window_tokens"
             );
         }
         Ok(())
@@ -363,6 +380,8 @@ impl Default for LlmConfig {
             request_timeout_ms: default_request_timeout_ms(),
             response_temperature: default_response_temperature(),
             max_output_tokens: default_max_output_tokens(),
+            context_window_tokens: default_context_window_tokens(),
+            context_safety_margin_tokens: default_context_safety_margin_tokens(),
         }
     }
 }
@@ -681,7 +700,7 @@ fn default_request_timeout_ms() -> u64 {
 }
 
 fn default_max_prompt_chars() -> usize {
-    3_500
+    1_600
 }
 
 fn default_max_response_chars() -> usize {
@@ -693,7 +712,15 @@ fn default_response_temperature() -> f64 {
 }
 
 fn default_max_output_tokens() -> u32 {
-    MAX_OUTPUT_TOKENS
+    256
+}
+
+fn default_context_window_tokens() -> u32 {
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+fn default_context_safety_margin_tokens() -> u32 {
+    DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
 }
 
 fn default_max_decision_attempts() -> u8 {
@@ -759,14 +786,29 @@ mod tests {
     }
 
     #[test]
-    fn default_tool_call_budget_supports_structured_native_calls() {
-        assert_eq!(valid_config().llm.max_output_tokens, MAX_OUTPUT_TOKENS);
+    fn default_tool_call_budget_reserves_context_for_structured_native_calls() {
+        let llm = &valid_config().llm;
+        assert_eq!(llm.max_output_tokens, 256);
+        assert_eq!(llm.context_window_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(
+            llm.context_safety_margin_tokens,
+            DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+        );
     }
 
     #[test]
     fn rejects_output_budget_above_provider_ceiling() {
         let mut config = valid_config();
         config.llm.max_output_tokens = MAX_OUTPUT_TOKENS + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_output_and_margin_that_exhaust_the_context_window() {
+        let mut config = valid_config();
+        config.llm.context_window_tokens = 512;
+        config.llm.max_output_tokens = 256;
+        config.llm.context_safety_margin_tokens = 256;
         assert!(config.validate().is_err());
     }
 
