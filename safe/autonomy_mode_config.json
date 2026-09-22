@@ -19,7 +19,8 @@
             "endpoint": "http://127.0.0.1:11434/api/generate"
           }
         },
-        "model": "mistral:7b"
+        "model": "mistral:7b",
+        "max_output_tokens": 2048
       },
       "action_catalog": [
         {

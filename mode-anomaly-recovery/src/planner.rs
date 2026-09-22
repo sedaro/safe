@@ -8,72 +8,49 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use safe::mode_runtime::ModeOutputTx;
 use safe::protocol::{AutonomyModeId, Command, CommandEnvelope, TimedCommand};
+use safe_llm_adapter::{
+    CompletionFinishReason, LlmAdapter, ToolChatCompletion, ToolChatMessage, ToolChatRequest,
+};
 use safe_sim::{CancellationToken, EdsPatch, SedaroSimulator, SimulationResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::timeout;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{
     AllowedAction, AnomalyRecoveryModeConfig, MetricAggregation, SimulationScenario,
 };
-use crate::http_client;
-use crate::types::{AnomalyCandidate, TelemetrySample};
+use crate::evidence::{EvidenceLedger, telemetry_summary};
+use crate::simulation::{
+    ScenarioRun, ScenarioRunRequest, ScenarioRunner, UnitMetric, run_and_validate,
+};
+use crate::types::{
+    AnomalyCandidate, AssessmentOutcome, LiveContext, RecoveryDisposition, TelemetrySample,
+    ThermalAssessment,
+};
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
+const MAX_ASSESSMENT_RATIONALE_CHARS: usize = 800;
+const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 400;
+const MAX_FORECAST_RISKS: usize = 4;
+const MAX_FORECAST_RISK_CHARS: usize = 200;
+const MAX_SELECTION_REASON_CHARS: usize = 400;
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
     pub(crate) config: AnomalyRecoveryModeConfig,
     pub(crate) candidates: Vec<AnomalyCandidate>,
     pub(crate) telemetry: TelemetrySample,
+    pub(crate) live_context: LiveContext,
     pub(crate) mode_id: AutonomyModeId,
     pub(crate) generation: u64,
     pub(crate) generations: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
     pub(crate) output: ModeOutputTx,
-}
-
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    tools: Vec<Value>,
-    stream: bool,
-    options: ChatOptions,
-}
-#[derive(Serialize, Deserialize, Clone)]
-struct ChatMessage {
-    role: String,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCall>>,
-}
-#[derive(Serialize)]
-struct ChatOptions {
-    temperature: f64,
-    num_predict: u32,
-}
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: ChatMessage,
-    #[serde(default)]
-    done_reason: Option<String>,
-    #[serde(default)]
-    done: bool,
-    #[serde(default)]
-    eval_count: Option<u32>,
-}
-#[derive(Serialize, Deserialize, Clone)]
-struct ToolCall {
-    function: ToolFunction,
-}
-#[derive(Serialize, Deserialize, Clone)]
-struct ToolFunction {
-    name: String,
-    arguments: Value,
+    pub(crate) adapter: Arc<dyn LlmAdapter>,
+    pub(crate) telemetry_version: u64,
+    pub(crate) board_version: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,12 +62,28 @@ struct RunArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SelectArguments {
+    assessment_id: String,
     anomaly_id: String,
     action_id: String,
     reason: String,
     #[serde(default)]
     evidence_paths: Option<Vec<String>>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteAssessmentArguments {
+    outcome: AssessmentOutcome,
+    disposition: RecoveryDisposition,
+    candidate_ids: Vec<String>,
+    evidence_ids: Vec<String>,
+    rationale: String,
+    uncertainty: String,
+    #[serde(default)]
+    forecast_risks: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadContextArguments {}
 #[derive(Serialize)]
 struct ToolResult {
     status: &'static str,
@@ -98,6 +91,49 @@ struct ToolResult {
     run_id: u8,
     metrics: HashMap<String, f64>,
     error: Option<String>,
+}
+
+struct SedaroScenarioRunner {
+    config: AnomalyRecoveryModeConfig,
+    telemetry: TelemetrySample,
+}
+
+#[async_trait::async_trait]
+impl ScenarioRunner for SedaroScenarioRunner {
+    async fn run(&self, request: ScenarioRunRequest) -> Result<ScenarioRun> {
+        let simulation = self
+            .config
+            .simulation
+            .as_ref()
+            .ok_or_else(|| anyhow!("simulation is not configured"))?;
+        let scenario = simulation
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == request.scenario_id)
+            .ok_or_else(|| anyhow!("scenario is not configured"))?;
+        let metrics =
+            execute_scenario(&self.config, scenario, &self.telemetry, &HashMap::new(), 0).await?;
+        let metrics = metrics
+            .into_iter()
+            .map(|(id, value)| {
+                let units = scenario
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.id == id)
+                    .map(|metric| metric.units.clone())
+                    .unwrap_or_default();
+                (id, UnitMetric { value, units })
+            })
+            .collect();
+        Ok(ScenarioRun {
+            scenario_id: scenario.id.clone(),
+            success: true,
+            timed_out: false,
+            evidence_revision: request.evidence_revision,
+            horizon_days: request.horizon_days,
+            metrics,
+        })
+    }
 }
 
 pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
@@ -110,15 +146,16 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             .saturating_mul(MAX_TURNS as u64),
     );
     let scenarios = applicable_scenarios(&request.config, &request.candidates);
-    let mut messages = vec![ChatMessage {
+    let mut ledger = EvidenceLedger::default();
+    let mut messages = vec![ToolChatMessage {
         // Mistral receives concrete tool tasks reliably as a user turn. Tool
         // definitions remain native Ollama fields rather than prompt syntax.
         role: "user".into(),
         content: prompt(&request, &scenarios)?,
-        tool_calls: None,
+        tool_calls: Vec::new(),
     }];
     let mut runs = 0u8;
-    let mut used_scenarios = Vec::new();
+    let mut assessment: Option<ThermalAssessment> = None;
     for turn in 1..=MAX_TURNS {
         if cancelled(&request) {
             return Ok(());
@@ -126,53 +163,169 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         if started.elapsed() >= planning_limit {
             bail!("planning time budget exhausted");
         }
-        let phase_tools = if scenarios.is_empty() || runs > 0 {
-            vec![select_tool(&request.candidates)]
-        } else {
-            vec![simulation_tool(&scenarios)]
-        };
+        let phase_tools = phase_tools(
+            &request.candidates,
+            &scenarios,
+            runs,
+            &ledger,
+            assessment.as_ref(),
+        );
+        let available_tools = tool_names(&phase_tools);
         let response = tokio::select! {
             _ = request.cancel.cancelled() => return Ok(()),
-            result = chat(&request.config, messages.clone(), phase_tools) => result?,
+            result = chat(&request, messages.clone(), phase_tools) => result?,
         };
-        if response.done_reason.as_deref() == Some("length") {
+        if response.finish_reason == CompletionFinishReason::Length {
+            let detail = truncation_detail(
+                turn,
+                &available_tools,
+                request.adapter.kind(),
+                &request.config.llm.model,
+                request.config.llm.max_output_tokens,
+            );
+            let available_tools = available_tools.join(",");
+            warn!(
+                turn,
+                max_turns = MAX_TURNS,
+                available_tools,
+                adapter = request.adapter.kind(),
+                model = %request.config.llm.model,
+                max_output_tokens = request.config.llm.max_output_tokens,
+                "anomaly recovery tool-call response stopped at token limit"
+            );
             bail!(
-                "Ollama response stopped at token limit; use a tool-capable model with sufficient context"
+                "tool-call response stopped at token limit; {detail}; use a tool-capable model with sufficient context"
             );
         }
-        let calls = response.message.tool_calls.clone().unwrap_or_default();
+        let response_chars = response.message.content.chars().count()
+            + response
+                .message
+                .tool_calls
+                .iter()
+                .map(|call| call.name.chars().count() + call.arguments.to_string().chars().count())
+                .sum::<usize>();
+        if response_chars > request.config.max_response_chars.saturating_mul(8) {
+            bail!("tool-call response exceeded bounded limit");
+        }
+        let calls = response.message.tool_calls.clone();
         if request.config.decision_trace {
             info!(
                 decision_trace = true,
-                stage = "ollama_message",
+                stage = "tool_call_message",
                 turn,
-                done = response.done,
-                done_reason = ?response.done_reason,
-                eval_count = ?response.eval_count,
+                finish_reason = ?response.finish_reason,
                 assistant_content = %sanitize(&response.message.content),
-                "anomaly recovery parsed Ollama assistant message"
+                "anomaly recovery parsed tool-call assistant message"
             );
         }
         info!(
             decision_trace = request.config.decision_trace,
-            stage = "ollama_tool_calls",
+            stage = "tool_calls",
             turn,
             tool_call_count = calls.len(),
-            "anomaly recovery received Ollama tool-call response"
+            "anomaly recovery received native tool-call response"
         );
+        if calls.len() > 1
+            && calls.iter().all(|call| {
+                matches!(
+                    call.name.as_str(),
+                    "get_latest_telemetry" | "get_command_board_state"
+                )
+            })
+        {
+            for call in &calls {
+                match call.name.as_str() {
+                    "get_latest_telemetry" => {
+                        parse_read_context_arguments(call, "get_latest_telemetry")?;
+                        let snapshot = request.live_context.snapshot();
+                        let _result = latest_telemetry_result(&request.live_context)?;
+                        let status = if snapshot.telemetry.is_some() {
+                            "ok"
+                        } else {
+                            "unavailable"
+                        };
+                        ledger.record(
+                            "telemetry",
+                            snapshot.telemetry_version,
+                            status,
+                            telemetry_summary(&snapshot),
+                        );
+                    }
+                    "get_command_board_state" => {
+                        parse_read_context_arguments(call, "get_command_board_state")?;
+                        let snapshot = request.live_context.snapshot();
+                        let result = command_board_result(&request.live_context)?;
+                        let status = if snapshot.board.is_some() {
+                            "ok"
+                        } else {
+                            "unavailable"
+                        };
+                        ledger.record(
+                            "board",
+                            snapshot.board_version,
+                            status,
+                            serde_json::from_str(&result)?,
+                        );
+                    }
+                    _ => unreachable!("parallel context-call allow-list checked above"),
+                }
+            }
+            messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            continue;
+        }
         if calls.len() != 1 {
             // Do not reinterpret content as a tool request. Give tool-capable
             // models one bounded repair opportunity per remaining turn.
-            messages.push(response.message);
-            messages.push(ChatMessage {
+            // A malformed call is not executed, so do not replay its native
+            // tool-call envelope without the tool response OpenAI requires.
+            messages.push(ToolChatMessage {
+                role: response.message.role,
+                content: response.message.content,
+                tool_calls: Vec::new(),
+            });
+            messages.push(ToolChatMessage {
                 role: "user".into(),
                 content: "Use the only available tool now to complete the requested task with the supplied values.".into(),
-                tool_calls: None,
+                tool_calls: Vec::new(),
             });
             continue;
         }
-        let call = &calls[0].function;
+        let call = &calls[0];
         match call.name.as_str() {
+            "get_latest_telemetry" => {
+                parse_read_context_arguments(call, "get_latest_telemetry")?;
+                let snapshot = request.live_context.snapshot();
+                let _result = latest_telemetry_result(&request.live_context)?;
+                let status = if snapshot.telemetry.is_some() {
+                    "ok"
+                } else {
+                    "unavailable"
+                };
+                ledger.record(
+                    "telemetry",
+                    snapshot.telemetry_version,
+                    status,
+                    telemetry_summary(&snapshot),
+                );
+                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            }
+            "get_command_board_state" => {
+                parse_read_context_arguments(call, "get_command_board_state")?;
+                let snapshot = request.live_context.snapshot();
+                let result = command_board_result(&request.live_context)?;
+                let status = if snapshot.board.is_some() {
+                    "ok"
+                } else {
+                    "unavailable"
+                };
+                ledger.record(
+                    "board",
+                    snapshot.board_version,
+                    status,
+                    serde_json::from_str(&result)?,
+                );
+                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            }
             "run_eds_simulation" => {
                 if runs >= request.config.simulation.as_ref().map_or(0, |s| s.max_runs) {
                     bail!("simulation run budget exhausted");
@@ -205,27 +358,114 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                         error: Some(sanitize(&error.to_string())),
                     },
                 };
-                used_scenarios.push(scenario);
+                ledger.record(
+                    "simulation",
+                    runs as u64,
+                    tool_result.status,
+                    serde_json::to_value(&tool_result)?,
+                );
                 info!(decision_trace = request.config.decision_trace, stage = "simulation_result", turn, runs, elapsed_ms = started_run.elapsed().as_millis() as u64, scenario = %scenario.id, status = tool_result.status, "anomaly recovery simulation tool completed");
-                messages =
-                    fresh_selection_messages(selection_prompt(&request, &scenarios, &tool_result)?);
+                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            }
+            "complete_thermal_assessment" => {
+                let args: CompleteAssessmentArguments =
+                    serde_json::from_value(call.arguments.clone()).map_err(|e| {
+                        anyhow!("invalid complete_thermal_assessment arguments: {e}")
+                    })?;
+                let completed = validate_assessment(&request, &ledger, args)?;
+                info!(episode_id = %completed.episode_id, revision = completed.revision, outcome = ?completed.outcome, disposition = ?completed.disposition, evidence_ids = ?completed.evidence_ids, "thermal assessment completed");
+                if completed.outcome != AssessmentOutcome::ThermalAnomaly
+                    || completed.disposition != RecoveryDisposition::EvaluateRecovery
+                {
+                    return Ok(());
+                }
+                assessment = Some(completed);
+                messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
             }
             "select_recovery_action" => {
-                if !scenarios.is_empty() && runs == 0 {
-                    bail!(
-                        "an applicable simulation scenario requires a simulation before final action selection"
+                let assessment = assessment.as_ref().ok_or_else(|| {
+                    anyhow!("recovery selection requires a completed anomaly assessment")
+                })?;
+                let args: SelectArguments = match serde_json::from_value(call.arguments.clone()) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        messages = fresh_selection_messages(format!(
+                            "{} Selection validation failed: invalid arguments: {error}. Retry select_recovery_action with a non-empty reason and exact IDs.",
+                            context_prompt(&request, &scenarios, &ledger)?
+                        ));
+                        continue;
+                    }
+                };
+                if args.assessment_id != assessment.episode_id {
+                    messages = fresh_selection_messages(format!(
+                        "{} Selection validation failed: assessment_id must be exactly '{}'. Retry select_recovery_action.",
+                        context_prompt(&request, &scenarios, &ledger)?,
+                        assessment.episode_id
+                    ));
+                    continue;
+                }
+                let (candidate, action) = match evaluate(
+                    &request.config,
+                    &request.candidates,
+                    &args,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        messages = fresh_selection_messages(format!(
+                            "{} Selection validation failed: {error}. Retry select_recovery_action with a non-empty reason and exact configured IDs.",
+                            context_prompt(&request, &scenarios, &ledger)?
+                        ));
+                        continue;
+                    }
+                };
+                let simulation = request.config.simulation.as_ref().ok_or_else(|| {
+                    anyhow!("recovery requires an action-specific simulation contract")
+                })?;
+                let recovery = simulation
+                    .scenarios
+                    .iter()
+                    .find(|scenario| {
+                        scenario.applicable_rule_ids.contains(&candidate.rule_id)
+                            && scenario.modeled_action == Some(action)
+                    })
+                    .ok_or_else(|| anyhow!("no action-specific recovery scenario is configured"))?;
+                let baseline_id = recovery
+                    .baseline_scenario_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("recovery scenario has no baseline association"))?;
+                let baseline = simulation
+                    .scenarios
+                    .iter()
+                    .find(|scenario| scenario.id == baseline_id)
+                    .ok_or_else(|| anyhow!("recovery baseline scenario is not configured"))?;
+                let snapshot = request.live_context.snapshot();
+                let paired = run_and_validate(
+                    Arc::new(SedaroScenarioRunner {
+                        config: request.config.clone(),
+                        telemetry: request.telemetry.clone(),
+                    }),
+                    baseline,
+                    recovery,
+                    action,
+                    request.generation,
+                    recovery.duration_days,
+                )
+                .await?;
+                if !paired.thermal_benefit_verified {
+                    info!(
+                        "power-only recovery viability passed; thermal benefit remains unverified"
                     );
                 }
-                let args: SelectArguments = serde_json::from_value(call.arguments.clone())
-                    .map_err(|e| anyhow!("invalid select_recovery_action arguments: {e}"))?;
-                let (candidate, action) = evaluate(&request.config, &request.candidates, &args)?;
-                if !scenarios.is_empty()
-                    && !used_scenarios.iter().any(|scenario| {
-                        scenario.applicable_rule_ids.contains(&candidate.rule_id)
-                            && scenario.allowed_actions.contains(&action)
-                    })
+                let current = request.live_context.snapshot();
+                if snapshot.telemetry_version != current.telemetry_version
+                    || snapshot.board_version != current.board_version
+                    || request.telemetry_version != current.telemetry_version
+                    || request.board_version != current.board_version
                 {
-                    bail!("final action is not allowed by a completed scenario");
+                    bail!("simulation result is stale");
+                }
+                if board_conflicts_or_duplicates(&current, action)? {
+                    bail!("recovery action duplicates or conflicts with current command board");
                 }
                 if cancelled(&request) {
                     return Ok(());
@@ -277,41 +517,112 @@ fn applicable_scenarios<'a>(
 }
 
 fn prompt(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Result<String> {
-    let next_step = if scenarios.is_empty() {
-        "Choose the best eligible recovery action for one supplied anomaly candidate by using select_recovery_action."
-    } else {
-        "Start by using run_eds_simulation for one applicable supplied scenario."
-    };
     let text = format!(
-        "You are a constrained SAFE recovery advisor. {next_step} Use only the provided tool and supplied values. Never invent IDs. Context: {}",
+        "You are a constrained SAFE thermal assessment advisor. First inspect telemetry and command-board context. Then complete an assessment with an explicit outcome; recovery is optional and can only follow an anomaly assessment. Use only supplied values. Never invent IDs. Context: {}",
         serde_json::to_string(&planning_context(request, scenarios))?
     );
     bounded_prompt(request, text)
 }
 
-fn selection_prompt(
+fn validate_assessment(
+    request: &PlanningRequest,
+    ledger: &EvidenceLedger,
+    args: CompleteAssessmentArguments,
+) -> Result<ThermalAssessment> {
+    if args.rationale.trim().is_empty()
+        || args.rationale.chars().count() > MAX_ASSESSMENT_RATIONALE_CHARS
+    {
+        bail!("assessment rationale is invalid");
+    }
+    if args.uncertainty.trim().is_empty()
+        || args.uncertainty.chars().count() > MAX_ASSESSMENT_UNCERTAINTY_CHARS
+    {
+        bail!("assessment uncertainty is invalid");
+    }
+    if args.forecast_risks.len() > MAX_FORECAST_RISKS
+        || args.forecast_risks.iter().any(|risk| {
+            risk.trim().is_empty() || risk.chars().count() > MAX_FORECAST_RISK_CHARS
+        })
+    {
+        bail!("assessment forecast risks are invalid");
+    }
+    if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
+        bail!("assessment requires telemetry and command-board tool attempts");
+    }
+    if args.evidence_ids.is_empty() || !ledger.contains_all(&args.evidence_ids) {
+        bail!("assessment cites evidence that is unavailable from this investigation");
+    }
+    if args.candidate_ids.iter().any(|id| {
+        !request
+            .candidates
+            .iter()
+            .any(|candidate| &candidate.anomaly_id == id)
+    }) {
+        bail!("assessment cites a candidate outside this investigation");
+    }
+    match (args.outcome, args.disposition) {
+        (AssessmentOutcome::ThermalAnomaly, _) => {}
+        (_, RecoveryDisposition::EvaluateRecovery) => {
+            bail!("only a thermal anomaly may request recovery evaluation")
+        }
+        (AssessmentOutcome::NoThermalAnomaly, RecoveryDisposition::OperatorReview) => {}
+        (AssessmentOutcome::NoThermalAnomaly, RecoveryDisposition::Monitor) => {}
+        (
+            AssessmentOutcome::Inconclusive,
+            RecoveryDisposition::Monitor | RecoveryDisposition::OperatorReview,
+        ) => {}
+    }
+    if args.outcome == AssessmentOutcome::NoThermalAnomaly
+        && ledger
+            .prompt_value()
+            .to_string()
+            .contains("\"status\":\"unavailable\"")
+    {
+        bail!("unavailable required evidence cannot establish no_thermal_anomaly");
+    }
+    Ok(ThermalAssessment {
+        episode_id: format!(
+            "{}-{}",
+            request
+                .candidates
+                .first()
+                .map_or("thermal", |candidate| candidate.anomaly_id.as_str()),
+            request.generation
+        ),
+        revision: request.generation,
+        outcome: args.outcome,
+        disposition: args.disposition,
+        candidate_ids: args.candidate_ids,
+        evidence_ids: args.evidence_ids,
+        rationale: args.rationale,
+        uncertainty: args.uncertainty,
+        forecast_risks: args.forecast_risks,
+    })
+}
+
+fn context_prompt(
     request: &PlanningRequest,
     scenarios: &[&SimulationScenario],
-    result: &ToolResult,
+    ledger: &EvidenceLedger,
 ) -> Result<String> {
     let text = format!(
-        "You are a constrained SAFE recovery advisor. Use select_recovery_action to choose the best eligible action for one supplied anomaly candidate based on the simulation result. Use only the provided tool and supplied values. Never invent IDs. Simulation result: {} Context: {}",
-        bounded_json(result)?,
+        "You are a constrained SAFE thermal assessment advisor. Build an evidence-backed assessment. Use only supplied values and never invent IDs. Cumulative evidence: {} Context: {}",
+        serde_json::to_string(&ledger.prompt_value())?,
         serde_json::to_string(&planning_context(request, scenarios))?
     );
     bounded_prompt(request, text)
 }
 
-fn fresh_selection_messages(content: String) -> Vec<ChatMessage> {
-    vec![ChatMessage {
+fn fresh_selection_messages(content: String) -> Vec<ToolChatMessage> {
+    vec![ToolChatMessage {
         role: "user".into(),
         content,
-        tool_calls: None,
+        tool_calls: Vec::new(),
     }]
 }
 
 fn planning_context(request: &PlanningRequest, scenarios: &[&SimulationScenario]) -> Value {
-    json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| &m.id).collect::<Vec<_>>() })).collect::<Vec<_>>()})
+    json!({"goal": request.config.goal, "instructions": request.config.analysis_instructions, "candidates": request.candidates, "actions": request.config.action_catalog, "scenarios": scenarios.iter().map(|s| json!({"id":s.id,"description":s.description,"thermal":s.thermal,"baseline_scenario_id":s.baseline_scenario_id,"modeled_action":s.modeled_action,"applicable_rule_ids":s.applicable_rule_ids,"allowed_actions":s.allowed_actions,"parameters":s.parameters.iter().map(|p| json!({"id":p.id,"min":p.min,"max":p.max})).collect::<Vec<_>>(),"metrics":s.metrics.iter().map(|m| json!({"id":m.id,"quantity":m.quantity,"units":m.units})).collect::<Vec<_>>() })).collect::<Vec<_>>()})
 }
 
 fn bounded_prompt(request: &PlanningRequest, text: String) -> Result<String> {
@@ -338,7 +649,78 @@ fn simulation_tool(scenarios: &[&SimulationScenario]) -> Value {
     json!({"type":"function","function":{"name":"run_eds_simulation","description":"Run one applicable allow-listed local EDS scenario","parameters":{"type":"object","required":["scenario_id"],"properties":{"scenario_id":{"type":"string","description":"Exact ID of the scenario to run","enum":scenario_ids},"parameters":{"type":"object","description":"Optional named numeric scenario parameters within their described bounds","properties":parameter_properties}}}}})
 }
 
-fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
+fn phase_tools(
+    candidates: &[AnomalyCandidate],
+    _scenarios: &[&SimulationScenario],
+    _runs: u8,
+    ledger: &EvidenceLedger,
+    assessment: Option<&ThermalAssessment>,
+) -> Vec<Value> {
+    let mut tools = Vec::new();
+    if !ledger.has_kind("telemetry") {
+        tools.push(latest_telemetry_tool());
+    }
+    if !ledger.has_kind("board") {
+        tools.push(command_board_tool());
+    }
+    if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
+        return tools;
+    }
+    if assessment.is_some() {
+        tools.push(select_tool(
+            candidates,
+            assessment.map(|assessment| assessment.episode_id.as_str()),
+        ));
+    } else {
+        tools.push(assessment_tool(candidates, ledger));
+    }
+    tools
+}
+
+fn tool_names(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn truncation_detail(
+    turn: u8,
+    available_tools: &[String],
+    adapter: &str,
+    model: &str,
+    max_output_tokens: u32,
+) -> String {
+    format!(
+        "turn={turn}/{MAX_TURNS} available_tools=[{}] adapter={adapter} model={model} max_output_tokens={max_output_tokens}",
+        available_tools.join(",")
+    )
+}
+
+fn assessment_tool(candidates: &[AnomalyCandidate], ledger: &EvidenceLedger) -> Value {
+    json!({"type":"function","function":{"name":"complete_thermal_assessment","description":"Complete the evidence-backed thermal assessment; this may finish without a recovery command","parameters":{"type":"object","additionalProperties":false,"required":["outcome","disposition","candidate_ids","evidence_ids","rationale","uncertainty"],"properties":{"outcome":{"type":"string","enum":["thermal_anomaly","no_thermal_anomaly","inconclusive"]},"disposition":{"type":"string","enum":["monitor","operator_review","evaluate_recovery"]},"candidate_ids":{"type":"array","items":{"type":"string","enum":candidates.iter().map(|c| c.anomaly_id.as_str()).collect::<Vec<_>>() }},"evidence_ids":{"type":"array","items":{"type":"string","enum":ledger.ids()}},"rationale":{"type":"string","maxLength":MAX_ASSESSMENT_RATIONALE_CHARS},"uncertainty":{"type":"string","maxLength":MAX_ASSESSMENT_UNCERTAINTY_CHARS},"forecast_risks":{"type":"array","maxItems":MAX_FORECAST_RISKS,"items":{"type":"string","maxLength":MAX_FORECAST_RISK_CHARS}}}}}})
+}
+
+fn latest_telemetry_tool() -> Value {
+    read_context_tool(
+        "get_latest_telemetry",
+        "Get the latest telemetry snapshot received from SAFE",
+    )
+}
+
+fn command_board_tool() -> Value {
+    read_context_tool(
+        "get_command_board_state",
+        "Get the current command board snapshot received from SAFE",
+    )
+}
+
+fn read_context_tool(name: &str, description: &str) -> Value {
+    json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","additionalProperties":false}}})
+}
+
+fn select_tool(candidates: &[AnomalyCandidate], assessment_id: Option<&str>) -> Value {
     let mut anomaly_ids = Vec::new();
     let mut action_ids = Vec::new();
     for candidate in candidates {
@@ -352,63 +734,87 @@ fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
             }
         }
     }
-    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action for one supplied anomaly","parameters":{"type":"object","required":["anomaly_id","action_id","reason"],"properties":{"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"}}}}})
+    let assessment_schema = assessment_id.map_or_else(
+        || json!({"type": "string"}),
+        |id| json!({"type": "string", "enum": [id]}),
+    );
+    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection","maxLength":MAX_SELECTION_REASON_CHARS}}}}})
 }
 
 async fn chat(
-    config: &AnomalyRecoveryModeConfig,
-    messages: Vec<ChatMessage>,
+    request: &PlanningRequest,
+    messages: Vec<ToolChatMessage>,
     tools: Vec<Value>,
-) -> Result<ChatResponse> {
-    let (host, port, path) = config.ollama_chat_connection()?;
-    let body = serde_json::to_string(&ChatRequest {
-        model: config.llm.model.clone(),
-        messages,
-        tools,
-        stream: false,
-        options: ChatOptions {
-            temperature: config.llm.response_temperature,
-            num_predict: config.llm.max_output_tokens,
-        },
-    })?;
-    if config.decision_trace {
-        info!(
-            decision_trace = true,
-            stage = "ollama_request_body",
-            request_body = %body,
-            "anomaly recovery serialized Ollama chat request"
-        );
+) -> Result<ToolChatCompletion> {
+    request
+        .adapter
+        .tool_chat(ToolChatRequest {
+            model: request.config.llm.model.clone(),
+            messages,
+            tools,
+            temperature: request.config.llm.response_temperature,
+            max_output_tokens: request.config.llm.max_output_tokens,
+            timeout: Duration::from_millis(request.config.llm.request_timeout_ms),
+        })
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "{} tool-call request failed: {error}",
+                request.adapter.kind()
+            )
+        })
+}
+
+fn parse_read_context_arguments(call: &safe_llm_adapter::ToolCall, name: &str) -> Result<()> {
+    serde_json::from_value::<ReadContextArguments>(call.arguments.clone())
+        .map(|_| ())
+        .map_err(|error| anyhow!("invalid {name} arguments: {error}"))
+}
+
+fn latest_telemetry_result(context: &LiveContext) -> Result<String> {
+    let snapshot = context.snapshot();
+    let value = match snapshot.telemetry {
+        Some(telemetry) => json!({
+            "status": "ok",
+            "version": snapshot.telemetry_version,
+            "telemetry": telemetry,
+        }),
+        None => json!({
+            "status": "unavailable",
+            "version": snapshot.telemetry_version,
+            "error": "SAFE has not provided telemetry to this mode",
+        }),
+    };
+    bounded_context_json(value)
+}
+
+fn command_board_result(context: &LiveContext) -> Result<String> {
+    let snapshot = context.snapshot();
+    let value = match snapshot.board {
+        Some(board) => json!({
+            "status": "ok",
+            "version": snapshot.board_version,
+            "board": board,
+        }),
+        None => json!({
+            "status": "unavailable",
+            "version": snapshot.board_version,
+            "error": "SAFE has not provided a command board snapshot to this mode",
+        }),
+    };
+    bounded_context_json(value)
+}
+
+fn bounded_context_json(value: Value) -> Result<String> {
+    let text = serde_json::to_string(&value)?;
+    if text.chars().count() <= MAX_TOOL_CONTENT_CHARS {
+        return Ok(text);
     }
-    info!(
-        decision_trace = config.decision_trace,
-        stage = "ollama_request",
-        host = %host,
-        port,
-        path = %path,
-        model = %config.llm.model,
-        request_bytes = body.len(),
-        "anomaly recovery sending Ollama chat request"
-    );
-    let result = timeout(
-        Duration::from_millis(config.llm.request_timeout_ms),
-        http_client::post_json(&host, port, &path, &body),
-    )
-    .await
-    .map_err(|_| anyhow!("Ollama chat request timed out; verify local tool-capable model"))??;
-    info!(
-        decision_trace = config.decision_trace,
-        stage = "ollama_response",
-        status = result.status,
-        response_bytes = result.body.len(),
-        "anomaly recovery received Ollama chat response"
-    );
-    if !(200..300).contains(&result.status) {
-        bail!("Ollama HTTP {}: {}", result.status, sanitize(&result.body));
-    }
-    if result.body.chars().count() > config.max_response_chars.saturating_mul(8) {
-        bail!("Ollama chat payload exceeded bounded limit");
-    }
-    serde_json::from_str(&result.body).map_err(|e| anyhow!("invalid Ollama chat response: {e}"))
+    Ok(serde_json::to_string(&json!({
+        "status": "error",
+        "error": "context result exceeds tool content limit",
+        "limit_chars": MAX_TOOL_CONTENT_CHARS,
+    }))?)
 }
 
 async fn execute_scenario(
@@ -586,7 +992,9 @@ fn evaluate<'a>(
     candidates: &'a [AnomalyCandidate],
     args: &SelectArguments,
 ) -> Result<(&'a AnomalyCandidate, AllowedAction)> {
-    if args.reason.trim().is_empty() || args.reason.chars().count() > 400 {
+    if args.reason.trim().is_empty()
+        || args.reason.chars().count() > MAX_SELECTION_REASON_CHARS
+    {
         bail!("final reason is invalid");
     }
     let candidate = candidates
@@ -610,6 +1018,35 @@ fn evaluate<'a>(
         bail!("final action is not configured");
     }
     Ok((candidate, action))
+}
+
+fn board_conflicts_or_duplicates(
+    snapshot: &crate::types::LiveContextSnapshot,
+    action: AllowedAction,
+) -> Result<bool> {
+    let Some(board) = snapshot.board.as_ref() else {
+        return Ok(false);
+    };
+    let wanted = serde_json::to_value(&TimedCommand::Now(command(action)?))?;
+    let matches = board.proposals.values().any(|(_, candidate, _)| {
+        let value = serde_json::to_value(candidate).ok();
+        value.as_ref().is_some_and(|value| {
+            value == &wanted || (is_recovery_command(value) && is_recovery_command(&wanted))
+        })
+    });
+    Ok(matches)
+}
+
+fn is_recovery_command(value: &Value) -> bool {
+    value.get("Now").is_some_and(|command| match command {
+        Value::String(name) => {
+            ["PointSunYaw", "PointNadir", "ThrusterOff"].contains(&name.as_str())
+        }
+        Value::Object(command) => ["PointSunYaw", "PointNadir", "ThrusterOff"]
+            .iter()
+            .any(|name| command.contains_key(*name)),
+        _ => false,
+    })
 }
 fn command(action: AllowedAction) -> Result<Command> {
     match action {
@@ -639,7 +1076,7 @@ mod tests {
             "id":"thermal", "description":"thermal", "applicable_rule_ids":["r"], "allowed_actions":["point_nadir"], "duration_days":0.1,
             "patches":[{"agent_id":"agent","engine":"power","field":"temperature","type":"f64","telemetry_path":"telemetry.temperature"},{"agent_id":"agent","engine":"power","field":"gain","type":"f64","value":1.0}],
             "parameters":[{"id":"gain","patch_index":1,"min":0.5,"max":2.0}],
-            "metrics":[{"id":"peak","target_file":"agent.power.jsonl","field":"temperature","aggregation":"max"}]
+            "metrics":[{"id":"peak","quantity":"temperature","units":"C","target_file":"agent.power.jsonl","field":"temperature","aggregation":"max"}]
         })).unwrap()
     }
 
@@ -715,7 +1152,7 @@ mod tests {
                 .is_none()
         );
 
-        let selection = select_tool(&[candidate()]);
+        let selection = select_tool(&[candidate()], None);
         assert_eq!(
             selection["function"]["parameters"]["properties"]["anomaly_id"]["enum"][0],
             "profile-r"
@@ -726,21 +1163,161 @@ mod tests {
         );
         assert_eq!(
             selection["function"]["parameters"]["required"],
-            json!(["anomaly_id", "action_id", "reason"])
+            json!(["assessment_id", "anomaly_id", "action_id", "reason"])
         );
         assert!(
             selection["function"]["parameters"]["properties"]
                 .get("evidence_paths")
                 .is_none()
         );
+        assert_eq!(
+            selection["function"]["parameters"]["properties"]["reason"]["maxLength"],
+            MAX_SELECTION_REASON_CHARS
+        );
+
+        let mut ledger = EvidenceLedger::default();
+        ledger.record("telemetry", 1, "ok", json!({}));
+        ledger.record("board", 1, "ok", json!({}));
+        let assessment = assessment_tool(&[candidate()], &ledger);
+        let properties = &assessment["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["rationale"]["maxLength"],
+            MAX_ASSESSMENT_RATIONALE_CHARS
+        );
+        assert_eq!(
+            properties["uncertainty"]["maxLength"],
+            MAX_ASSESSMENT_UNCERTAINTY_CHARS
+        );
+        assert_eq!(
+            properties["forecast_risks"]["maxItems"],
+            MAX_FORECAST_RISKS
+        );
+        assert_eq!(
+            properties["forecast_risks"]["items"]["maxLength"],
+            MAX_FORECAST_RISK_CHARS
+        );
+
+        let telemetry = latest_telemetry_tool();
+        assert_eq!(telemetry["function"]["name"], "get_latest_telemetry");
+        assert_eq!(
+            telemetry["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        let board = command_board_tool();
+        assert_eq!(board["function"]["name"], "get_command_board_state");
     }
 
     #[test]
-    fn selection_phase_starts_with_fresh_user_history() {
+    fn context_tools_return_latest_bounded_snapshots() {
+        let context = LiveContext::default();
+        let unavailable = latest_telemetry_result(&context).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&unavailable).unwrap()["status"],
+            "unavailable"
+        );
+
+        context.update_telemetry(telemetry());
+        context.update_board(safe::protocol::AutonomyModeBoardState::default());
+        let latest =
+            serde_json::from_str::<Value>(&latest_telemetry_result(&context).unwrap()).unwrap();
+        assert_eq!(latest["status"], "ok");
+        assert_eq!(latest["version"], 1);
+        assert_eq!(latest["telemetry"]["ts_mono"], 1);
+
+        let board =
+            serde_json::from_str::<Value>(&command_board_result(&context).unwrap()).unwrap();
+        assert_eq!(board["status"], "ok");
+        assert_eq!(board["version"], 1);
+
+        context.update_telemetry(TelemetrySample {
+            source: None,
+            ts_mono: 2,
+            payload: json!({"data": "x".repeat(MAX_TOOL_CONTENT_CHARS)}),
+        });
+        let oversized =
+            serde_json::from_str::<Value>(&latest_telemetry_result(&context).unwrap()).unwrap();
+        assert_eq!(oversized["status"], "error");
+    }
+
+    #[test]
+    fn context_tool_arguments_and_phase_tools_are_constrained() {
+        let valid = safe_llm_adapter::ToolCall {
+            name: "get_latest_telemetry".into(),
+            arguments: json!({}),
+        };
+        assert!(parse_read_context_arguments(&valid, "get_latest_telemetry").is_ok());
+        let invalid = safe_llm_adapter::ToolCall {
+            arguments: json!({"extra": true}),
+            ..valid
+        };
+        assert!(parse_read_context_arguments(&invalid, "get_latest_telemetry").is_err());
+
+        let scenario = scenario();
+        let mut ledger = EvidenceLedger::default();
+        ledger.record("telemetry", 1, "ok", json!({}));
+        ledger.record("board", 1, "ok", json!({}));
+        let before_selection = phase_tools(&[candidate()], &[&scenario], 0, &ledger, None);
+        assert_eq!(
+            tool_names(&before_selection),
+            vec!["complete_thermal_assessment"]
+        );
+        assert!(
+            !before_selection
+                .iter()
+                .any(|tool| tool["function"]["name"] == "run_eds_simulation")
+        );
+        assert!(
+            !before_selection
+                .iter()
+                .any(|tool| tool["function"]["name"] == "select_recovery_action")
+        );
+        let after_assessment = phase_tools(&[candidate()], &[&scenario], 1, &ledger, None);
+        assert!(
+            after_assessment
+                .iter()
+                .any(|tool| tool["function"]["name"] == "complete_thermal_assessment")
+        );
+    }
+
+    #[test]
+    fn truncation_diagnostics_identify_turn_and_available_tools() {
+        assert_eq!(
+            truncation_detail(
+                2,
+                &[
+                    "get_latest_telemetry".to_string(),
+                    "get_command_board_state".to_string(),
+                ],
+                "ollama",
+                "mistral:7b",
+                1024,
+            ),
+            "turn=2/6 available_tools=[get_latest_telemetry,get_command_board_state] adapter=ollama model=mistral:7b max_output_tokens=1024"
+        );
+    }
+
+    #[test]
+    fn selection_phase_rebuilds_a_bounded_prompt() {
         let messages = fresh_selection_messages("select now".into());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "select now");
-        assert!(messages[0].tool_calls.is_none());
+        assert!(messages[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn board_duplicate_or_conflicting_recovery_is_blocked() {
+        let mut snapshot = crate::types::LiveContextSnapshot::default();
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        board.proposals.insert(
+            safe::protocol::BoardCmdId("existing".into()),
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                TimedCommand::Now(Command::PointNadir),
+                1,
+            ),
+        );
+        snapshot.board = Some(board);
+        assert!(board_conflicts_or_duplicates(&snapshot, AllowedAction::PointSunYaw).unwrap());
     }
 }

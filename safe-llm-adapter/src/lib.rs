@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
@@ -24,6 +24,37 @@ pub struct CompletionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub text: String,
+    pub finish_reason: CompletionFinishReason,
+}
+
+/// Provider-neutral native tool-call request.
+#[derive(Debug, Clone)]
+pub struct ToolChatRequest {
+    pub model: String,
+    pub messages: Vec<ToolChatMessage>,
+    /// OpenAI function-tool definitions. Ollama accepts the same shape.
+    pub tools: Vec<Value>,
+    pub temperature: f64,
+    pub max_output_tokens: u32,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolChatMessage {
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolChatCompletion {
+    pub message: ToolChatMessage,
     pub finish_reason: CompletionFinishReason,
 }
 
@@ -64,6 +95,16 @@ pub trait LlmAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError>;
+
+    async fn tool_chat(
+        &self,
+        _request: ToolChatRequest,
+    ) -> Result<ToolChatCompletion, AdapterError> {
+        Err(AdapterError::Configuration(format!(
+            "{} adapter does not support native tool calls",
+            self.kind()
+        )))
+    }
 }
 
 pub trait LlmAdapterFactory: Send + Sync {
@@ -73,7 +114,7 @@ pub trait LlmAdapterFactory: Send + Sync {
 }
 
 /// The selected adapter and its provider-owned configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterSelection {
     pub kind: String,
@@ -200,6 +241,46 @@ impl LlmAdapter for OllamaAdapter {
             },
         })
     }
+
+    async fn tool_chat(
+        &self,
+        request: ToolChatRequest,
+    ) -> Result<ToolChatCompletion, AdapterError> {
+        let mut endpoint = self.endpoint.clone();
+        let path = endpoint.path().strip_suffix("/generate").ok_or_else(|| {
+            AdapterError::Configuration(
+                "ollama tool calls require an endpoint ending in /generate".to_string(),
+            )
+        })?;
+        endpoint.set_path(&format!("{path}/chat"));
+        let body = json!({
+            "model": request.model,
+            "messages": request.messages.iter().map(ollama_message).collect::<Vec<_>>(),
+            "tools": request.tools,
+            "stream": false,
+            "options": {"temperature": request.temperature, "num_predict": request.max_output_tokens},
+        });
+        let body_text = post_json(&self.client, endpoint, body, request.timeout).await?;
+        let response: OllamaChatResponse = serde_json::from_str(&body_text).map_err(|error| {
+            AdapterError::Response(format!("invalid Ollama chat JSON payload: {error}"))
+        })?;
+        Ok(ToolChatCompletion {
+            message: ToolChatMessage {
+                role: response.message.role,
+                content: response.message.content,
+                tool_calls: response
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            },
+            finish_reason: ollama_finish_reason(response.done, response.done_reason.as_deref()),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +290,61 @@ struct OllamaResponse {
     done: bool,
     #[serde(default)]
     done_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaChatMessage,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OllamaChatMessage {
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCall>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OllamaToolCall {
+    function: OllamaToolFunction,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OllamaToolFunction {
+    name: String,
+    arguments: Value,
+}
+
+fn ollama_message(message: &ToolChatMessage) -> OllamaChatMessage {
+    OllamaChatMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(|call| OllamaToolCall {
+                function: OllamaToolFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn ollama_finish_reason(done: bool, done_reason: Option<&str>) -> CompletionFinishReason {
+    match done_reason {
+        Some("length") => CompletionFinishReason::Length,
+        Some(_) => CompletionFinishReason::Other,
+        None if done => CompletionFinishReason::Complete,
+        None => CompletionFinishReason::Other,
+    }
 }
 
 pub struct OpenAiCompatibleAdapterFactory;
@@ -292,26 +428,25 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         let body_text = post_json_with_auth(
             &self.client,
             self.endpoint.clone(),
-            body,
+            body.clone(),
             request.timeout,
             self.api_key.as_deref(),
         )
         .await?;
         let response: OpenAiCompatibleResponse =
             serde_json::from_str(&body_text).map_err(|error| {
-                AdapterError::Response(format!("invalid OpenAI-compatible JSON payload: {error}"))
+                AdapterError::Response(format!(
+                    "invalid OpenAI-compatible JSON payload: {error}; body={}",
+                    clip_chars(&body_text, 600)
+                ))
             })?;
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             AdapterError::Response(
                 "OpenAI-compatible response did not include a choice".to_string(),
             )
         })?;
-        let text = choice
-            .message
-            .content
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let message = choice_message(&choice)?;
+        let text = message.content.unwrap_or_default().trim().to_string();
         if text.is_empty() {
             return Err(AdapterError::Response(
                 "OpenAI-compatible response content was empty".to_string(),
@@ -327,24 +462,184 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             },
         })
     }
+
+    async fn tool_chat(
+        &self,
+        request: ToolChatRequest,
+    ) -> Result<ToolChatCompletion, AdapterError> {
+        let body = json!({
+            "model": request.model,
+            "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
+            "tools": request.tools,
+            "tool_choice": "required",
+            // Current OpenAI reasoning models require native tools to run
+            // without reasoning in the Chat Completions API.
+            "reasoning_effort": "none",
+            "temperature": request.temperature,
+            "max_completion_tokens": request.max_output_tokens,
+        });
+        let body_text = post_json_with_auth(
+            &self.client,
+            self.endpoint.clone(),
+            body.clone(),
+            request.timeout,
+            self.api_key.as_deref(),
+        )
+        .await?;
+        let first = parse_tool_chat_response(&body_text)?;
+        if first.finish_reason == CompletionFinishReason::Length {
+            // Some OpenAI-compatible local servers ignore max_completion_tokens
+            // and only honor the legacy max_tokens field.
+            let mut legacy_body = body;
+            if let Some(object) = legacy_body.as_object_mut() {
+                object.remove("max_completion_tokens");
+                object.insert("max_tokens".to_string(), json!(request.max_output_tokens));
+            }
+            if let Ok(legacy_text) = post_json_with_auth(
+                &self.client,
+                self.endpoint.clone(),
+                legacy_body,
+                request.timeout,
+                self.api_key.as_deref(),
+            )
+            .await
+            {
+                if let Ok(legacy_result) = parse_tool_chat_response(&legacy_text) {
+                    if legacy_result.finish_reason != CompletionFinishReason::Length
+                        || !legacy_result.message.tool_calls.is_empty()
+                    {
+                        return Ok(legacy_result);
+                    }
+                }
+            }
+        }
+        Ok(first)
+    }
 }
 
-#[derive(Debug, Deserialize)]
+fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, AdapterError> {
+    let response: OpenAiCompatibleResponse = serde_json::from_str(body_text).map_err(|error| {
+        AdapterError::Response(format!(
+            "invalid OpenAI-compatible JSON payload: {error}; body={}",
+            clip_chars(body_text, 600)
+        ))
+    })?;
+    let choice = response.choices.into_iter().next().ok_or_else(|| {
+        AdapterError::Response("OpenAI-compatible response did not include a choice".to_string())
+    })?;
+    let finish_reason = openai_finish_reason(choice.finish_reason.as_deref());
+    if finish_reason == CompletionFinishReason::Length {
+        return Ok(ToolChatCompletion {
+            message: ToolChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Vec::new(),
+            },
+            finish_reason,
+        });
+    }
+    let message = choice_message(&choice)?;
+    let tool_calls = message
+        .tool_calls
+        .into_iter()
+        .map(parse_openai_tool_call)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ToolChatCompletion {
+        message: ToolChatMessage {
+            role: message.role.unwrap_or_else(|| "assistant".to_string()),
+            content: message.content.unwrap_or_default(),
+            tool_calls,
+        },
+        finish_reason,
+    })
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleResponse {
     choices: Vec<OpenAiCompatibleChoice>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleChoice {
-    message: OpenAiCompatibleMessage,
+    #[serde(default)]
+    message: Option<OpenAiCompatibleMessage>,
+    #[serde(default)]
+    delta: Option<OpenAiCompatibleMessage>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenAiCompatibleMessage {
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiCompatibleToolCall>,
+}
+
+fn choice_message(
+    choice: &OpenAiCompatibleChoice,
+) -> Result<OpenAiCompatibleMessage, AdapterError> {
+    choice
+        .message
+        .clone()
+        .or_else(|| choice.delta.clone())
+        .ok_or_else(|| {
+            AdapterError::Response(format!(
+                "OpenAI-compatible choice contained neither message nor delta: {}",
+                serde_json::to_string(choice).unwrap_or_else(|_| "<unserializable choice>".into())
+            ))
+        })
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OpenAiCompatibleToolCall {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiCompatibleToolFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OpenAiCompatibleToolFunction {
+    name: String,
+    arguments: String,
+}
+
+fn openai_message(message: &ToolChatMessage) -> Value {
+    let mut value = json!({"role": message.role, "content": message.content});
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = Value::Array(message.tool_calls.iter().map(|call| json!({
+            "type": "function", "function": {"name": call.name, "arguments": call.arguments.to_string()}
+        })).collect());
+    }
+    value
+}
+
+fn parse_openai_tool_call(call: OpenAiCompatibleToolCall) -> Result<ToolCall, AdapterError> {
+    if call.kind != "function" {
+        return Err(AdapterError::Response(
+            "OpenAI-compatible tool call was not a function".to_string(),
+        ));
+    }
+    let arguments = serde_json::from_str(&call.function.arguments).map_err(|error| {
+        AdapterError::Response(format!(
+            "OpenAI-compatible tool-call arguments were not JSON: {error}"
+        ))
+    })?;
+    Ok(ToolCall {
+        name: call.function.name,
+        arguments,
+    })
+}
+
+fn openai_finish_reason(reason: Option<&str>) -> CompletionFinishReason {
+    match reason {
+        Some("stop") | Some("end_turn") | Some("tool_calls") => CompletionFinishReason::Complete,
+        Some("length") | Some("max_tokens") => CompletionFinishReason::Length,
+        _ => CompletionFinishReason::Other,
+    }
 }
 
 fn parse_endpoint(endpoint: &str, adapter: &str) -> Result<Url, AdapterError> {
@@ -387,7 +682,7 @@ async fn post_json_with_auth(
     let response = timeout(request_timeout, request.send())
         .await
         .map_err(|_| AdapterError::Timeout)?
-        .map_err(|error| AdapterError::Transport(error.to_string()))?;
+        .map_err(|error| AdapterError::Transport(format!("{error:?}")))?;
     let status = response.status();
     let body_text = response.text().await.map_err(|error| {
         AdapterError::Transport(format!("failed reading response body: {error}"))
@@ -422,12 +717,29 @@ mod tests {
         }
     }
 
+    fn tool_chat_request() -> ToolChatRequest {
+        ToolChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![ToolChatMessage {
+                role: "user".to_string(),
+                content: "select exactly one action".to_string(),
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![
+                json!({"type":"function","function":{"name":"select_recovery_action","parameters":{"type":"object"}}}),
+            ],
+            temperature: 0.0,
+            max_output_tokens: 64,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
     async fn mock_json_server(response_body: String) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
         let endpoint = format!(
-            "http://{}/completion",
+            "http://{}/api/generate",
             listener
                 .local_addr()
                 .expect("listener should have an address")
@@ -576,5 +888,136 @@ mod tests {
         assert_eq!(completion.finish_reason, CompletionFinishReason::Complete);
         assert!(request.contains("\"response_format\""));
         assert!(request.contains("\"max_tokens\":64"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_normalizes_native_tool_calls() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {
+                            "name": "select_recovery_action",
+                            "arguments": "{\"anomaly_id\":\"thermal\",\"action_id\":\"point_nadir\",\"reason\":\"approved\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }).to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let completion = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect("tool call should parse");
+        let request = server.await.expect("test server should finish");
+        assert_eq!(completion.finish_reason, CompletionFinishReason::Complete);
+        assert_eq!(completion.message.tool_calls.len(), 1);
+        assert_eq!(
+            completion.message.tool_calls[0].name,
+            "select_recovery_action"
+        );
+        assert_eq!(
+            completion.message.tool_calls[0].arguments["action_id"],
+            "point_nadir"
+        );
+        assert!(request.contains("\"tools\""));
+        assert!(request.contains("\"tool_choice\":\"required\""));
+        assert!(request.contains("\"reasoning_effort\":\"none\""));
+        assert!(request.contains("\"max_completion_tokens\":64"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_reports_choice_without_message() {
+        let response = json!({
+            "choices": [{"finish_reason": "stop"}]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let error = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect_err("missing choice message must fail closed");
+        assert!(error.to_string().contains("neither message nor delta"));
+        let _ = server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_preserves_length_without_message() {
+        let response = json!({
+            "choices": [{"message": null, "finish_reason": "length"}]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let completion = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect("length response should remain classified");
+        assert_eq!(completion.finish_reason, CompletionFinishReason::Length);
+        assert!(completion.message.tool_calls.is_empty());
+        let _ = server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn ollama_adapter_uses_native_chat_for_tool_calls() {
+        let response = json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "select_recovery_action",
+                        "arguments": {"anomaly_id":"thermal","action_id":"point_nadir","reason":"approved"}
+                    }
+                }]
+            },
+            "done": true,
+            "done_reason": "stop"
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "ollama".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("Ollama adapter should build");
+
+        let completion = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect("tool call should parse");
+        let request = server.await.expect("test server should finish");
+        assert_eq!(completion.message.tool_calls.len(), 1);
+        assert_eq!(
+            completion.message.tool_calls[0].name,
+            "select_recovery_action"
+        );
+        assert!(request.starts_with("POST /api/chat HTTP/1.1"));
+        assert!(request.contains("\"num_predict\":64"));
     }
 }

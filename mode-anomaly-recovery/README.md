@@ -1,9 +1,52 @@
-# Anomaly Recovery Static Nominal Profiles
+# Anomaly Recovery
+
+## Thermal Assessment User Story
+
+The intended thermal-recovery workflow uses an LLM to assess telemetry,
+command-board context, and simulation evidence together to judge whether a
+thermal anomaly is occurring and whether a recovery proposal is warranted.
+See [the thermal anomaly recovery user story](./thermal-anomaly-recovery-story.md)
+for the target workflow, acceptance criteria, and gaps in the current branch.
+The [implementation plan](./thermal-anomaly-recovery-plan.md) breaks this work
+into ordered milestones with file-level changes and verification criteria.
+
+## Current Implementation
 
 `mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
-configured static nominal profiles locally and emits profile-backed commands.
-It contacts the configured LLM adapter only when local evaluation leaves more
-than one actionable choice.
+configured static nominal profiles locally as investigation triggers, then uses
+native LLM tools to collect telemetry and command-board evidence before it can
+complete a thermal assessment. Completion records `thermal_anomaly`,
+`no_thermal_anomaly`, or `inconclusive`; a recovery action is optional and may
+only follow an anomaly assessment requesting recovery evaluation.
+
+Evidence is retained in a bounded, host-owned ledger across tool calls. Telemetry
+history is source-scoped and ignores duplicate or out-of-order timestamps for
+trend/persistence use. Board proposals and approvals are command intent, not
+execution acknowledgement. A telemetry or board update cancels pending work
+before it can submit a stale proposal.
+
+The EDS is intentionally used only for power and command-side-effect viability;
+it does not contain a thermal model and is not thermal evidence. Thermal
+assessment is based on telemetry, trends, board state, and LLM reasoning.
+Missing thermal EDS outputs therefore do not block anomaly assessment or
+power-only command viability.
+
+### Post-selection viability
+
+Recovery selection is only an assessment disposition. Before SAFE receives a
+command, host code requires an exact action-specific recovery scenario and its
+baseline association, then runs both from the same frozen evidence revision,
+state bindings, and horizon. Both runs must succeed and return finite,
+unit-declared `final_state_of_charge` and `minimum_state_of_charge` metrics;
+the recovery contract also supplies machine-checkable minimum-SOC and maximum
+degradation constraints. Missing metrics, failed or timed-out runs, mismatched
+actions, stale revisions, and board duplicates/conflicts block output.
+
+Power-only viability can support a short-term command decision, but it always
+logs thermal benefit as unverified. Any future simulation-backed thermal claim
+would require a separate thermal model and verified output units. Model-specific
+EDS paths, IDs, and field names belong only in deployment configuration, never
+in generic source or committed fixtures.
 
 Profiles are selected by an exact `TelemetryFrame.source` match. Rule paths are
 dot-separated and relative to `TelemetryFrame.payload`; numeric path segments
@@ -82,8 +125,9 @@ The action catalog may contain only these recommendable actions:
 
 `capture_image` and `noop` are representable enum values but are rejected for
 recommendations. A rule with no `eligible_actions` is observable and can appear
-in diagnostics, but cannot emit a command. Every configuration requires a
-non-empty action catalog.
+in diagnostics, but cannot emit a command. An empty action catalog is valid for
+assessment-only operation; rules that name an action still require it to be
+defined.
 
 ## LLM Adapters
 
@@ -94,7 +138,7 @@ generation settings:
 | --- | --- |
 | `llm.request_timeout_ms` | `20000` |
 | `llm.response_temperature` | `0.0` |
-| `llm.max_output_tokens` | `256` |
+| `llm.max_output_tokens` | `2048` (maximum) |
 | `max_prompt_chars` | `3500` |
 | `max_response_chars` | `800` |
 | `max_decision_attempts` | `3` |
@@ -125,7 +169,7 @@ secret in `mode_config`:
     "model": "example-model",
     "request_timeout_ms": 20000,
     "response_temperature": 0.0,
-    "max_output_tokens": 256
+    "max_output_tokens": 2048
   }
 }
 ```
@@ -142,6 +186,13 @@ loading is not supported.
 
 `goal` and `analysis_instructions` also have safe default text and may be
 overridden to constrain the decision prompt.
+
+The 2048-token ceiling is sufficient for the advertised tool calls: context
+tools take no arguments, assessment rationale and uncertainty are bounded to
+800 and 400 characters, up to four 200-character forecast risks are allowed,
+and recovery-selection rationale is bounded to 400 characters. Configuration
+validation rejects larger token budgets, and host validation enforces the same
+text limits even when a provider does not honor JSON Schema length keywords.
 
 ## Live Decision Trace
 
@@ -259,6 +310,11 @@ completions with strict JSON-schema response formatting.
   configured bounded numeric parameters.
 - `select_recovery_action`, which may choose only a frozen candidate and one of
   its eligible configured actions. Evidence is derived from that candidate.
+- `get_latest_telemetry`, which returns the latest telemetry snapshot SAFE has
+  broadcast to the mode.
+- `get_command_board_state`, which returns the latest command-board snapshot
+  SAFE has broadcast to the mode, including proposals, approvals, rejections,
+  and source-of-truth IDs.
 - `options.temperature` and `options.num_predict`.
 
 The configured Ollama model must support native tool calls. Unsupported tools,
@@ -280,6 +336,12 @@ eligible action, and exact evidence path. HTTP errors, timeouts, malformed
 responses, token-limit truncation, empty responses, oversized responses, and
 validation failures are retried up to `max_decision_attempts`. Parse and
 validation failures include bounded repair feedback.
+
+The telemetry and board tools are read-only. Their responses are bounded to
+2,000 characters and report `unavailable` until SAFE has broadcast the
+corresponding snapshot. They read the newest snapshot available at invocation
+time, but do not change the frozen candidate/action allow-list or bypass SAFE
+board and gatekeeper validation.
 
 ## SAFE Integration
 
@@ -373,3 +435,18 @@ Run the advisor unit and integration tests with:
 ```bash
 cargo test -p mode-anomaly-recovery
 ```
+
+The opt-in live example uses the OpenAI-compatible endpoint and model from
+`safe/autonomy_mode_config.json`, sends fake high-temperature telemetry through
+the real SAFE mode transport, and runs the configured real EDS twice for the
+baseline/recovery viability check. It requires `OPENAI_API_KEY` and the
+configured EDS workspace (the checked-in example uses `/workspace/bundle_juno`):
+
+```bash
+cargo test -p mode-anomaly-recovery --test live_openai_simulation_e2e \
+  -- --ignored --nocapture
+```
+
+The test captures mode logs and verifies thermal assessment, post-selection
+simulation, power-only thermal separation, and command proposal stages. It is
+ignored by default because it consumes OpenAI API and EDS resources.
