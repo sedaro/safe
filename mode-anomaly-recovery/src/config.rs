@@ -689,7 +689,7 @@ fn default_response_temperature() -> f64 {
 }
 
 fn default_max_output_tokens() -> u32 {
-    256
+    1024
 }
 
 fn default_max_decision_attempts() -> u8 {
@@ -752,6 +752,11 @@ mod tests {
     #[test]
     fn accepts_valid_static_nominal_profile() {
         valid_config().validate().expect("config should validate");
+    }
+
+    #[test]
+    fn default_tool_call_budget_supports_structured_native_calls() {
+        assert_eq!(valid_config().llm.max_output_tokens, 1024);
     }
 
     #[test]
