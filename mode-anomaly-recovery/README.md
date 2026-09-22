@@ -200,7 +200,7 @@ overridden to constrain the decision prompt.
 allowance. Before every native-tool request, the mode conservatively estimates
 the serialized messages and tools, adds `max_output_tokens` and the safety
 margin, and fails closed if the total exceeds that window. Context-only tools
-use at most 64 output tokens; assessment and selection use the configured
+use at most 128 output tokens; assessment and selection use the configured
 allowance. For a 2048-token server, keep the defaults unless the server's
 chat-template overhead has been measured.
 

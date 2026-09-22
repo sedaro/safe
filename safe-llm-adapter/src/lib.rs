@@ -518,7 +518,12 @@ fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, Adapt
         AdapterError::Response("OpenAI-compatible response did not include a choice".to_string())
     })?;
     let finish_reason = openai_finish_reason(choice.finish_reason.as_deref());
-    if finish_reason == CompletionFinishReason::Length {
+    let Some(message) = choice.message.or(choice.delta) else {
+        if finish_reason != CompletionFinishReason::Length {
+            return Err(AdapterError::Response(
+                "OpenAI-compatible choice contained neither message nor delta".to_string(),
+            ));
+        }
         return Ok(ToolChatCompletion {
             message: ToolChatMessage {
                 role: "assistant".to_string(),
@@ -527,17 +532,27 @@ fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, Adapt
             },
             finish_reason,
         });
-    }
-    let message = choice_message(&choice)?;
+    };
     let tool_calls = message
         .tool_calls
         .into_iter()
         .map(parse_openai_tool_call)
         .collect::<Result<Vec<_>, _>>()?;
+    let content = message.content.unwrap_or_default();
+    // A complete native tool-call envelope is executable after host validation,
+    // even if a local server spends its final token on the envelope terminator.
+    let finish_reason = if finish_reason == CompletionFinishReason::Length
+        && content.trim().is_empty()
+        && !tool_calls.is_empty()
+    {
+        CompletionFinishReason::Complete
+    } else {
+        finish_reason
+    };
     Ok(ToolChatCompletion {
         message: ToolChatMessage {
             role: message.role.unwrap_or_else(|| "assistant".to_string()),
-            content: message.content.unwrap_or_default(),
+            content,
             tool_calls,
         },
         finish_reason,
@@ -936,6 +951,46 @@ mod tests {
             .expect("length response should remain classified");
         assert_eq!(completion.finish_reason, CompletionFinishReason::Length);
         assert!(completion.message.tool_calls.is_empty());
+        let _ = server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_accepts_complete_tool_call_at_length() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {
+                            "name": "get_latest_telemetry",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "length"
+            }]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let completion = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect("complete native tool call should remain usable");
+        assert_eq!(completion.finish_reason, CompletionFinishReason::Complete);
+        assert_eq!(completion.message.tool_calls.len(), 1);
+        assert_eq!(
+            completion.message.tool_calls[0].name,
+            "get_latest_telemetry"
+        );
         let _ = server.await.expect("test server should finish");
     }
 
