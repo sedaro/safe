@@ -6,6 +6,8 @@ use safe_llm_adapter::AdapterSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+const MAX_OUTPUT_TOKENS: u32 = 2_048;
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AllowedAction {
@@ -341,8 +343,10 @@ impl LlmConfig {
         if !self.response_temperature.is_finite() || self.response_temperature < 0.0 {
             bail!("llm.response_temperature must be finite and non-negative");
         }
-        if self.max_output_tokens == 0 {
-            bail!("llm.max_output_tokens must be greater than zero");
+        if self.max_output_tokens == 0 || self.max_output_tokens > MAX_OUTPUT_TOKENS {
+            bail!(
+                "llm.max_output_tokens must be between 1 and {MAX_OUTPUT_TOKENS}"
+            );
         }
         Ok(())
     }
@@ -689,7 +693,7 @@ fn default_response_temperature() -> f64 {
 }
 
 fn default_max_output_tokens() -> u32 {
-    1024
+    MAX_OUTPUT_TOKENS
 }
 
 fn default_max_decision_attempts() -> u8 {
@@ -756,7 +760,14 @@ mod tests {
 
     #[test]
     fn default_tool_call_budget_supports_structured_native_calls() {
-        assert_eq!(valid_config().llm.max_output_tokens, 1024);
+        assert_eq!(valid_config().llm.max_output_tokens, MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn rejects_output_budget_above_provider_ceiling() {
+        let mut config = valid_config();
+        config.llm.max_output_tokens = MAX_OUTPUT_TOKENS + 1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

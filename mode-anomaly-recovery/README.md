@@ -138,7 +138,7 @@ generation settings:
 | --- | --- |
 | `llm.request_timeout_ms` | `20000` |
 | `llm.response_temperature` | `0.0` |
-| `llm.max_output_tokens` | `256` |
+| `llm.max_output_tokens` | `2048` (maximum) |
 | `max_prompt_chars` | `3500` |
 | `max_response_chars` | `800` |
 | `max_decision_attempts` | `3` |
@@ -169,7 +169,7 @@ secret in `mode_config`:
     "model": "example-model",
     "request_timeout_ms": 20000,
     "response_temperature": 0.0,
-    "max_output_tokens": 256
+    "max_output_tokens": 2048
   }
 }
 ```
@@ -186,6 +186,13 @@ loading is not supported.
 
 `goal` and `analysis_instructions` also have safe default text and may be
 overridden to constrain the decision prompt.
+
+The 2048-token ceiling is sufficient for the advertised tool calls: context
+tools take no arguments, assessment rationale and uncertainty are bounded to
+800 and 400 characters, up to four 200-character forecast risks are allowed,
+and recovery-selection rationale is bounded to 400 characters. Configuration
+validation rejects larger token budgets, and host validation enforces the same
+text limits even when a provider does not honor JSON Schema length keywords.
 
 ## Live Decision Trace
 
