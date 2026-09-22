@@ -20,6 +20,9 @@ use crate::config::{
     AllowedAction, AnomalyRecoveryModeConfig, MetricAggregation, SimulationScenario,
 };
 use crate::evidence::{EvidenceLedger, telemetry_summary};
+use crate::simulation::{
+    ScenarioRun, ScenarioRunRequest, ScenarioRunner, UnitMetric, run_and_validate,
+};
 use crate::types::{
     AnomalyCandidate, AssessmentOutcome, LiveContext, RecoveryDisposition, TelemetrySample,
     ThermalAssessment,
@@ -41,6 +44,8 @@ pub(crate) struct PlanningRequest {
     pub(crate) cancel: CancellationToken,
     pub(crate) output: ModeOutputTx,
     pub(crate) adapter: Arc<dyn LlmAdapter>,
+    pub(crate) telemetry_version: u64,
+    pub(crate) board_version: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +88,49 @@ struct ToolResult {
     error: Option<String>,
 }
 
+struct SedaroScenarioRunner {
+    config: AnomalyRecoveryModeConfig,
+    telemetry: TelemetrySample,
+}
+
+#[async_trait::async_trait]
+impl ScenarioRunner for SedaroScenarioRunner {
+    async fn run(&self, request: ScenarioRunRequest) -> Result<ScenarioRun> {
+        let simulation = self
+            .config
+            .simulation
+            .as_ref()
+            .ok_or_else(|| anyhow!("simulation is not configured"))?;
+        let scenario = simulation
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == request.scenario_id)
+            .ok_or_else(|| anyhow!("scenario is not configured"))?;
+        let metrics =
+            execute_scenario(&self.config, scenario, &self.telemetry, &HashMap::new(), 0).await?;
+        let metrics = metrics
+            .into_iter()
+            .map(|(id, value)| {
+                let units = scenario
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.id == id)
+                    .map(|metric| metric.units.clone())
+                    .unwrap_or_default();
+                (id, UnitMetric { value, units })
+            })
+            .collect();
+        Ok(ScenarioRun {
+            scenario_id: scenario.id.clone(),
+            success: true,
+            timed_out: false,
+            evidence_revision: request.evidence_revision,
+            horizon_days: request.horizon_days,
+            metrics,
+        })
+    }
+}
+
 pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
     let started = Instant::now();
     let planning_limit = Duration::from_millis(
@@ -102,7 +150,6 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         tool_calls: Vec::new(),
     }];
     let mut runs = 0u8;
-    let mut used_scenarios = Vec::new();
     let mut assessment: Option<ThermalAssessment> = None;
     for turn in 1..=MAX_TURNS {
         if cancelled(&request) {
@@ -240,7 +287,6 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                         error: Some(sanitize(&error.to_string())),
                     },
                 };
-                used_scenarios.push(scenario);
                 ledger.record(
                     "simulation",
                     runs as u64,
@@ -269,24 +315,60 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 let assessment = assessment.as_ref().ok_or_else(|| {
                     anyhow!("recovery selection requires a completed anomaly assessment")
                 })?;
-                if !scenarios.is_empty() && runs == 0 {
-                    bail!(
-                        "an applicable simulation scenario requires a simulation before final action selection"
-                    );
-                }
                 let args: SelectArguments = serde_json::from_value(call.arguments.clone())
                     .map_err(|e| anyhow!("invalid select_recovery_action arguments: {e}"))?;
                 if args.assessment_id != assessment.episode_id {
                     bail!("recovery selection did not reference the completed assessment");
                 }
                 let (candidate, action) = evaluate(&request.config, &request.candidates, &args)?;
-                if !scenarios.is_empty()
-                    && !used_scenarios.iter().any(|scenario| {
+                let simulation = request.config.simulation.as_ref().ok_or_else(|| {
+                    anyhow!("recovery requires an action-specific simulation contract")
+                })?;
+                let recovery = simulation
+                    .scenarios
+                    .iter()
+                    .find(|scenario| {
                         scenario.applicable_rule_ids.contains(&candidate.rule_id)
-                            && scenario.allowed_actions.contains(&action)
+                            && scenario.modeled_action == Some(action)
                     })
+                    .ok_or_else(|| anyhow!("no action-specific recovery scenario is configured"))?;
+                let baseline_id = recovery
+                    .baseline_scenario_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("recovery scenario has no baseline association"))?;
+                let baseline = simulation
+                    .scenarios
+                    .iter()
+                    .find(|scenario| scenario.id == baseline_id)
+                    .ok_or_else(|| anyhow!("recovery baseline scenario is not configured"))?;
+                let snapshot = request.live_context.snapshot();
+                let paired = run_and_validate(
+                    Arc::new(SedaroScenarioRunner {
+                        config: request.config.clone(),
+                        telemetry: request.telemetry.clone(),
+                    }),
+                    baseline,
+                    recovery,
+                    action,
+                    request.generation,
+                    recovery.duration_days,
+                )
+                .await?;
+                if !paired.thermal_benefit_verified {
+                    info!(
+                        "power-only recovery viability passed; thermal benefit remains unverified"
+                    );
+                }
+                let current = request.live_context.snapshot();
+                if snapshot.telemetry_version != current.telemetry_version
+                    || snapshot.board_version != current.board_version
+                    || request.telemetry_version != current.telemetry_version
+                    || request.board_version != current.board_version
                 {
-                    bail!("final action is not allowed by a completed scenario");
+                    bail!("simulation result is stale");
+                }
+                if board_conflicts_or_duplicates(&current, action)? {
+                    bail!("recovery action duplicates or conflicts with current command board");
                 }
                 if cancelled(&request) {
                     return Ok(());
@@ -461,8 +543,8 @@ fn simulation_tool(scenarios: &[&SimulationScenario]) -> Value {
 
 fn phase_tools(
     candidates: &[AnomalyCandidate],
-    scenarios: &[&SimulationScenario],
-    runs: u8,
+    _scenarios: &[&SimulationScenario],
+    _runs: u8,
     ledger: &EvidenceLedger,
     assessment: Option<&ThermalAssessment>,
 ) -> Vec<Value> {
@@ -472,8 +554,6 @@ fn phase_tools(
     }
     if assessment.is_some() {
         tools.push(select_tool(candidates));
-    } else if !scenarios.is_empty() && runs == 0 {
-        tools.push(simulation_tool(scenarios));
     }
     tools.push(assessment_tool(candidates, ledger));
     tools
@@ -794,6 +874,35 @@ fn evaluate<'a>(
     }
     Ok((candidate, action))
 }
+
+fn board_conflicts_or_duplicates(
+    snapshot: &crate::types::LiveContextSnapshot,
+    action: AllowedAction,
+) -> Result<bool> {
+    let Some(board) = snapshot.board.as_ref() else {
+        return Ok(false);
+    };
+    let wanted = serde_json::to_value(&TimedCommand::Now(command(action)?))?;
+    let matches = board.proposals.values().any(|(_, candidate, _)| {
+        let value = serde_json::to_value(candidate).ok();
+        value.as_ref().is_some_and(|value| {
+            value == &wanted || (is_recovery_command(value) && is_recovery_command(&wanted))
+        })
+    });
+    Ok(matches)
+}
+
+fn is_recovery_command(value: &Value) -> bool {
+    value.get("Now").is_some_and(|command| match command {
+        Value::String(name) => {
+            ["PointSunYaw", "PointNadir", "ThrusterOff"].contains(&name.as_str())
+        }
+        Value::Object(command) => ["PointSunYaw", "PointNadir", "ThrusterOff"]
+            .iter()
+            .any(|name| command.contains_key(*name)),
+        _ => false,
+    })
+}
 fn command(action: AllowedAction) -> Result<Command> {
     match action {
         AllowedAction::PointNadir => Ok(Command::PointNadir),
@@ -822,7 +931,7 @@ mod tests {
             "id":"thermal", "description":"thermal", "applicable_rule_ids":["r"], "allowed_actions":["point_nadir"], "duration_days":0.1,
             "patches":[{"agent_id":"agent","engine":"power","field":"temperature","type":"f64","telemetry_path":"telemetry.temperature"},{"agent_id":"agent","engine":"power","field":"gain","type":"f64","value":1.0}],
             "parameters":[{"id":"gain","patch_index":1,"min":0.5,"max":2.0}],
-            "metrics":[{"id":"peak","target_file":"agent.power.jsonl","field":"temperature","aggregation":"max"}]
+            "metrics":[{"id":"peak","quantity":"temperature","units":"C","target_file":"agent.power.jsonl","field":"temperature","aggregation":"max"}]
         })).unwrap()
     }
 
@@ -976,20 +1085,20 @@ mod tests {
         let mut ledger = EvidenceLedger::default();
         ledger.record("telemetry", 1, "ok", json!({}));
         ledger.record("board", 1, "ok", json!({}));
-        let before_simulation = phase_tools(&[candidate()], &[&scenario], 0, &ledger, None);
+        let before_selection = phase_tools(&[candidate()], &[&scenario], 0, &ledger, None);
         assert!(
-            before_simulation
+            !before_selection
                 .iter()
                 .any(|tool| tool["function"]["name"] == "run_eds_simulation")
         );
         assert!(
-            !before_simulation
+            !before_selection
                 .iter()
                 .any(|tool| tool["function"]["name"] == "select_recovery_action")
         );
-        let after_simulation = phase_tools(&[candidate()], &[&scenario], 1, &ledger, None);
+        let after_assessment = phase_tools(&[candidate()], &[&scenario], 1, &ledger, None);
         assert!(
-            after_simulation
+            after_assessment
                 .iter()
                 .any(|tool| tool["function"]["name"] == "complete_thermal_assessment")
         );
@@ -1002,5 +1111,21 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "select now");
         assert!(messages[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn board_duplicate_or_conflicting_recovery_is_blocked() {
+        let mut snapshot = crate::types::LiveContextSnapshot::default();
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        board.proposals.insert(
+            safe::protocol::BoardCmdId("existing".into()),
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                TimedCommand::Now(Command::PointNadir),
+                1,
+            ),
+        );
+        snapshot.board = Some(board);
+        assert!(board_conflicts_or_duplicates(&snapshot, AllowedAction::PointSunYaw).unwrap());
     }
 }

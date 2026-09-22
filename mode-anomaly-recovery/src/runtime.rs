@@ -703,6 +703,8 @@ impl AnomalyRecoveryMode {
                 .adapter
                 .clone()
                 .ok_or_else(|| anyhow!("anomaly recovery LLM adapter has not been configured"))?,
+            telemetry_version: self.live_context.snapshot().telemetry_version,
+            board_version: self.live_context.snapshot().board_version,
         };
         tokio::spawn(async move {
             if let Err(error) = crate::planner::run(request).await {

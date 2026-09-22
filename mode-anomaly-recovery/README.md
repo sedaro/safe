@@ -25,11 +25,28 @@ trend/persistence use. Board proposals and approvals are command intent, not
 execution acknowledgement. A telemetry or board update cancels pending work
 before it can submit a stale proposal.
 
-The checked-in power-only scenario remains non-thermal. It is not thermal evidence and
-cannot establish thermal improvement. Live thermal integration is blocked until
-deployment supplies verified EDS thermal output fields, initial-state bindings,
-command schedule bindings, and time units; deterministic assessment behavior is
-implemented independently of that external mapping.
+The EDS is intentionally used only for power and command-side-effect viability;
+it does not contain a thermal model and is not thermal evidence. Thermal
+assessment is based on telemetry, trends, board state, and LLM reasoning.
+Missing thermal EDS outputs therefore do not block anomaly assessment or
+power-only command viability.
+
+### Post-selection viability
+
+Recovery selection is only an assessment disposition. Before SAFE receives a
+command, host code requires an exact action-specific recovery scenario and its
+baseline association, then runs both from the same frozen evidence revision,
+state bindings, and horizon. Both runs must succeed and return finite,
+unit-declared `final_state_of_charge` and `minimum_state_of_charge` metrics;
+the recovery contract also supplies machine-checkable minimum-SOC and maximum
+degradation constraints. Missing metrics, failed or timed-out runs, mismatched
+actions, stale revisions, and board duplicates/conflicts block output.
+
+Power-only viability can support a short-term command decision, but it always
+logs thermal benefit as unverified. Any future simulation-backed thermal claim
+would require a separate thermal model and verified output units. Model-specific
+EDS paths, IDs, and field names belong only in deployment configuration, never
+in generic source or committed fixtures.
 
 Profiles are selected by an exact `TelemetryFrame.source` match. Rule paths are
 dot-separated and relative to `TelemetryFrame.payload`; numeric path segments
