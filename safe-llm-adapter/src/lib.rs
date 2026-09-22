@@ -555,14 +555,14 @@ fn choice_message(
         })
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenAiCompatibleToolCall {
     #[serde(rename = "type")]
     kind: String,
     function: OpenAiCompatibleToolFunction,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenAiCompatibleToolFunction {
     name: String,
     arguments: String,
@@ -896,6 +896,28 @@ mod tests {
         assert!(request.contains("\"tool_choice\":\"required\""));
         assert!(request.contains("\"reasoning_effort\":\"none\""));
         assert!(request.contains("\"max_completion_tokens\":64"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_reports_choice_without_message() {
+        let response = json!({
+            "choices": [{"finish_reason": "stop"}]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let error = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect_err("missing choice message must fail closed");
+        assert!(error.to_string().contains("neither message nor delta"));
+        let _ = server.await.expect("test server should finish");
     }
 
     #[tokio::test]
