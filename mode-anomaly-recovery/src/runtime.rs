@@ -575,10 +575,67 @@ impl AnomalyRecoveryMode {
     fn candidate_signature(candidates: &[AnomalyCandidate]) -> String {
         let mut ids = candidates
             .iter()
-            .map(|candidate| format!("{}:{}", candidate.source, candidate.anomaly_id))
+            .map(|candidate| {
+                format!(
+                    "{}:{}:{}:{}",
+                    candidate.source, candidate.anomaly_id, candidate.ts_mono, candidate.observed
+                )
+            })
             .collect::<Vec<_>>();
         ids.sort();
         ids.join("|")
+    }
+
+    fn planning_in_flight(&self) -> bool {
+        self.planning_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    fn defer_telemetry_while_planning(&mut self, sample: TelemetrySample) -> bool {
+        if !self.planning_in_flight() {
+            return false;
+        }
+        self.pending_telemetry = Some(sample);
+        true
+    }
+
+    fn stop_planning(&mut self) {
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(task) = self.planning_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn reap_finished_plan(&mut self) {
+        let Some(task) = self.planning_task.take_if(|task| task.is_finished()) else {
+            return;
+        };
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            warn!(reason = %error, "anomaly recovery planning task failed");
+        }
+        self.planning_cancel = None;
+    }
+
+    async fn accept_telemetry(
+        &mut self,
+        runtime: &mut ModeRuntime,
+        sample: TelemetrySample,
+    ) -> Result<()> {
+        self.latest_telemetry = Some(sample.clone());
+        self.live_context.update_telemetry(sample.clone());
+        self.evaluate_static_profile(&sample);
+
+        if runtime.is_active() {
+            self.plan_current_candidates(runtime).await?;
+        }
+        Ok(())
     }
 
     async fn emit_action(
@@ -626,6 +683,11 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
         if self.current_candidates.is_empty() {
+            self.planning_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if let Some(cancel) = self.planning_cancel.take() {
+                cancel.cancel();
+            }
             return Ok(());
         }
 
@@ -634,23 +696,19 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
 
-        let actionable = self
-            .current_candidates
-            .iter()
-            .filter(|candidate| !candidate.eligible_actions.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-
         if self.config.decision_trace {
             self.log_decision_trace(
                 "candidates",
                 format!(
                     "{} detected candidate(s); {} have configured actions",
                     self.current_candidates.len(),
-                    actionable.len(),
+                    self.current_candidates
+                        .iter()
+                        .filter(|candidate| !candidate.eligible_actions.is_empty())
+                        .count(),
                 ),
             );
-            for candidate in &actionable {
+            for candidate in &self.current_candidates {
                 let actions = candidate
                     .eligible_actions
                     .iter()
@@ -670,37 +728,6 @@ impl AnomalyRecoveryMode {
                 );
             }
         }
-        if actionable.is_empty() {
-            warn!(
-                candidate_count = self.current_candidates.len(),
-                "nominal-profile anomalies have no eligible action; no command will be emitted"
-            );
-            self.last_plan_signature = Some(signature);
-            return Ok(());
-        }
-
-        if actionable.len() == 1 && actionable[0].eligible_actions.len() == 1 {
-            let candidate = &actionable[0];
-            let action = candidate.eligible_actions[0];
-            self.log_decision_trace(
-                "decision",
-                format!(
-                    "LLM skipped | {} has exactly one configured action: {}",
-                    candidate.anomaly_id,
-                    action.as_str(),
-                ),
-            );
-            self.emit_action(
-                runtime,
-                candidate,
-                action,
-                "single configured eligible action",
-            )
-            .await?;
-            self.last_plan_signature = Some(signature);
-            return Ok(());
-        }
-
         if let Some(cancel) = self.planning_cancel.take() {
             cancel.cancel();
         }
@@ -715,20 +742,27 @@ impl AnomalyRecoveryMode {
             .ok_or_else(|| anyhow!("missing telemetry snapshot"))?;
         let request = crate::planner::PlanningRequest {
             config: self.config.clone(),
-            candidates: actionable,
+            candidates: self.current_candidates.clone(),
             telemetry,
+            live_context: self.live_context.clone(),
             mode_id: runtime.mode_id(),
             generation,
             generations: self.planning_generation.clone(),
             active: self.active.clone(),
             cancel: cancel.clone(),
             output: runtime.output_tx(),
+            adapter: self
+                .adapter
+                .clone()
+                .ok_or_else(|| anyhow!("anomaly recovery LLM adapter has not been configured"))?,
+            telemetry_version: self.live_context.snapshot().telemetry_version,
+            board_version: self.live_context.snapshot().board_version,
         };
-        tokio::spawn(async move {
+        self.planning_task = Some(tokio::spawn(async move {
             if let Err(error) = crate::planner::run(request).await {
                 warn!(reason = %error, "anomaly recovery background planning failed without emitting a command");
             }
-        });
+        }));
         self.planning_cancel = Some(cancel);
         self.last_plan_signature = Some(signature);
         Ok(())
@@ -817,8 +851,10 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             "anomaly recovery static nominal profile config loaded"
         );
         self.config = config;
-        self.adapter = Some(adapter);
+        self.adapter = Some(adapter.into());
         self.latest_telemetry = None;
+        self.pending_telemetry = None;
+        self.live_context.clear();
         self.current_candidates.clear();
         self.rule_states.clear();
         self.has_board_snapshot = false;
@@ -826,9 +862,7 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         self.warned_missing_board_snapshot = false;
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
-        if let Some(cancel) = self.planning_cancel.take() {
-            cancel.cancel();
-        }
+        self.stop_planning();
         Ok(())
     }
 
@@ -849,11 +883,8 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     async fn on_deactivate(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
-        self.planning_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Some(cancel) = self.planning_cancel.take() {
-            cancel.cancel();
-        }
+        self.stop_planning();
+        self.pending_telemetry = None;
         self.last_plan_signature = None;
         Ok(())
     }
@@ -868,19 +899,13 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             ts_mono: telemetry.ts_mono,
             payload: telemetry.payload,
         };
-        self.latest_telemetry = Some(sample.clone());
-        self.evaluate_static_profile(&sample);
-
-        if !runtime.is_active() {
+        self.reap_finished_plan().await;
+        if runtime.is_active() && self.defer_telemetry_while_planning(sample.clone()) {
             return Ok(());
         }
-        if let Err(err) = self.plan_current_candidates(runtime).await {
-            self.log_planning_error(
-                "on_telemetry",
-                "plan_current_candidates",
-                &err,
-                Some(&sample),
-            );
+        self.pending_telemetry = None;
+        if let Err(err) = self.accept_telemetry(runtime, sample.clone()).await {
+            self.log_planning_error("on_telemetry", "accept_telemetry", &err, Some(&sample));
         }
         Ok(())
     }
@@ -890,11 +915,13 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         runtime: &mut ModeRuntime,
         board: AutonomyModeBoardState,
     ) -> Result<()> {
-        let first_snapshot = !self.has_board_snapshot;
         self.has_board_snapshot = true;
+        self.live_context.update_board(board.clone());
         self.latest_board_snapshot = board;
-        if first_snapshot
-            && runtime.is_active()
+        // Board intent can explain, conflict with, or duplicate recovery. It always invalidates a pending decision.
+        self.stop_planning();
+        self.last_plan_signature = None;
+        if runtime.is_active()
             && let Err(err) = self.plan_current_candidates(runtime).await
         {
             self.log_planning_error(
@@ -907,14 +934,22 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         Ok(())
     }
 
+    async fn on_tick(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
+        self.reap_finished_plan().await;
+        if !runtime.is_active() || self.planning_in_flight() {
+            return Ok(());
+        }
+        if let Some(sample) = self.pending_telemetry.take() {
+            self.accept_telemetry(runtime, sample).await?;
+        }
+        Ok(())
+    }
+
     async fn on_shutdown(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
-        self.planning_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Some(cancel) = self.planning_cancel.take() {
-            cancel.cancel();
-        }
+        self.stop_planning();
+        self.pending_telemetry = None;
         Ok(())
     }
 }
@@ -962,6 +997,55 @@ mod tests {
             ts_mono,
             payload,
         }
+    }
+
+    #[tokio::test]
+    async fn telemetry_is_coalesced_without_invalidating_an_in_flight_plan() {
+        let mut mode = configured_mode();
+        let frozen = sample(1, json!({"telemetry":{"temperature_c":50.0}}));
+        mode.latest_telemetry = Some(frozen.clone());
+        mode.live_context.update_telemetry(frozen);
+        let generation = mode
+            .planning_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        mode.planning_task = Some(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+
+        assert!(mode.defer_telemetry_while_planning(sample(
+            2,
+            json!({"telemetry":{"temperature_c":51.0}})
+        )));
+        assert!(mode.defer_telemetry_while_planning(sample(
+            3,
+            json!({"telemetry":{"temperature_c":52.0}})
+        )));
+
+        assert_eq!(mode.latest_telemetry.as_ref().unwrap().ts_mono, 1);
+        assert_eq!(mode.live_context.snapshot().telemetry.unwrap().ts_mono, 1);
+        assert_eq!(mode.pending_telemetry.as_ref().unwrap().ts_mono, 3);
+        assert_eq!(
+            mode.planning_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            generation
+        );
+        mode.stop_planning();
+    }
+
+    #[tokio::test]
+    async fn finished_plan_can_be_reaped_before_processing_pending_telemetry() {
+        let mut mode = configured_mode();
+        mode.pending_telemetry = Some(sample(2, json!({"telemetry":{}})));
+        mode.planning_cancel = Some(safe_sim::CancellationToken::new());
+        mode.planning_task = Some(tokio::spawn(async {}));
+        tokio::task::yield_now().await;
+
+        mode.reap_finished_plan().await;
+
+        assert!(!mode.planning_in_flight());
+        assert!(mode.planning_task.is_none());
+        assert!(mode.planning_cancel.is_none());
+        assert_eq!(mode.pending_telemetry.as_ref().unwrap().ts_mono, 2);
     }
 
     #[test]
@@ -1155,7 +1239,7 @@ mod tests {
     async fn generic_adapter_receives_constrained_completion_request() {
         let mut mode = configured_mode();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        mode.adapter = Some(Box::new(RecordingAdapter {
+        mode.adapter = Some(Arc::new(RecordingAdapter {
             requests: Arc::clone(&requests),
             completion: Completion {
                 text: "{}".to_string(),
@@ -1172,13 +1256,13 @@ mod tests {
         assert_eq!(request.prompt, "test prompt");
         assert_eq!(request.response_schema["required"][0], "anomaly_id");
         assert_eq!(request.temperature, 0.0);
-        assert_eq!(request.max_output_tokens, 256);
+        assert_eq!(request.max_output_tokens, 2048);
     }
 
     #[tokio::test]
     async fn truncated_completion_is_rejected_before_decision_parsing() {
         let mut mode = configured_mode();
-        mode.adapter = Some(Box::new(RecordingAdapter {
+        mode.adapter = Some(Arc::new(RecordingAdapter {
             requests: Arc::new(Mutex::new(Vec::new())),
             completion: Completion {
                 text: "{\"action_id\":\"point_nadir\"}".to_string(),
