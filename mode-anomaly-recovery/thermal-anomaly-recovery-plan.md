@@ -133,9 +133,10 @@ scenario execution/results; thermal fixtures under `testdata/`.
 - Keep simulation available until its run budget is exhausted. Track attempts
   separately from successful relevant results. A failed run cannot satisfy a
   simulation prerequisite; preserve its failure as evidence.
-- Require configured thermal evidence for a simulation-backed conclusion.
-  A power-only run remains supporting evidence. Permit an inconclusive assessment
-  when the model is unavailable or does not resolve the question.
+- Keep thermal assessment independent of EDS thermal modeling. The current EDS
+  is power-only, so its paired runs validate command side effects and electrical
+  viability only. Permit the LLM/telemetry assessment to complete without a
+  thermal simulation and mark thermal benefit unverified.
 - Add an injectable scenario runner so multi-run behavior can be tested without
   an EDS installation. Keep `SedaroSimulator` as the production implementation.
 
@@ -144,10 +145,9 @@ are distinct; failed/power-only runs do not satisfy thermal requirements;
 comparisons remain available after the first run; timeout/cancellation and metric
 units/missing values are validated.
 
-**External dependency:** verify the actual EDS thermal output fields, initialization
-bindings, command schedule inputs, and time units before authoring the live
-thermal scenario. The current power-only fixture does not supply these.
-Deterministic development can proceed with synthetic thermal results meanwhile.
+**External dependency:** a separate EDS thermal model is required only if the
+mission later wants simulation-backed thermal-benefit claims. It is not required
+for the anomaly assessment or the current power-only command-viability gate.
 
 ## 5. Conditional Recovery and Proposal Deduplication
 
@@ -215,15 +215,16 @@ cargo test --workspace
 | 1. Assessment precedes recovery | Milestones 1, 5 |
 | 2. Telemetry and board considered together | Milestone 2 |
 | 3. Evidence survives tool calls | Milestones 2, 4 |
-| 4. Simulation tests the thermal hypothesis | Milestones 4, 6 and verified EDS mapping |
+| 4. Simulation validates command side effects | Milestones 4, 5, and 6; thermal assessment remains telemetry/LLM-based |
 | 5. Actionable uncertainty | Milestones 1, 2, 4 |
 | 6. Current evidence and reassessment | Milestone 3 |
 | 7. Explicit recovery basis | Milestone 5 |
 | 8. Auditable result | Milestones 1–6 |
 
 Each milestone includes its focused deterministic tests. Full-story completion
-requires the real thermal-model integration as well as the assessment-only
-delivery; a successful power simulation or emitted command is not sufficient.
+does not require a thermal EDS model: a successful power simulation validates
+command viability only, while the thermal assessment remains evidence-backed
+telemetry/LLM synthesis.
 
 ## Implementation Status
 
@@ -240,8 +241,19 @@ longer emits the former automatic single-action proposal. Recovery selection is
 available only after a `thermal_anomaly` assessment requests recovery evaluation
 and references that assessment ID.
 
-The checked-in EDS scenario is still power-only. No live thermal integration
-claim is made: verified EDS thermal output names, initialization bindings,
-command-schedule bindings, and time-unit semantics are required before a thermal
-baseline/recovery fixture can be configured or live-tested. Synthetic/deterministic
-assessment coverage can proceed without those deployment-supplied model details.
+The checked-in EDS integration is intentionally power-only. Thermal assessment
+comes from host telemetry, command-board evidence, and LLM synthesis; paired
+EDS runs validate action-specific electrical side effects after selection. No
+thermal benefit is claimed from those runs. A separate thermal model, with
+verified output units and bindings, is an optional future enhancement rather
+than a blocker to this mode.
+
+Post-selection viability is now host-enforced: recovery selection follows the
+completed thermal assessment, exact generic baseline/recovery contracts are
+paired on frozen evidence and horizon, and an injectable runner validates
+finite unit-bearing SOC metrics and machine-checkable constraints before SAFE
+command output. Failed, timed-out, incomplete, action-mismatched, stale, or
+duplicate/conflicting results are rejected. Power-only success is explicitly
+command viability only and never thermal benefit evidence. A future thermal EDS
+integration would be separately gated on exact output fields, state/schedule
+bindings, and units.

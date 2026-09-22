@@ -236,13 +236,42 @@ pub(crate) enum MetricAggregation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SimulationMetric {
     pub(crate) id: String,
-    #[serde(default)]
-    pub(crate) quantity: Option<String>,
-    #[serde(default)]
-    pub(crate) units: Option<String>,
+    pub(crate) quantity: String,
+    pub(crate) units: String,
     pub(crate) target_file: String,
     pub(crate) field: String,
     pub(crate) aggregation: MetricAggregation,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SimulationScenarioRole {
+    Baseline,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationStateBinding {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) path: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConstraintKind {
+    Minimum,
+    Maximum,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationConstraint {
+    pub(crate) metric_id: String,
+    pub(crate) kind: ConstraintKind,
+    pub(crate) value: f64,
+    pub(crate) units: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -256,6 +285,14 @@ pub(crate) struct SimulationScenario {
     pub(crate) baseline_scenario_id: Option<String>,
     #[serde(default)]
     pub(crate) modeled_action: Option<AllowedAction>,
+    #[serde(default)]
+    pub(crate) role: Option<SimulationScenarioRole>,
+    #[serde(default)]
+    pub(crate) command_schedule_binding: Option<String>,
+    #[serde(default)]
+    pub(crate) state_bindings: Vec<SimulationStateBinding>,
+    #[serde(default)]
+    pub(crate) constraints: Vec<SimulationConstraint>,
     #[serde(default)]
     pub(crate) thermal: bool,
     pub(crate) duration_days: f64,
@@ -427,10 +464,10 @@ impl AnomalyRecoveryModeConfig {
 
         if let Some(simulation) = &self.simulation {
             if simulation.eds_path.as_os_str().is_empty()
-                || simulation.max_runs == 0
+                || simulation.max_runs < 2
                 || simulation.run_timeout_ms == 0
             {
-                bail!("simulation requires eds_path, max_runs > 0, and run_timeout_ms > 0");
+                bail!("simulation requires eds_path, max_runs >= 2, and run_timeout_ms > 0");
             }
             let mut scenario_ids = HashSet::new();
             for scenario in &simulation.scenarios {
@@ -515,6 +552,8 @@ impl AnomalyRecoveryModeConfig {
                 for metric in &scenario.metrics {
                     if metric.id.trim().is_empty()
                         || !metric_ids.insert(metric.id.as_str())
+                        || metric.quantity.trim().is_empty()
+                        || metric.units.trim().is_empty()
                         || metric.target_file.trim().is_empty()
                         || metric.target_file.contains('/')
                         || metric.target_file.contains('\\')
@@ -522,26 +561,12 @@ impl AnomalyRecoveryModeConfig {
                     {
                         bail!("simulation scenario '{}': invalid metric", scenario.id);
                     }
-                    if metric
-                        .units
-                        .as_ref()
-                        .is_some_and(|units| units.trim().is_empty())
-                        || metric
-                            .quantity
-                            .as_ref()
-                            .is_some_and(|quantity| quantity.trim().is_empty())
-                    {
-                        bail!(
-                            "simulation scenario '{}': metric quantity and units must not be empty",
-                            scenario.id
-                        );
-                    }
                 }
                 if scenario.thermal
                     && !scenario
                         .metrics
                         .iter()
-                        .any(|metric| metric.quantity.as_deref() == Some("temperature"))
+                        .any(|metric| metric.quantity == "temperature")
                 {
                     bail!(
                         "thermal simulation scenario '{}' needs a temperature metric",
@@ -553,6 +578,35 @@ impl AnomalyRecoveryModeConfig {
                         "recovery scenario '{}' needs baseline_scenario_id",
                         scenario.id
                     );
+                }
+                if scenario.role == Some(SimulationScenarioRole::Recovery)
+                    && (scenario.modeled_action.is_none()
+                        || scenario.baseline_scenario_id.is_none()
+                        || scenario.command_schedule_binding.is_none())
+                {
+                    bail!(
+                        "recovery scenario '{}' needs modeled_action, baseline_scenario_id, and command_schedule_binding",
+                        scenario.id
+                    );
+                }
+                for binding in &scenario.state_bindings {
+                    if binding.id.trim().is_empty()
+                        || binding.source.trim().is_empty()
+                        || validate_path(&binding.path).is_err()
+                    {
+                        bail!(
+                            "simulation scenario '{}': invalid state binding",
+                            scenario.id
+                        );
+                    }
+                }
+                for constraint in &scenario.constraints {
+                    if constraint.metric_id.trim().is_empty()
+                        || constraint.units.trim().is_empty()
+                        || !constraint.value.is_finite()
+                    {
+                        bail!("simulation scenario '{}': invalid constraint", scenario.id);
+                    }
                 }
             }
         }
@@ -784,7 +838,7 @@ mod tests {
                 "allowed_actions": ["point_sun_yaw"], "duration_days": 0.1,
                 "patches": [{"agent_id":"a", "engine":"power", "field":"temp", "type":"f64", "telemetry_path":"telemetry.temperature_c"}],
                 "parameters": [{"id":"bad", "patch_index":0, "min":0.0, "max":1.0}],
-                "metrics": [{"id":"temp", "target_file":"a.power.jsonl", "field":"temp", "aggregation":"max"}]
+                 "metrics": [{"id":"temp", "quantity":"temperature", "units":"C", "target_file":"a.power.jsonl", "field":"temp", "aggregation":"max"}]
             }]
         });
         let config: AnomalyRecoveryModeConfig = serde_json::from_value(value).unwrap();
