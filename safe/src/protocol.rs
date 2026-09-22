@@ -15,9 +15,16 @@ pub enum Command {
     IridiumTransmitMsg(String),
     PointSunYaw,
     PointNadir,
-    PointQuaternion { x: f64, y: f64, z: f64, w: f64 },
+    PointQuaternion {
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+    },
     CaptureImage,
-    CaptureImageWithCamera { camera_id: u32 },
+    CaptureImageWithCamera {
+        camera_id: u32,
+    },
     PointThruster,
     ThrusterOn,
     ThrusterOff,

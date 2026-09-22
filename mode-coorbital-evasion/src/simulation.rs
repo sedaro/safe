@@ -726,21 +726,15 @@ mod tests {
             .mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
             .unwrap();
 
-        assert!(
-            patches.iter().any(|patch| {
-                patch.field == "ground-threat.latitude_deg" && patch.value == "-23.000000000000000"
-            })
-        );
-        assert!(
-            patches.iter().any(|patch| {
-                patch.field == "ground-threat.longitude_deg" && patch.value == "-67.000000000000000"
-            })
-        );
-        assert!(
-            patches.iter().any(|patch| {
-                patch.field == "ground-threat.altitude_km" && patch.value == "0.500000000000000"
-            })
-        );
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.latitude_deg" && patch.value == "-23.000000000000000"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.longitude_deg" && patch.value == "-67.000000000000000"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.altitude_km" && patch.value == "0.500000000000000"
+        }));
     }
 
     #[test]

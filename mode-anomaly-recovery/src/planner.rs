@@ -391,12 +391,7 @@ async fn chat(
     );
     let result = timeout(
         Duration::from_millis(config.llm.request_timeout_ms),
-        http_client::post_json(
-            &host,
-            port,
-            &path,
-            &body,
-        ),
+        http_client::post_json(&host, port, &path, &body),
     )
     .await
     .map_err(|_| anyhow!("Ollama chat request timed out; verify local tool-capable model"))??;
