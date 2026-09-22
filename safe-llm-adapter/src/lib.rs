@@ -57,6 +57,8 @@ pub struct ToolCall {
 pub struct ToolChatCompletion {
     pub message: ToolChatMessage,
     pub finish_reason: CompletionFinishReason,
+    /// Provider-specific attempt summary intended for opt-in caller diagnostics.
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +279,7 @@ impl LlmAdapter for OllamaAdapter {
                     .collect(),
             },
             finish_reason: ollama_finish_reason(response.done, response.done_reason.as_deref()),
+            diagnostic: None,
         })
     }
 }
@@ -497,10 +500,27 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             )
             .await
                 && let Ok(legacy_result) = parse_tool_chat_response(&legacy_text)
-                && (legacy_result.finish_reason != CompletionFinishReason::Length
-                    || !legacy_result.message.tool_calls.is_empty())
             {
-                return Ok(legacy_result);
+                let diagnostic = openai_tool_attempt_diagnostic(
+                    &first,
+                    "max_completion_tokens",
+                    &body_text,
+                    &legacy_result,
+                    "max_tokens",
+                    &legacy_text,
+                );
+                if legacy_result.finish_reason != CompletionFinishReason::Length
+                    || !legacy_result.message.tool_calls.is_empty()
+                {
+                    return Ok(ToolChatCompletion {
+                        diagnostic: Some(diagnostic),
+                        ..legacy_result
+                    });
+                }
+                return Ok(ToolChatCompletion {
+                    diagnostic: Some(diagnostic),
+                    ..first
+                });
             }
         }
         Ok(first)
@@ -531,6 +551,7 @@ fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, Adapt
                 tool_calls: Vec::new(),
             },
             finish_reason,
+            diagnostic: None,
         });
     };
     let tool_calls = message
@@ -556,7 +577,29 @@ fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, Adapt
             tool_calls,
         },
         finish_reason,
+        diagnostic: None,
     })
+}
+
+fn openai_tool_attempt_diagnostic(
+    first: &ToolChatCompletion,
+    first_token_parameter: &str,
+    first_body: &str,
+    second: &ToolChatCompletion,
+    second_token_parameter: &str,
+    second_body: &str,
+) -> String {
+    format!(
+        "{first_token_parameter}:finish_reason={:?},tool_calls={},assistant_content={:?},response_body={:?}; {second_token_parameter}:finish_reason={:?},tool_calls={},assistant_content={:?},response_body={:?}",
+        first.finish_reason,
+        first.message.tool_calls.len(),
+        clip_chars(&first.message.content, 240),
+        clip_chars(first_body, 600),
+        second.finish_reason,
+        second.message.tool_calls.len(),
+        clip_chars(&second.message.content, 240),
+        clip_chars(second_body, 600),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -992,6 +1035,33 @@ mod tests {
             "get_latest_telemetry"
         );
         let _ = server.await.expect("test server should finish");
+    }
+
+    #[test]
+    fn openai_tool_attempt_diagnostic_identifies_both_token_parameters() {
+        let truncated = ToolChatCompletion {
+            message: ToolChatMessage {
+                role: "assistant".to_string(),
+                content: "<tool_call>".to_string(),
+                tool_calls: Vec::new(),
+            },
+            finish_reason: CompletionFinishReason::Length,
+            diagnostic: None,
+        };
+
+        let diagnostic = openai_tool_attempt_diagnostic(
+            &truncated,
+            "max_completion_tokens",
+            "{\"choices\":[{\"finish_reason\":\"length\"}]}",
+            &truncated,
+            "max_tokens",
+            "{\"choices\":[{\"finish_reason\":\"length\"}]}",
+        );
+
+        assert!(diagnostic.contains("max_completion_tokens:finish_reason=Length,tool_calls=0"));
+        assert!(diagnostic.contains("max_tokens:finish_reason=Length,tool_calls=0"));
+        assert!(diagnostic.contains("assistant_content=\"<tool_call>\""));
+        assert!(diagnostic.contains("response_body=\"{\\\"choices\\\""));
     }
 
     #[tokio::test]

@@ -185,6 +185,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     turn,
                     assistant_content = %sanitize(&response.message.content),
                     parsed_tool_call_count = response.message.tool_calls.len(),
+                    provider_attempts = ?response.diagnostic,
                     "anomaly recovery truncated tool-call diagnostic"
                 );
             }
