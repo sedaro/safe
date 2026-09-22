@@ -66,6 +66,11 @@ impl MissionPlanningMode {
         runtime: &mut ModeRuntime,
         telemetry: &TelemetryFrame,
     ) -> Result<()> {
+        info!(
+            simulation_count = 1,
+            planning_horizon_secs = self.config.planning_horizon_secs,
+            "mission planning running baseline simulation"
+        );
         let current_gps_time = telemetry_number(
             telemetry,
             &self.config.telemetry_gps_time_pointer,
@@ -86,6 +91,8 @@ impl MissionPlanningMode {
                 .await
                 .context("baseline simulation")?;
         let samples = extract_planning_samples(&self.config, &baseline_result)?;
+        // The planning samples retain the needed values; release full EDS frames before validation.
+        drop(baseline_result);
         let plan = build_plan(
             &self.config,
             &samples,
@@ -118,6 +125,16 @@ impl MissionPlanningMode {
             execution_time(left, current_gps_time)
                 .total_cmp(&execution_time(right, current_gps_time))
         });
+        let validation_simulation_count = 1 + self
+            .config
+            .monte_carlo
+            .as_ref()
+            .map_or(0, |monte_carlo| monte_carlo.samples);
+        info!(
+            simulation_count = validation_simulation_count,
+            planning_horizon_secs = self.config.planning_horizon_secs,
+            "mission planning running candidate validation simulations"
+        );
         validate_candidate_schedule(&self.config, telemetry, validation_schedule)
             .await
             .context("candidate-command Monte Carlo validation")?;
@@ -275,6 +292,7 @@ fn execution_time(command: &TimedCommand, current_gps_time: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use safe::protocol::{AutonomyModeId, BoardCmdId, Command};
     use uuid::Uuid;
 
@@ -308,5 +326,14 @@ mod tests {
             ..MissionPlanningMode::default()
         };
         assert!(mode.replan_interval_active());
+    }
+
+    #[test]
+    fn unrelated_adapter_failure_is_not_transient() {
+        let error = anyhow!(
+            "simulation input adapter failed (code=Some(1)): Error: invalid telemetry packet"
+        );
+
+        assert!(!telemetry_is_not_ready(&error));
     }
 }

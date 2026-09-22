@@ -52,6 +52,7 @@ pub(crate) async fn validate_candidate_schedule(
         .await
         .context("candidate-command simulation")?;
     validate_result(config, &nominal)?;
+    drop(nominal);
     let Some(monte_carlo) = &config.monte_carlo else {
         return Ok(());
     };
@@ -61,7 +62,7 @@ pub(crate) async fn validate_candidate_schedule(
         .patch_multi(input.patches)
         .timeout(Duration::from_secs(config.simulation_timeout_secs));
     let mut study = MonteCarloStudy::new(
-        simulator,
+        simulator.clone(),
         config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY,
     )
     .samples(monte_carlo.samples)
@@ -69,18 +70,24 @@ pub(crate) async fn validate_candidate_schedule(
     for parameter in &monte_carlo.parameters {
         study = study.parameter(parameter.clone());
     }
-    let study_result = study.run().await.context("monte_carlo study execution")?;
     let mut passed = 0;
     let mut failures = Vec::new();
-    for run in study_result.runs {
-        let id = run.case.id.clone();
-        if !run.succeeded() {
-            failures.push(format!("{id}: EDS simulation failed"));
-        } else if let Some(result) = run.simulation_result() {
-            match validate_result(config, result) {
+    // Run cases one at a time so their decoded EDS outputs are released before
+    // the next sample. Retaining a complete study can exhaust a flight host.
+    for case in study.generate_cases()? {
+        let id = case.id;
+        let result = simulator
+            .clone()
+            .patch_multi(case.patches)
+            .run_collect(config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY)
+            .await;
+        match result {
+            Ok(result) if result.success => match validate_result(config, &result) {
                 Ok(()) => passed += 1,
                 Err(error) => failures.push(format!("{id}: {error}")),
-            }
+            },
+            Ok(_) => failures.push(format!("{id}: EDS simulation failed")),
+            Err(error) => failures.push(format!("{id}: {error:#}")),
         }
     }
     let fraction = passed as f64 / monte_carlo.samples as f64;
@@ -339,7 +346,16 @@ fn numeric(frame: &EdsFrame, field: &str) -> Result<f64> {
 }
 
 fn boolean(frame: &EdsFrame, field: &str) -> Result<bool> {
-    frame.get_by_field(field)?.data.as_bool()
+    let value = &frame.get_by_field(field)?.data;
+    match value {
+        safe_sim::EdsValue::Bool(value) => Ok(*value),
+        safe_sim::EdsValue::Sequence(values) => values
+            .iter()
+            .map(safe_sim::EdsValue::as_bool)
+            .collect::<Result<Vec<_>>>()
+            .map(|values| values.into_iter().any(|value| value)),
+        _ => bail!("field '{field}' must be a boolean or an array of booleans"),
+    }
 }
 
 fn aggregate(values: &[f64], check: &FieldCheck) -> Result<f64> {

@@ -53,6 +53,16 @@ pub(crate) enum PointingTarget {
     Quaternion(UnitQuaternion<f64>),
 }
 
+pub(crate) fn quaternion_to_ypr(quaternion: &UnitQuaternion<f64>) -> (f64, f64, f64) {
+    let (roll, pitch, yaw) = quaternion.euler_angles();
+    let radians_to_degrees = 180.0 / std::f64::consts::PI;
+    (
+        roll * radians_to_degrees,
+        pitch * radians_to_degrees,
+        yaw * radians_to_degrees,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScheduledPointing {
     pub(crate) time_mjd: f64,
@@ -60,12 +70,12 @@ pub(crate) struct ScheduledPointing {
 }
 
 pub(crate) type ModeScheduleEntry = (f64, String);
-pub(crate) type QuaternionScheduleEntry = (f64, (f64, f64, f64, f64));
+pub(crate) type RpyScheduleEntry = (f64, (f64, f64, f64));
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct EdsPointingSchedule {
     pub(crate) mode_schedule: Vec<ModeScheduleEntry>,
-    pub(crate) quaternion_schedule: Vec<QuaternionScheduleEntry>,
+    pub(crate) rpy_schedule: Vec<RpyScheduleEntry>,
 }
 
 #[derive(Debug, Clone, Default)]

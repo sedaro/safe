@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::config::CoorbitalEvasionModeConfig;
 use crate::types::{
     CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget, ScheduledPointing,
+    quaternion_to_ypr,
 };
 
 impl CoorbitalEvasionMode {
@@ -34,6 +35,27 @@ impl CoorbitalEvasionMode {
             (Command::PointNadir, PointingTarget::Nadir) => true,
             (Command::PointQuaternion { x, y, z, w }, PointingTarget::Quaternion(target)) => {
                 let existing = UnitQuaternion::new_normalize(Quaternion::new(*w, *x, *y, *z));
+                let dot = existing
+                    .quaternion()
+                    .coords
+                    .dot(&target.quaternion().coords)
+                    .abs()
+                    .clamp(-1.0, 1.0);
+                2.0 * dot.acos() <= self.config.command_dedup_angle_rad
+            }
+            (
+                Command::PointYpr {
+                    roll_deg,
+                    pitch_deg,
+                    yaw_deg,
+                },
+                PointingTarget::Quaternion(target),
+            ) => {
+                let existing = UnitQuaternion::from_euler_angles(
+                    roll_deg.to_radians(),
+                    pitch_deg.to_radians(),
+                    yaw_deg.to_radians(),
+                );
                 let dot = existing
                     .quaternion()
                     .coords
@@ -68,6 +90,7 @@ impl CoorbitalEvasionMode {
                 | Command::PointSunYaw
                 | Command::PointThruster
                 | Command::PointQuaternion { .. }
+                | Command::PointYpr { .. }
         )
     }
 
@@ -161,12 +184,11 @@ impl CoorbitalEvasionMode {
             let command = match &planned.target {
                 PointingTarget::Nadir => Command::PointNadir,
                 PointingTarget::Quaternion(quaternion) => {
-                    let q = quaternion.quaternion();
-                    Command::PointQuaternion {
-                        x: q.i,
-                        y: q.j,
-                        z: q.k,
-                        w: q.w,
+                    let (roll_deg, pitch_deg, yaw_deg) = quaternion_to_ypr(quaternion);
+                    Command::PointYpr {
+                        roll_deg,
+                        pitch_deg,
+                        yaw_deg,
                     }
                 }
             };
@@ -193,9 +215,6 @@ impl CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         telemetry: &TelemetryFrame,
     ) -> anyhow::Result<()> {
-        if self.config.threat_ids.is_empty() {
-            return Ok(());
-        }
         let PlanningOutcome::Schedule(plan) = self.build_plan(telemetry).await? else {
             info!("coorbital-evasion baseline is clear; no pointing change required");
             return Ok(());
@@ -237,9 +256,6 @@ impl CoorbitalEvasionMode {
         }
         if self.config.field_of_view_id.is_empty() {
             warn!("CoorbitalEvasion mode_config.field_of_view_id is empty");
-        }
-        if self.config.threat_ids.is_empty() {
-            warn!("CoorbitalEvasion mode_config.threat_ids is empty; no threats will be evaluated");
         }
         self.warned_missing_config = true;
     }
@@ -365,6 +381,19 @@ mod tests {
                 w: -1.0,
             },
             &target
+        ));
+    }
+
+    #[test]
+    fn ypr_command_matches_quaternion_target() {
+        let mode = CoorbitalEvasionMode::new();
+        assert!(mode.command_matches_target(
+            &Command::PointYpr {
+                roll_deg: 0.0,
+                pitch_deg: 0.0,
+                yaw_deg: 0.0,
+            },
+            &PointingTarget::Quaternion(UnitQuaternion::identity()),
         ));
     }
 
