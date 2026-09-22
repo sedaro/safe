@@ -180,6 +180,14 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 max_output_tokens,
             );
             let available_tools = available_tools.join(",");
+            if request.config.decision_trace {
+                warn!(
+                    turn,
+                    assistant_content = %sanitize(&response.message.content),
+                    parsed_tool_call_count = response.message.tool_calls.len(),
+                    "anomaly recovery truncated tool-call diagnostic"
+                );
+            }
             warn!(
                 turn,
                 max_turns = MAX_TURNS,
