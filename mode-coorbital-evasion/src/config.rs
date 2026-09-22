@@ -33,8 +33,6 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     pub(crate) agent_id: String,
     #[serde(default = "default_field_of_view_id")]
     pub(crate) field_of_view_id: String,
-    #[serde(default)]
-    pub(crate) threat_ids: Vec<String>,
     /// Maximum threat range to consider, in kilometers.
     #[serde(default = "default_threat_max_range_km")]
     pub(crate) threat_max_range_km: f64,
@@ -72,8 +70,8 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     pub(crate) schedule_patch_engine: String,
     #[serde(default = "default_pointing_mode_schedule_field")]
     pub(crate) pointing_mode_schedule_field: String,
-    #[serde(default = "default_pointing_quaternion_schedule_field")]
-    pub(crate) pointing_quaternion_schedule_field: String,
+    #[serde(default = "default_pointing_rpy_schedule_field")]
+    pub(crate) pointing_rpy_schedule_field: String,
     #[serde(default = "default_nadir_mode_id")]
     pub(crate) nadir_mode_id: String,
     #[serde(default = "default_sun_yaw_mode_id")]
@@ -96,7 +94,6 @@ impl Default for CoorbitalEvasionModeConfig {
             command_lead_secs: default_command_lead_secs(),
             agent_id: default_agent_id(),
             field_of_view_id: default_field_of_view_id(),
-            threat_ids: Vec::new(),
             threat_max_range_km: default_threat_max_range_km(),
             fov_half_angle_deg: default_fov_half_angle_deg(),
             fov_guard_angle_deg: default_fov_guard_angle_deg(),
@@ -114,7 +111,7 @@ impl Default for CoorbitalEvasionModeConfig {
             in_field_of_view_field: default_in_field_of_view_field(),
             schedule_patch_engine: default_schedule_patch_engine(),
             pointing_mode_schedule_field: default_pointing_mode_schedule_field(),
-            pointing_quaternion_schedule_field: default_pointing_quaternion_schedule_field(),
+            pointing_rpy_schedule_field: default_pointing_rpy_schedule_field(),
             nadir_mode_id: default_nadir_mode_id(),
             sun_yaw_mode_id: default_sun_yaw_mode_id(),
         }
@@ -202,7 +199,7 @@ fn default_schedule_patch_engine() -> String {
 fn default_pointing_mode_schedule_field() -> String {
     String::new()
 }
-fn default_pointing_quaternion_schedule_field() -> String {
+fn default_pointing_rpy_schedule_field() -> String {
     String::new()
 }
 fn default_nadir_mode_id() -> String {
@@ -225,7 +222,7 @@ mod tests {
         assert!(config.agent_id.is_empty());
         assert!(config.field_of_view_id.is_empty());
         assert!(config.pointing_mode_schedule_field.is_empty());
-        assert!(config.pointing_quaternion_schedule_field.is_empty());
+        assert!(config.pointing_rpy_schedule_field.is_empty());
         assert!(config.nadir_mode_id.is_empty());
         assert!(config.sun_yaw_mode_id.is_empty());
     }

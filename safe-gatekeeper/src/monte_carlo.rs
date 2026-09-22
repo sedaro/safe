@@ -99,9 +99,13 @@ pub(crate) fn generate_cases(
             )?;
 
             if let Some(patch_index) = baseline_index {
-                patches[patch_index].value = final_value.to_string();
+                let mut rendered = final_value.to_string();
+                if !rendered.contains(['.', 'e', 'E']) {
+                    rendered.push_str(".0");
+                }
+                patches[patch_index].value = rendered;
             } else {
-                patches.push(variation.target.patch(final_value));
+                patches.push(variation.target.patch_f64(final_value));
             }
             values.insert(variation.name.clone(), final_value);
         }

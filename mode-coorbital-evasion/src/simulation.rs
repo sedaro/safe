@@ -15,11 +15,11 @@ use tokio::process::Command as ProcessCommand;
 use crate::planning::threat_is_within_range;
 use crate::types::{
     CoorbitalEvasionMode, EdsPointingSchedule, GeometrySample, ModeScheduleEntry, PointingTarget,
-    QuaternionScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport,
+    RpyScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport, quaternion_to_ypr,
 };
 
 const POINTING_MODE_SCHEDULE_TYPE: &str = "[(f64, str)]";
-const POINTING_QUATERNION_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64, f64))]";
+const POINTING_RPY_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64))]";
 
 fn telemetry_vec3(value: &Value) -> anyhow::Result<[f64; 3]> {
     let values = value
@@ -54,6 +54,34 @@ pub(crate) struct SimulationInput {
 }
 
 impl CoorbitalEvasionMode {
+    pub(crate) fn active_threat_ids(
+        &self,
+        telemetry: &TelemetryFrame,
+    ) -> anyhow::Result<Vec<String>> {
+        let augmented = telemetry
+            .payload
+            .get("augmented")
+            .and_then(Value::as_object)
+            .context("telemetry is missing object payload.augmented")?;
+        let mut ids = augmented
+            .get("ground_threat_locations")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|threats| threats.keys())
+            .chain(
+                augmented
+                    .get("space_threat_epoch_states")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|threats| threats.keys()),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     fn add_command_to_schedule(
         &self,
         schedule: &mut EdsPointingSchedule,
@@ -67,9 +95,19 @@ impl CoorbitalEvasionMode {
             Command::PointSunYaw => schedule
                 .mode_schedule
                 .push((time_mjd, self.config.sun_yaw_mode_id.clone())),
-            Command::PointQuaternion { x, y, z, w } => schedule
-                .quaternion_schedule
-                .push((time_mjd, (*x, *y, *z, *w))),
+            Command::PointQuaternion { x, y, z, w } => {
+                let quaternion = UnitQuaternion::new_normalize(Quaternion::new(*w, *x, *y, *z));
+                schedule
+                    .rpy_schedule
+                    .push((time_mjd, quaternion_to_ypr(&quaternion)));
+            }
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            } => schedule
+                .rpy_schedule
+                .push((time_mjd, (*roll_deg, *pitch_deg, *yaw_deg))),
             _ => {}
         }
     }
@@ -79,7 +117,7 @@ impl CoorbitalEvasionMode {
             .mode_schedule
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
         schedule
-            .quaternion_schedule
+            .rpy_schedule
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
         schedule.mode_schedule.dedup_by(|left, right| {
             if left.0 == right.0 {
@@ -89,7 +127,7 @@ impl CoorbitalEvasionMode {
                 false
             }
         });
-        schedule.quaternion_schedule.dedup_by(|left, right| {
+        schedule.rpy_schedule.dedup_by(|left, right| {
             if left.0 == right.0 {
                 *left = right.clone();
                 true
@@ -113,11 +151,11 @@ impl CoorbitalEvasionMode {
         format!("[{entries}]")
     }
 
-    fn serialize_quaternion_schedule(schedule: &[QuaternionScheduleEntry]) -> String {
+    fn serialize_rpy_schedule(schedule: &[RpyScheduleEntry]) -> String {
         let entries = schedule
             .iter()
-            .map(|(time_mjd, (x, y, z, w))| {
-                format!("({time_mjd:.15}, ({x:.15}, {y:.15}, {z:.15}, {w:.15}))")
+            .map(|(time_mjd, (roll, pitch, yaw))| {
+                format!("({time_mjd:.15}, ({roll:.15}, {pitch:.15}, {yaw:.15}))")
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -153,7 +191,10 @@ impl CoorbitalEvasionMode {
             }
             if !matches!(
                 command,
-                Command::PointNadir | Command::PointSunYaw | Command::PointQuaternion { .. }
+                Command::PointNadir
+                    | Command::PointSunYaw
+                    | Command::PointQuaternion { .. }
+                    | Command::PointYpr { .. }
             ) {
                 continue;
             }
@@ -175,11 +216,11 @@ impl CoorbitalEvasionMode {
             .mode_schedule
             .iter()
             .any(|(time_mjd, _)| *time_mjd <= sim_start_mjd);
-        let has_active_quaternion = schedule
-            .quaternion_schedule
+        let has_active_rpy = schedule
+            .rpy_schedule
             .iter()
             .any(|(time_mjd, _)| *time_mjd <= sim_start_mjd);
-        if !has_active_mode && !has_active_quaternion {
+        if !has_active_mode && !has_active_rpy {
             schedule
                 .mode_schedule
                 .push((sim_start_mjd, self.config.nadir_mode_id.clone()));
@@ -201,8 +242,8 @@ impl CoorbitalEvasionMode {
                 .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
                 .cloned()
                 .collect(),
-            quaternion_schedule: accepted
-                .quaternion_schedule
+            rpy_schedule: accepted
+                .rpy_schedule
                 .iter()
                 .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
                 .cloned()
@@ -214,10 +255,9 @@ impl CoorbitalEvasionMode {
                     .mode_schedule
                     .push((command.time_mjd, self.config.nadir_mode_id.clone())),
                 PointingTarget::Quaternion(quaternion) => {
-                    let q = quaternion.quaternion();
                     schedule
-                        .quaternion_schedule
-                        .push((command.time_mjd, (q.i, q.j, q.k, q.w)));
+                        .rpy_schedule
+                        .push((command.time_mjd, quaternion_to_ypr(quaternion)));
                 }
             }
         }
@@ -225,7 +265,11 @@ impl CoorbitalEvasionMode {
         schedule
     }
 
-    fn mode_patches(&self, telemetry: &TelemetryFrame) -> anyhow::Result<Vec<EdsPatch>> {
+    fn mode_patches(
+        &self,
+        telemetry: &TelemetryFrame,
+        threat_ids: &[String],
+    ) -> anyhow::Result<Vec<EdsPatch>> {
         let mut patches = vec![
             EdsPatch::new(
                 &self.config.agent_id,
@@ -271,7 +315,16 @@ impl CoorbitalEvasionMode {
             .get("space_threat_epoch_states")
             .and_then(Value::as_object);
 
-        for id in &self.config.threat_ids {
+        for id in threat_ids {
+            // Rogue point threats are inactive by default, so state patches alone
+            // do not make them participate in FOV evaluation.
+            patches.push(EdsPatch::new(
+                &self.config.agent_id,
+                "gnc",
+                &format!("{id}.active"),
+                "bool",
+                "true",
+            ));
             match (
                 ground.and_then(|locations| locations.get(id)),
                 space.and_then(|states| states.get(id)),
@@ -486,6 +539,7 @@ impl CoorbitalEvasionMode {
     pub(crate) fn decode_geometry(
         &self,
         result: &SimulationResult,
+        threat_ids: &[String],
     ) -> anyhow::Result<Vec<GeometrySample>> {
         self.frames_for_result(result)?
             .iter()
@@ -507,9 +561,7 @@ impl CoorbitalEvasionMode {
                             self.config.time_field
                         )
                     })?;
-                let threats = self
-                    .config
-                    .threat_ids
+                let threats = threat_ids
                     .iter()
                     .map(|id| {
                         Ok(ThreatGeometry {
@@ -557,10 +609,11 @@ impl CoorbitalEvasionMode {
         input: &SimulationInput,
         schedule: &EdsPointingSchedule,
         telemetry: &TelemetryFrame,
+        threat_ids: &[String],
     ) -> anyhow::Result<Vec<GeometrySample>> {
         let sim_start_mjd = input.start_time_mjd;
         let mut patches = input.patches.clone();
-        patches.extend(self.mode_patches(telemetry)?);
+        patches.extend(self.mode_patches(telemetry, threat_ids)?);
         patches.push(EdsPatch::new(
             &self.config.agent_id,
             &self.config.schedule_patch_engine,
@@ -571,9 +624,9 @@ impl CoorbitalEvasionMode {
         patches.push(EdsPatch::new(
             &self.config.agent_id,
             &self.config.schedule_patch_engine,
-            &self.config.pointing_quaternion_schedule_field,
-            POINTING_QUATERNION_SCHEDULE_TYPE,
-            &Self::serialize_quaternion_schedule(&schedule.quaternion_schedule),
+            &self.config.pointing_rpy_schedule_field,
+            POINTING_RPY_SCHEDULE_TYPE,
+            &Self::serialize_rpy_schedule(&schedule.rpy_schedule),
         ));
         let simulator = safe_sim::SedaroSimulator::new(&self.config.eds_path)
             .at_epoch(sim_start_mjd)
@@ -585,6 +638,12 @@ impl CoorbitalEvasionMode {
                 self.config.eds_path.display()
             )
         })?;
+        tracing::info!(
+            simulation_count = 1,
+            threat_count = threat_ids.len(),
+            sim_duration_days = self.config.sim_duration_days,
+            "coorbital-evasion running geometry simulation"
+        );
         let result = simulator
             .run_collect(self.config.sim_duration_days)
             .await
@@ -594,7 +653,7 @@ impl CoorbitalEvasionMode {
                     workspace.display()
                 )
             })?;
-        self.decode_geometry(&result)
+        self.decode_geometry(&result, threat_ids)
     }
 
     pub(crate) fn validation_report(
@@ -602,6 +661,7 @@ impl CoorbitalEvasionMode {
         samples: &[GeometrySample],
         earliest_command_mjd: f64,
         _fov_half_angle_rad: f64,
+        threat_ids: &[String],
     ) -> ValidationReport {
         let mut report = ValidationReport::default();
         let earliest = samples
@@ -617,7 +677,7 @@ impl CoorbitalEvasionMode {
                     && threat.in_field_of_view
                 {
                     exposed = true;
-                    let id = &self.config.threat_ids[threat_index];
+                    let id = &threat_ids[threat_index];
                     if !report.exposed_threat_ids.contains(id) {
                         report.exposed_threat_ids.push(id.clone());
                     }
@@ -653,8 +713,7 @@ mod tests {
 
     #[test]
     fn mode_patches_use_ground_threat_state_from_telemetry() {
-        let mut mode = CoorbitalEvasionMode::new();
-        mode.config.threat_ids = vec!["ground-threat".to_string()];
+        let mode = CoorbitalEvasionMode::new();
         let telemetry = TelemetryFrame::new(serde_json::json!({
             "augmented": {
                 "ground_threat_locations": {
@@ -663,7 +722,9 @@ mod tests {
             }
         }));
 
-        let patches = mode.mode_patches(&telemetry).unwrap();
+        let patches = mode
+            .mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+            .unwrap();
 
         assert!(
             patches.iter().any(|patch| {
@@ -684,8 +745,7 @@ mod tests {
 
     #[test]
     fn mode_patches_use_space_threat_state_from_telemetry() {
-        let mut mode = CoorbitalEvasionMode::new();
-        mode.config.threat_ids = vec!["space-threat".to_string()];
+        let mode = CoorbitalEvasionMode::new();
         let telemetry = TelemetryFrame::new(serde_json::json!({
             "augmented": {
                 "space_threat_epoch_states": {
@@ -694,7 +754,9 @@ mod tests {
             }
         }));
 
-        let patches = mode.mode_patches(&telemetry).unwrap();
+        let patches = mode
+            .mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+            .unwrap();
 
         assert!(
             patches
@@ -710,16 +772,15 @@ mod tests {
     }
 
     #[test]
-    fn mode_patches_reject_missing_configured_threat_state() {
-        let mut mode = CoorbitalEvasionMode::new();
-        mode.config.threat_ids = vec!["missing-threat".to_string()];
+    fn mode_patches_accepts_telemetry_without_threats() {
+        let mode = CoorbitalEvasionMode::new();
         let telemetry = TelemetryFrame::new(serde_json::json!({"augmented": {}}));
 
         assert!(
-            mode.mode_patches(&telemetry)
-                .unwrap_err()
-                .to_string()
-                .contains("missing state for configured threat 'missing-threat'")
+            mode.mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+                .unwrap()
+                .iter()
+                .all(|patch| !patch.field.contains("threat"))
         );
     }
 
@@ -769,8 +830,8 @@ mod tests {
                 (future_mode_time, mode.config.nadir_mode_id.clone()),
             ]
         );
-        assert_eq!(schedule.quaternion_schedule.len(), 1);
-        assert!((schedule.quaternion_schedule[0].0 - (start + 0.02)).abs() < 1.0e-9);
+        assert_eq!(schedule.rpy_schedule.len(), 1);
+        assert!((schedule.rpy_schedule[0].0 - (start + 0.02)).abs() < 1.0e-9);
     }
 
     #[test]
@@ -781,7 +842,7 @@ mod tests {
             schedule.mode_schedule,
             vec![(60_000.0, mode.config.nadir_mode_id.clone())]
         );
-        assert!(schedule.quaternion_schedule.is_empty());
+        assert!(schedule.rpy_schedule.is_empty());
     }
 
     #[test]
@@ -814,7 +875,7 @@ mod tests {
                 (future_mode_time, mode.config.sun_yaw_mode_id.clone()),
             ]
         );
-        assert!(schedule.quaternion_schedule.is_empty());
+        assert!(schedule.rpy_schedule.is_empty());
     }
 
     #[test]
@@ -822,7 +883,7 @@ mod tests {
         let mode = CoorbitalEvasionMode::new();
         let accepted = EdsPointingSchedule {
             mode_schedule: vec![(1.0, "sun".to_string()), (2.0, "thruster".to_string())],
-            quaternion_schedule: Vec::new(),
+            rpy_schedule: Vec::new(),
         };
         let selected = vec![ScheduledPointing {
             time_mjd: 1.5,
@@ -833,13 +894,12 @@ mod tests {
             result.mode_schedule,
             vec![(1.0, "sun".to_string()), (1.5, mode.config.nadir_mode_id)]
         );
-        assert!(result.quaternion_schedule.is_empty());
+        assert!(result.rpy_schedule.is_empty());
     }
 
     #[test]
     fn validation_ignores_threats_beyond_max_range() {
         let mut mode = CoorbitalEvasionMode::new();
-        mode.config.threat_ids = vec!["threat".to_string()];
         mode.config.threat_max_range_km = 9.0;
         let samples = (0..=1)
             .map(|index| GeometrySample {
@@ -856,7 +916,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let report = mode.validation_report(&samples, 60_000.0, 30_f64.to_radians());
+        let report = mode.validation_report(
+            &samples,
+            60_000.0,
+            30_f64.to_radians(),
+            &["threat".to_string()],
+        );
         assert_eq!(report.score.exposure_secs, 0.0);
         assert!(report.exposed_threat_ids.is_empty());
     }

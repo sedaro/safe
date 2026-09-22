@@ -198,12 +198,14 @@ fn default_pointing_command(pointing: &PointingConfig) -> Command {
     match pointing {
         PointingConfig::Nadir => Command::PointNadir,
         PointingConfig::SunYaw => Command::PointSunYaw,
-        PointingConfig::Quaternion { x, y, z, w } => Command::PointQuaternion {
-            x: *x,
-            y: *y,
-            z: *z,
-            w: *w,
-        },
+        PointingConfig::Quaternion { x, y, z, w } => {
+            let (roll_deg, pitch_deg, yaw_deg) = quaternion_to_ypr(*x, *y, *z, *w);
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            }
+        }
         PointingConfig::Ypr {
             roll_deg,
             pitch_deg,
@@ -214,6 +216,18 @@ fn default_pointing_command(pointing: &PointingConfig) -> Command {
             yaw_deg: *yaw_deg,
         },
     }
+}
+
+fn quaternion_to_ypr(x: f64, y: f64, z: f64, w: f64) -> (f64, f64, f64) {
+    let roll = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+    let pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0).asin();
+    let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    let radians_to_degrees = 180.0 / std::f64::consts::PI;
+    (
+        roll * radians_to_degrees,
+        pitch * radians_to_degrees,
+        yaw * radians_to_degrees,
+    )
 }
 
 fn track_command(station: &GroundStationConfig) -> Command {
@@ -243,7 +257,7 @@ fn command_time(command: &TimedCommand) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GroundStationConfig, MissionPlanningConfig, TargetConfig};
+    use crate::config::{GroundStationConfig, MissionPlanningConfig, PointingConfig, TargetConfig};
 
     fn config() -> MissionPlanningConfig {
         MissionPlanningConfig {
@@ -274,6 +288,23 @@ mod tests {
             target_visible: visible,
             station_elevations_deg: vec![elevation],
         }
+    }
+
+    #[test]
+    fn quaternion_default_pointing_is_emitted_as_ypr() {
+        assert!(matches!(
+            default_pointing_command(&PointingConfig::Quaternion {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            }),
+            Command::PointYpr {
+                roll_deg: 0.0,
+                pitch_deg: 0.0,
+                yaw_deg: 0.0,
+            }
+        ));
     }
 
     #[test]

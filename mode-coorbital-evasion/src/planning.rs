@@ -619,8 +619,8 @@ impl CoorbitalEvasionMode {
                 &self.config.pointing_mode_schedule_field,
             ),
             (
-                "pointing_quaternion_schedule_field",
-                &self.config.pointing_quaternion_schedule_field,
+                "pointing_rpy_schedule_field",
+                &self.config.pointing_rpy_schedule_field,
             ),
             ("nadir_mode_id", &self.config.nadir_mode_id),
             ("sun_yaw_mode_id", &self.config.sun_yaw_mode_id),
@@ -628,9 +628,6 @@ impl CoorbitalEvasionMode {
             if value.trim().is_empty() {
                 anyhow::bail!("mode_config.{name} must be configured");
             }
-        }
-        if self.config.threat_ids.is_empty() {
-            anyhow::bail!("mode_config.threat_ids must contain at least one threat ID");
         }
         if self.config.sim_duration_days <= 0.0 {
             anyhow::bail!("mode_config.sim_duration_days must be greater than zero");
@@ -649,6 +646,10 @@ impl CoorbitalEvasionMode {
         telemetry: &TelemetryFrame,
     ) -> anyhow::Result<PlanningOutcome> {
         self.validate_config()?;
+        let threat_ids = self.active_threat_ids(telemetry)?;
+        if threat_ids.is_empty() {
+            return Ok(PlanningOutcome::NoBoardChange);
+        }
         let input = self.simulation_input(telemetry).await?;
         let sim_start_mjd = input.start_time_mjd;
         let horizon_end_mjd = sim_start_mjd + self.config.sim_duration_days;
@@ -659,7 +660,7 @@ impl CoorbitalEvasionMode {
 
         let accepted_schedule = self.accepted_pointing_schedule(sim_start_mjd, horizon_end_mjd);
         let baseline = self
-            .run_geometry_simulation(&input, &accepted_schedule, telemetry)
+            .run_geometry_simulation(&input, &accepted_schedule, telemetry, &threat_ids)
             .await
             .context("failed to simulate accepted pointing schedule")?;
         let earliest = baseline
@@ -788,13 +789,14 @@ impl CoorbitalEvasionMode {
             &commands,
         );
         let validated_samples = self
-            .run_geometry_simulation(&input, &selected_schedule, telemetry)
+            .run_geometry_simulation(&input, &selected_schedule, telemetry, &threat_ids)
             .await
             .context("failed to validate selected pointing schedule")?;
         let validation = self.validation_report(
             &validated_samples,
             baseline[earliest].time_mjd,
             fov_half_angle_rad,
+            &threat_ids,
         );
 
         Ok(PlanningOutcome::Schedule(CoorbitalEvasionPlan {
