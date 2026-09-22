@@ -23,6 +23,29 @@ impl CoorbitalEvasionMode {
             .unwrap_or(true)
     }
 
+    fn pending_upstream_proposal_count(&self) -> usize {
+        let Some(upstream_mode_id) = self.config.wait_for_proposals_from_mode_id else {
+            return 0;
+        };
+        self.latest_board_snapshot
+            .proposals
+            .iter()
+            .filter(|(id, (from, _, _))| {
+                *from == upstream_mode_id
+                    && self
+                        .latest_board_snapshot
+                        .approved
+                        .get(*id)
+                        .is_none_or(Vec::is_empty)
+                    && self
+                        .latest_board_snapshot
+                        .rejected
+                        .get(*id)
+                        .is_none_or(Vec::is_empty)
+            })
+            .count()
+    }
+
     fn board_command_active(&self, id: &BoardCmdId) -> bool {
         self.latest_board_snapshot
             .rejected
@@ -264,11 +287,25 @@ impl CoorbitalEvasionMode {
         if !self.can_replan_now() {
             return;
         }
-        self.last_replan_start = Some(Instant::now());
-        if let Err(error) = self.maybe_plan(runtime, telemetry).await {
-            warn!("coorbital-evasion planning failed: {error:#}");
+        let pending_upstream_proposals = self.pending_upstream_proposal_count();
+        if pending_upstream_proposals > 0 {
+            return;
+        }
+        match self.maybe_plan(runtime, telemetry).await {
+            Ok(()) => self.last_replan_start = Some(Instant::now()),
+            Err(error) if telemetry_is_not_ready(&error) => {}
+            Err(error) => {
+                warn!("coorbital-evasion planning failed: {error:#}");
+            }
         }
     }
+}
+
+fn telemetry_is_not_ready(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("telemetry is missing ")
+        || message.contains("OTP-2 simulation input is missing derived ")
+        || message.contains("OTP-2 simulation input is missing battery voltage")
 }
 
 #[async_trait]
@@ -312,11 +349,9 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         board: AutonomyModeBoardState,
     ) -> anyhow::Result<()> {
-        let first_snapshot = !self.has_board_snapshot;
         self.has_board_snapshot = true;
         self.latest_board_snapshot = board;
-        if first_snapshot
-            && runtime.is_active()
+        if runtime.is_active()
             && let Some(telemetry) = self.latest_telemetry.clone()
         {
             self.replan_if_ready(runtime, &telemetry).await;
@@ -327,6 +362,7 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use safe::protocol::{AutonomyModeBoardState, BoardCmdId};
     use safe::utils::utc_mjd_to_gps;
     use uuid::Uuid;
@@ -524,5 +560,87 @@ mod tests {
         let (_, propose) = mode.reconciliation_actions(own, &plan(vec![selected.clone()]));
 
         assert_eq!(propose, vec![selected]);
+    }
+
+    #[test]
+    fn waits_only_for_unresolved_proposals_from_configured_mode() {
+        let upstream = AutonomyModeId(Uuid::new_v4());
+        let other = AutonomyModeId(Uuid::new_v4());
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.wait_for_proposals_from_mode_id = Some(upstream);
+        let mut board = AutonomyModeBoardState::default();
+        add_board_command(
+            &mut board,
+            "upstream-pending",
+            upstream,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        add_board_command(
+            &mut board,
+            "other-pending",
+            other,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        mode.latest_board_snapshot = board;
+
+        assert_eq!(mode.pending_upstream_proposal_count(), 1);
+    }
+
+    #[test]
+    fn approved_or_rejected_upstream_proposals_do_not_block_planning() {
+        let upstream = AutonomyModeId(Uuid::new_v4());
+        let approver = AutonomyModeId(Uuid::new_v4());
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.wait_for_proposals_from_mode_id = Some(upstream);
+        let mut board = AutonomyModeBoardState::default();
+        add_board_command(
+            &mut board,
+            "approved",
+            upstream,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        add_board_command(
+            &mut board,
+            "rejected",
+            upstream,
+            Command::PointNadir,
+            60_000.2,
+            false,
+        );
+        board.approved.insert(
+            BoardCmdId("approved".to_string()),
+            vec![(approver, "approved".to_string(), 0)],
+        );
+        board.rejected.insert(
+            BoardCmdId("rejected".to_string()),
+            vec![(approver, "rejected".to_string(), 0)],
+        );
+        mode.latest_board_snapshot = board;
+
+        assert_eq!(mode.pending_upstream_proposal_count(), 0);
+    }
+
+    #[test]
+    fn missing_derived_telemetry_is_transient() {
+        let error = anyhow!(
+            "simulation input adapter failed (code=Some(1)): Error: OTP-2 simulation input is missing derived ECI position"
+        );
+
+        assert!(telemetry_is_not_ready(&error));
+    }
+
+    #[test]
+    fn unrelated_adapter_failure_is_not_transient() {
+        let error = anyhow!(
+            "simulation input adapter failed (code=Some(1)): Error: invalid telemetry packet"
+        );
+
+        assert!(!telemetry_is_not_ready(&error));
     }
 }

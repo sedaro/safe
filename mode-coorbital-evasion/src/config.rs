@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use safe::protocol::AutonomyModeId;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +30,9 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     pub(crate) min_replan_interval_secs: u64,
     #[serde(default = "default_command_lead_secs")]
     pub(crate) command_lead_secs: f64,
+    /// Defer planning until proposals from this mode have reached a terminal board state.
+    #[serde(default)]
+    pub(crate) wait_for_proposals_from_mode_id: Option<AutonomyModeId>,
     #[serde(default = "default_agent_id")]
     pub(crate) agent_id: String,
     #[serde(default = "default_field_of_view_id")]
@@ -92,6 +96,7 @@ impl Default for CoorbitalEvasionModeConfig {
             simulation_timeout_secs: default_simulation_timeout_secs(),
             min_replan_interval_secs: default_min_replan_interval_secs(),
             command_lead_secs: default_command_lead_secs(),
+            wait_for_proposals_from_mode_id: None,
             agent_id: default_agent_id(),
             field_of_view_id: default_field_of_view_id(),
             threat_max_range_km: default_threat_max_range_km(),
@@ -219,6 +224,7 @@ mod tests {
         assert_eq!(config.fov_guard_angle_deg, 1.0);
         assert!(config.threat_max_range_km.is_infinite());
         assert_eq!(config.max_slew_rate_rad_s, 0.010_472);
+        assert!(config.wait_for_proposals_from_mode_id.is_none());
         assert!(config.agent_id.is_empty());
         assert!(config.field_of_view_id.is_empty());
         assert!(config.pointing_mode_schedule_field.is_empty());
