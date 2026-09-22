@@ -35,7 +35,7 @@ const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 160;
 const MAX_FORECAST_RISKS: usize = 2;
 const MAX_FORECAST_RISK_CHARS: usize = 100;
 const MAX_SELECTION_REASON_CHARS: usize = 200;
-const CONTEXT_TOOL_OUTPUT_TOKENS: u32 = 64;
+const CONTEXT_TOOL_OUTPUT_TOKENS: u32 = 128;
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
