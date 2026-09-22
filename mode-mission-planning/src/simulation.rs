@@ -208,17 +208,31 @@ pub(crate) fn extract_planning_samples(
     result: &SimulationResult,
 ) -> Result<Vec<PlanningSample>> {
     let frames = result_frames(result, &config.result_file)?;
+    let state_of_charge_frames =
+        frames_with_field(result, &config.time_field, &config.state_of_charge_field)?;
+    let target_frames = config
+        .targets
+        .iter()
+        .map(|target| {
+            frames_with_field(result, &config.time_field, &target.in_fov_field)
+                .with_context(|| format!("target '{}'", target.name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let station_frames = config
+        .ground_stations
+        .iter()
+        .map(|station| {
+            frames_with_field(result, &config.time_field, &station.elevation_field)
+                .with_context(|| format!("ground station '{}'", station.name))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut samples = Vec::with_capacity(frames.len());
     for (index, frame) in frames.iter().enumerate() {
         let time_mjd =
             numeric(frame, &config.time_field).with_context(|| format!("sample {index} time"))?;
         let state_of_charge = numeric(
-            frame_with_field(
-                result,
-                time_mjd,
-                &config.time_field,
-                &config.state_of_charge_field,
-            )?,
+            frame_at_time(&state_of_charge_frames, time_mjd)
+                .context("state of charge has no simulation frame")?,
             &config.state_of_charge_field,
         )
         .with_context(|| format!("sample {index} state of charge"))?;
@@ -226,25 +240,28 @@ pub(crate) fn extract_planning_samples(
             bail!("sample {index} contains non-finite time or state of charge");
         }
 
-        let target_visible = config.targets.iter().try_fold(false, |visible, target| {
-            boolean(
-                frame_with_field(result, time_mjd, &config.time_field, &target.in_fov_field)?,
-                &target.in_fov_field,
-            )
-            .with_context(|| format!("sample {index} target '{}'", target.name))
-            .map(|value| visible || value)
-        })?;
+        let target_visible = config.targets.iter().zip(&target_frames).try_fold(
+            false,
+            |visible, (target, target_frames)| {
+                boolean(
+                    frame_at_time(target_frames, time_mjd).with_context(|| {
+                        format!("target '{}' has no simulation frame", target.name)
+                    })?,
+                    &target.in_fov_field,
+                )
+                .with_context(|| format!("sample {index} target '{}'", target.name))
+                .map(|value| visible || value)
+            },
+        )?;
         let station_elevations_deg = config
             .ground_stations
             .iter()
-            .map(|station| {
+            .zip(&station_frames)
+            .map(|(station, station_frames)| {
                 numeric(
-                    frame_with_field(
-                        result,
-                        time_mjd,
-                        &config.time_field,
-                        &station.elevation_field,
-                    )?,
+                    frame_at_time(station_frames, time_mjd).with_context(|| {
+                        format!("ground station '{}' has no simulation frame", station.name)
+                    })?,
                     &station.elevation_field,
                 )
                 .with_context(|| format!("sample {index} station '{}'", station.name))
@@ -320,13 +337,12 @@ fn result_frames<'a>(result: &'a SimulationResult, target_file: &str) -> Result<
         .with_context(|| format!("missing simulation result file '{target_file}'"))
 }
 
-fn frame_with_field<'a>(
+fn frames_with_field<'a>(
     result: &'a SimulationResult,
-    time_mjd: f64,
     time_field: &str,
     field: &str,
-) -> Result<&'a EdsFrame> {
-    result
+) -> Result<Vec<(f64, &'a EdsFrame)>> {
+    let mut frames = result
         .frames_by_file
         .values()
         .flat_map(|frames| frames.iter())
@@ -334,11 +350,30 @@ fn frame_with_field<'a>(
         .filter_map(|frame| {
             numeric(frame, time_field)
                 .ok()
-                .map(|frame_time| ((frame_time - time_mjd).abs(), frame))
+                .map(|frame_time| (frame_time, frame))
         })
-        .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, frame)| frame)
-        .with_context(|| format!("missing simulation field '{field}' near time {time_mjd}"))
+        .collect::<Vec<_>>();
+    frames.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if frames.is_empty() {
+        bail!("missing simulation field '{field}'");
+    }
+    Ok(frames)
+}
+
+fn frame_at_time<'a>(frames: &[(f64, &'a EdsFrame)], time_mjd: f64) -> Option<&'a EdsFrame> {
+    let index = frames.partition_point(|(frame_time, _)| *frame_time < time_mjd);
+    match (frames.get(index.wrapping_sub(1)), frames.get(index)) {
+        (Some(left), Some(right)) => {
+            if (time_mjd - left.0).abs() <= (right.0 - time_mjd).abs() {
+                Some(left.1)
+            } else {
+                Some(right.1)
+            }
+        }
+        (Some(left), None) => Some(left.1),
+        (None, Some(right)) => Some(right.1),
+        (None, None) => None,
+    }
 }
 
 fn numeric(frame: &EdsFrame, field: &str) -> Result<f64> {
@@ -378,5 +413,129 @@ fn compare(observed: f64, check: &FieldCheck) -> bool {
         ComparisonOp::Gte => observed >= check.threshold,
         ComparisonOp::Eq => (observed - check.threshold).abs() <= check.tolerance,
         ComparisonOp::Ne => (observed - check.threshold).abs() > check.tolerance,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use safe_sim::{EdsType, EdsValue};
+
+    use super::*;
+    use crate::config::{GroundStationConfig, TargetConfig};
+
+    fn frame(time_mjd: f64, fields: &[(&str, EdsValue)]) -> EdsFrame {
+        let signature = format!(
+            "(time: f64, {})",
+            fields
+                .iter()
+                .map(|(name, value)| match value {
+                    EdsValue::F64(_) => format!("{name}: f64"),
+                    EdsValue::Bool(_) => format!("{name}: bool"),
+                    EdsValue::Sequence(_) => format!("{name}: [bool]"),
+                    _ => panic!("unsupported test field value"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let values = std::iter::once(EdsValue::F64(time_mjd))
+            .chain(fields.iter().map(|(_, value)| value.clone()))
+            .collect();
+        EdsFrame::new(
+            EdsType::parse(&signature).unwrap(),
+            EdsValue::Sequence(values),
+        )
+    }
+
+    #[test]
+    fn extracts_nearest_frames_from_interleaved_result_files() {
+        let result = SimulationResult {
+            success: true,
+            frames_by_file: HashMap::from([
+                (
+                    "spacecraft.power.jsonl".to_string(),
+                    vec![
+                        frame(30.0, &[("soc", EdsValue::F64(0.8))]),
+                        frame(10.0, &[("soc", EdsValue::F64(0.5))]),
+                        frame(20.0, &[("soc", EdsValue::F64(0.7))]),
+                        frame(0.0, &[("soc", EdsValue::F64(0.4))]),
+                    ],
+                ),
+                (
+                    "spacecraft.gnc.jsonl".to_string(),
+                    vec![
+                        frame(19.0, &[("target_visible", EdsValue::Bool(false))]),
+                        frame(
+                            9.0,
+                            &[(
+                                "target_visible",
+                                EdsValue::Sequence(vec![
+                                    EdsValue::Bool(false),
+                                    EdsValue::Bool(true),
+                                ]),
+                            )],
+                        ),
+                    ],
+                ),
+                (
+                    "spacecraft.cdh.jsonl".to_string(),
+                    vec![
+                        frame(22.0, &[("station_elevation", EdsValue::F64(15.0))]),
+                        frame(8.0, &[("station_elevation", EdsValue::F64(5.0))]),
+                    ],
+                ),
+            ]),
+            ..SimulationResult::default()
+        };
+        let config = MissionPlanningConfig {
+            result_file: "spacecraft.power.jsonl".to_string(),
+            time_field: "time".to_string(),
+            state_of_charge_field: "soc".to_string(),
+            targets: vec![TargetConfig {
+                name: "target".to_string(),
+                in_fov_field: "target_visible".to_string(),
+            }],
+            ground_stations: vec![GroundStationConfig {
+                name: "station".to_string(),
+                latitude_deg: 0.0,
+                longitude_deg: 0.0,
+                altitude_m: 0.0,
+                elevation_field: "station_elevation".to_string(),
+            }],
+            ..MissionPlanningConfig::default()
+        };
+
+        let samples = extract_planning_samples(&config, &result).unwrap();
+
+        assert_eq!(samples.len(), 4);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.time_mjd)
+                .collect::<Vec<_>>(),
+            vec![0.0, 10.0, 20.0, 30.0]
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.state_of_charge)
+                .collect::<Vec<_>>(),
+            vec![0.4, 0.5, 0.7, 0.8]
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.target_visible)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.station_elevations_deg.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![5.0], vec![5.0], vec![15.0], vec![15.0]]
+        );
     }
 }
