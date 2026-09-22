@@ -469,7 +469,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             "model": request.model,
             "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
             "tools": request.tools,
-            "tool_choice": "required",
+            "tool_choice": openai_tool_choice(&request.tools),
             // Current OpenAI reasoning models require native tools to run
             // without reasoning in the Chat Completions API.
             "reasoning_effort": "none",
@@ -525,6 +525,18 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         }
         Ok(first)
     }
+}
+
+fn openai_tool_choice(tools: &[Value]) -> Value {
+    let Some(name) = tools
+        .first()
+        .filter(|_| tools.len() == 1)
+        .and_then(|tool| tool.pointer("/function/name"))
+        .and_then(Value::as_str)
+    else {
+        return json!("auto");
+    };
+    json!({"type": "function", "function": {"name": name}})
 }
 
 fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, AdapterError> {
@@ -954,7 +966,9 @@ mod tests {
             "point_nadir"
         );
         assert!(request.contains("\"tools\""));
-        assert!(request.contains("\"tool_choice\":\"required\""));
+        assert!(request.contains(
+            "\"tool_choice\":{\"function\":{\"name\":\"select_recovery_action\"},\"type\":\"function\"}"
+        ));
         assert!(request.contains("\"reasoning_effort\":\"none\""));
         assert!(request.contains("\"max_completion_tokens\":64"));
     }
@@ -1006,6 +1020,17 @@ mod tests {
 
         assert!(error.to_string().contains("/v1/chat/completions"));
         let _ = server.await.expect("test server should finish");
+    }
+
+    #[test]
+    fn openai_tool_choice_uses_auto_for_multiple_tools() {
+        assert_eq!(
+            openai_tool_choice(&[
+                json!({"type":"function","function":{"name":"get_latest_telemetry"}}),
+                json!({"type":"function","function":{"name":"get_command_board_state"}}),
+            ]),
+            json!("auto")
+        );
     }
 
     #[tokio::test]
