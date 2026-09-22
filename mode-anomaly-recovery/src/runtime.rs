@@ -575,7 +575,12 @@ impl AnomalyRecoveryMode {
     fn candidate_signature(candidates: &[AnomalyCandidate]) -> String {
         let mut ids = candidates
             .iter()
-            .map(|candidate| format!("{}:{}", candidate.source, candidate.anomaly_id))
+            .map(|candidate| {
+                format!(
+                    "{}:{}:{}:{}",
+                    candidate.source, candidate.anomaly_id, candidate.ts_mono, candidate.observed
+                )
+            })
             .collect::<Vec<_>>();
         ids.sort();
         ids.join("|")
@@ -626,6 +631,11 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
         if self.current_candidates.is_empty() {
+            self.planning_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if let Some(cancel) = self.planning_cancel.take() {
+                cancel.cancel();
+            }
             return Ok(());
         }
 
@@ -634,23 +644,19 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
 
-        let actionable = self
-            .current_candidates
-            .iter()
-            .filter(|candidate| !candidate.eligible_actions.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-
         if self.config.decision_trace {
             self.log_decision_trace(
                 "candidates",
                 format!(
                     "{} detected candidate(s); {} have configured actions",
                     self.current_candidates.len(),
-                    actionable.len(),
+                    self.current_candidates
+                        .iter()
+                        .filter(|candidate| !candidate.eligible_actions.is_empty())
+                        .count(),
                 ),
             );
-            for candidate in &actionable {
+            for candidate in &self.current_candidates {
                 let actions = candidate
                     .eligible_actions
                     .iter()
@@ -670,37 +676,6 @@ impl AnomalyRecoveryMode {
                 );
             }
         }
-        if actionable.is_empty() {
-            warn!(
-                candidate_count = self.current_candidates.len(),
-                "nominal-profile anomalies have no eligible action; no command will be emitted"
-            );
-            self.last_plan_signature = Some(signature);
-            return Ok(());
-        }
-
-        if actionable.len() == 1 && actionable[0].eligible_actions.len() == 1 {
-            let candidate = &actionable[0];
-            let action = candidate.eligible_actions[0];
-            self.log_decision_trace(
-                "decision",
-                format!(
-                    "LLM skipped | {} has exactly one configured action: {}",
-                    candidate.anomaly_id,
-                    action.as_str(),
-                ),
-            );
-            self.emit_action(
-                runtime,
-                candidate,
-                action,
-                "single configured eligible action",
-            )
-            .await?;
-            self.last_plan_signature = Some(signature);
-            return Ok(());
-        }
-
         if let Some(cancel) = self.planning_cancel.take() {
             cancel.cancel();
         }
@@ -715,14 +690,19 @@ impl AnomalyRecoveryMode {
             .ok_or_else(|| anyhow!("missing telemetry snapshot"))?;
         let request = crate::planner::PlanningRequest {
             config: self.config.clone(),
-            candidates: actionable,
+            candidates: self.current_candidates.clone(),
             telemetry,
+            live_context: self.live_context.clone(),
             mode_id: runtime.mode_id(),
             generation,
             generations: self.planning_generation.clone(),
             active: self.active.clone(),
             cancel: cancel.clone(),
             output: runtime.output_tx(),
+            adapter: self
+                .adapter
+                .clone()
+                .ok_or_else(|| anyhow!("anomaly recovery LLM adapter has not been configured"))?,
         };
         tokio::spawn(async move {
             if let Err(error) = crate::planner::run(request).await {
@@ -817,8 +797,9 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             "anomaly recovery static nominal profile config loaded"
         );
         self.config = config;
-        self.adapter = Some(adapter);
+        self.adapter = Some(adapter.into());
         self.latest_telemetry = None;
+        self.live_context.clear();
         self.current_candidates.clear();
         self.rule_states.clear();
         self.has_board_snapshot = false;
@@ -869,6 +850,13 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             payload: telemetry.payload,
         };
         self.latest_telemetry = Some(sample.clone());
+        self.live_context.update_telemetry(sample.clone());
+        // A new relevant frame supersedes a worker's frozen observations before it can propose.
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
         self.evaluate_static_profile(&sample);
 
         if !runtime.is_active() {
@@ -890,11 +878,17 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         runtime: &mut ModeRuntime,
         board: AutonomyModeBoardState,
     ) -> Result<()> {
-        let first_snapshot = !self.has_board_snapshot;
         self.has_board_snapshot = true;
+        self.live_context.update_board(board.clone());
         self.latest_board_snapshot = board;
-        if first_snapshot
-            && runtime.is_active()
+        // Board intent can explain, conflict with, or duplicate recovery. It always invalidates a pending decision.
+        self.planning_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(cancel) = self.planning_cancel.take() {
+            cancel.cancel();
+        }
+        self.last_plan_signature = None;
+        if runtime.is_active()
             && let Err(err) = self.plan_current_candidates(runtime).await
         {
             self.log_planning_error(
@@ -1155,7 +1149,7 @@ mod tests {
     async fn generic_adapter_receives_constrained_completion_request() {
         let mut mode = configured_mode();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        mode.adapter = Some(Box::new(RecordingAdapter {
+        mode.adapter = Some(Arc::new(RecordingAdapter {
             requests: Arc::clone(&requests),
             completion: Completion {
                 text: "{}".to_string(),
@@ -1178,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_completion_is_rejected_before_decision_parsing() {
         let mut mode = configured_mode();
-        mode.adapter = Some(Box::new(RecordingAdapter {
+        mode.adapter = Some(Arc::new(RecordingAdapter {
             requests: Arc::new(Mutex::new(Vec::new())),
             completion: Completion {
                 text: "{\"action_id\":\"point_nadir\"}".to_string(),

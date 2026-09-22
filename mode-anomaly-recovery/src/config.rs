@@ -236,6 +236,10 @@ pub(crate) enum MetricAggregation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SimulationMetric {
     pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) quantity: Option<String>,
+    #[serde(default)]
+    pub(crate) units: Option<String>,
     pub(crate) target_file: String,
     pub(crate) field: String,
     pub(crate) aggregation: MetricAggregation,
@@ -248,6 +252,12 @@ pub(crate) struct SimulationScenario {
     pub(crate) description: String,
     pub(crate) applicable_rule_ids: Vec<String>,
     pub(crate) allowed_actions: Vec<AllowedAction>,
+    #[serde(default)]
+    pub(crate) baseline_scenario_id: Option<String>,
+    #[serde(default)]
+    pub(crate) modeled_action: Option<AllowedAction>,
+    #[serde(default)]
+    pub(crate) thermal: bool,
     pub(crate) duration_days: f64,
     #[serde(default)]
     pub(crate) patches: Vec<SimulationPatchBinding>,
@@ -267,7 +277,7 @@ pub(crate) struct SimulationConfig {
     pub(crate) scenarios: Vec<SimulationScenario>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LlmConfig {
     pub(crate) adapter: AdapterSelection,
@@ -301,39 +311,6 @@ impl LlmConfig {
     }
 }
 
-impl AnomalyRecoveryModeConfig {
-    pub(crate) fn ollama_chat_connection(&self) -> Result<(String, u16, String)> {
-        if self.llm.adapter.kind != "ollama" {
-            bail!("simulation tool calls require the ollama adapter");
-        }
-        let endpoint = self
-            .llm
-            .adapter
-            .config
-            .get("endpoint")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("ollama adapter requires a string endpoint"))?;
-        let authority = endpoint
-            .strip_prefix("http://")
-            .ok_or_else(|| anyhow!("simulation tool calls require an http Ollama endpoint"))?
-            .split_once('/')
-            .map_or_else(|| endpoint.trim_start_matches("http://"), |(host, _)| host);
-        let (host, port) = authority
-            .rsplit_once(':')
-            .map(|(host, port)| {
-                port.parse::<u16>()
-                    .map(|port| (host.to_string(), port))
-                    .map_err(|_| anyhow!("Ollama endpoint has an invalid port"))
-            })
-            .transpose()?
-            .unwrap_or_else(|| (authority.to_string(), 80));
-        if host.is_empty() {
-            bail!("Ollama endpoint must include a host");
-        }
-        Ok((host, port, "/api/chat".to_string()))
-    }
-}
-
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -349,7 +326,7 @@ impl Default for LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AnomalyRecoveryModeConfig {
     pub(crate) llm: LlmConfig,
@@ -381,9 +358,6 @@ impl AnomalyRecoveryModeConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.nominal_profiles.is_empty() {
             bail!("anomaly recovery requires at least one nominal profile");
-        }
-        if self.action_catalog.is_empty() {
-            bail!("anomaly recovery requires an action_catalog");
         }
         self.llm.validate()?;
         if self.max_prompt_chars == 0 || self.max_response_chars == 0 {
@@ -548,6 +522,37 @@ impl AnomalyRecoveryModeConfig {
                     {
                         bail!("simulation scenario '{}': invalid metric", scenario.id);
                     }
+                    if metric
+                        .units
+                        .as_ref()
+                        .is_some_and(|units| units.trim().is_empty())
+                        || metric
+                            .quantity
+                            .as_ref()
+                            .is_some_and(|quantity| quantity.trim().is_empty())
+                    {
+                        bail!(
+                            "simulation scenario '{}': metric quantity and units must not be empty",
+                            scenario.id
+                        );
+                    }
+                }
+                if scenario.thermal
+                    && !scenario
+                        .metrics
+                        .iter()
+                        .any(|metric| metric.quantity.as_deref() == Some("temperature"))
+                {
+                    bail!(
+                        "thermal simulation scenario '{}' needs a temperature metric",
+                        scenario.id
+                    );
+                }
+                if scenario.modeled_action.is_some() && scenario.baseline_scenario_id.is_none() {
+                    bail!(
+                        "recovery scenario '{}' needs baseline_scenario_id",
+                        scenario.id
+                    );
                 }
             }
         }
@@ -736,10 +741,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_profiles_without_action_catalog_entries() {
+    fn rejects_rule_actions_missing_from_catalog() {
         let mut config = valid_config();
         config.action_catalog.clear();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_assessment_only_profile_without_actions() {
+        let mut config = valid_config();
+        config.action_catalog.clear();
+        config.nominal_profiles[0].rules[0].eligible_actions.clear();
+        config
+            .validate()
+            .expect("assessment-only configuration should validate");
     }
 
     #[test]

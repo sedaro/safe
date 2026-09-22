@@ -1,9 +1,35 @@
-# Anomaly Recovery Static Nominal Profiles
+# Anomaly Recovery
+
+## Thermal Assessment User Story
+
+The intended thermal-recovery workflow uses an LLM to assess telemetry,
+command-board context, and simulation evidence together to judge whether a
+thermal anomaly is occurring and whether a recovery proposal is warranted.
+See [the thermal anomaly recovery user story](./thermal-anomaly-recovery-story.md)
+for the target workflow, acceptance criteria, and gaps in the current branch.
+The [implementation plan](./thermal-anomaly-recovery-plan.md) breaks this work
+into ordered milestones with file-level changes and verification criteria.
+
+## Current Implementation
 
 `mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
-configured static nominal profiles locally and emits profile-backed commands.
-It contacts the configured LLM adapter only when local evaluation leaves more
-than one actionable choice.
+configured static nominal profiles locally as investigation triggers, then uses
+native LLM tools to collect telemetry and command-board evidence before it can
+complete a thermal assessment. Completion records `thermal_anomaly`,
+`no_thermal_anomaly`, or `inconclusive`; a recovery action is optional and may
+only follow an anomaly assessment requesting recovery evaluation.
+
+Evidence is retained in a bounded, host-owned ledger across tool calls. Telemetry
+history is source-scoped and ignores duplicate or out-of-order timestamps for
+trend/persistence use. Board proposals and approvals are command intent, not
+execution acknowledgement. A telemetry or board update cancels pending work
+before it can submit a stale proposal.
+
+The checked-in power-only scenario remains non-thermal. It is not thermal evidence and
+cannot establish thermal improvement. Live thermal integration is blocked until
+deployment supplies verified EDS thermal output fields, initial-state bindings,
+command schedule bindings, and time units; deterministic assessment behavior is
+implemented independently of that external mapping.
 
 Profiles are selected by an exact `TelemetryFrame.source` match. Rule paths are
 dot-separated and relative to `TelemetryFrame.payload`; numeric path segments
@@ -82,8 +108,9 @@ The action catalog may contain only these recommendable actions:
 
 `capture_image` and `noop` are representable enum values but are rejected for
 recommendations. A rule with no `eligible_actions` is observable and can appear
-in diagnostics, but cannot emit a command. Every configuration requires a
-non-empty action catalog.
+in diagnostics, but cannot emit a command. An empty action catalog is valid for
+assessment-only operation; rules that name an action still require it to be
+defined.
 
 ## LLM Adapters
 
@@ -259,6 +286,11 @@ completions with strict JSON-schema response formatting.
   configured bounded numeric parameters.
 - `select_recovery_action`, which may choose only a frozen candidate and one of
   its eligible configured actions. Evidence is derived from that candidate.
+- `get_latest_telemetry`, which returns the latest telemetry snapshot SAFE has
+  broadcast to the mode.
+- `get_command_board_state`, which returns the latest command-board snapshot
+  SAFE has broadcast to the mode, including proposals, approvals, rejections,
+  and source-of-truth IDs.
 - `options.temperature` and `options.num_predict`.
 
 The configured Ollama model must support native tool calls. Unsupported tools,
@@ -280,6 +312,12 @@ eligible action, and exact evidence path. HTTP errors, timeouts, malformed
 responses, token-limit truncation, empty responses, oversized responses, and
 validation failures are retried up to `max_decision_attempts`. Parse and
 validation failures include bounded repair feedback.
+
+The telemetry and board tools are read-only. Their responses are bounded to
+2,000 characters and report `unavailable` until SAFE has broadcast the
+corresponding snapshot. They read the newest snapshot available at invocation
+time, but do not change the frozen candidate/action allow-list or bypass SAFE
+board and gatekeeper validation.
 
 ## SAFE Integration
 
