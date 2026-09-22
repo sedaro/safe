@@ -40,7 +40,7 @@ async fn live_openai_tool_calls_run_assessment_and_post_selection_juno_viability
         .expect("anomaly recovery mode config should be present");
     mode_config["decision_trace"] = serde_json::json!(true);
     mode_config["max_prompt_chars"] = serde_json::json!(12000);
-    mode_config["llm"]["max_output_tokens"] = serde_json::json!(1024);
+    mode_config["llm"]["max_output_tokens"] = serde_json::json!(2048);
     mode_config["goal"] = serde_json::json!(
         "When the configured thermal anomaly is confirmed, request recovery evaluation for one eligible action so host code can validate command viability."
     );

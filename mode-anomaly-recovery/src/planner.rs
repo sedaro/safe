@@ -14,7 +14,7 @@ use safe_llm_adapter::{
 use safe_sim::{CancellationToken, EdsPatch, SedaroSimulator, SimulationResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{
     AllowedAction, AnomalyRecoveryModeConfig, MetricAggregation, SimulationScenario,
@@ -30,6 +30,11 @@ use crate::types::{
 
 const MAX_TURNS: u8 = 6;
 const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
+const MAX_ASSESSMENT_RATIONALE_CHARS: usize = 800;
+const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 400;
+const MAX_FORECAST_RISKS: usize = 4;
+const MAX_FORECAST_RISK_CHARS: usize = 200;
+const MAX_SELECTION_REASON_CHARS: usize = 400;
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -165,13 +170,31 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             &ledger,
             assessment.as_ref(),
         );
+        let available_tools = tool_names(&phase_tools);
         let response = tokio::select! {
             _ = request.cancel.cancelled() => return Ok(()),
             result = chat(&request, messages.clone(), phase_tools) => result?,
         };
         if response.finish_reason == CompletionFinishReason::Length {
+            let detail = truncation_detail(
+                turn,
+                &available_tools,
+                request.adapter.kind(),
+                &request.config.llm.model,
+                request.config.llm.max_output_tokens,
+            );
+            let available_tools = available_tools.join(",");
+            warn!(
+                turn,
+                max_turns = MAX_TURNS,
+                available_tools,
+                adapter = request.adapter.kind(),
+                model = %request.config.llm.model,
+                max_output_tokens = request.config.llm.max_output_tokens,
+                "anomaly recovery tool-call response stopped at token limit"
+            );
             bail!(
-                "tool-call response stopped at token limit; use a tool-capable model with sufficient context"
+                "tool-call response stopped at token limit; {detail}; use a tool-capable model with sufficient context"
             );
         }
         let response_chars = response.message.content.chars().count()
@@ -506,11 +529,22 @@ fn validate_assessment(
     ledger: &EvidenceLedger,
     args: CompleteAssessmentArguments,
 ) -> Result<ThermalAssessment> {
-    if args.rationale.trim().is_empty() || args.rationale.chars().count() > 800 {
+    if args.rationale.trim().is_empty()
+        || args.rationale.chars().count() > MAX_ASSESSMENT_RATIONALE_CHARS
+    {
         bail!("assessment rationale is invalid");
     }
-    if args.uncertainty.trim().is_empty() || args.uncertainty.chars().count() > 400 {
+    if args.uncertainty.trim().is_empty()
+        || args.uncertainty.chars().count() > MAX_ASSESSMENT_UNCERTAINTY_CHARS
+    {
         bail!("assessment uncertainty is invalid");
+    }
+    if args.forecast_risks.len() > MAX_FORECAST_RISKS
+        || args.forecast_risks.iter().any(|risk| {
+            risk.trim().is_empty() || risk.chars().count() > MAX_FORECAST_RISK_CHARS
+        })
+    {
+        bail!("assessment forecast risks are invalid");
     }
     if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
         bail!("assessment requires telemetry and command-board tool attempts");
@@ -643,8 +677,29 @@ fn phase_tools(
     tools
 }
 
+fn tool_names(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn truncation_detail(
+    turn: u8,
+    available_tools: &[String],
+    adapter: &str,
+    model: &str,
+    max_output_tokens: u32,
+) -> String {
+    format!(
+        "turn={turn}/{MAX_TURNS} available_tools=[{}] adapter={adapter} model={model} max_output_tokens={max_output_tokens}",
+        available_tools.join(",")
+    )
+}
+
 fn assessment_tool(candidates: &[AnomalyCandidate], ledger: &EvidenceLedger) -> Value {
-    json!({"type":"function","function":{"name":"complete_thermal_assessment","description":"Complete the evidence-backed thermal assessment; this may finish without a recovery command","parameters":{"type":"object","additionalProperties":false,"required":["outcome","disposition","candidate_ids","evidence_ids","rationale","uncertainty"],"properties":{"outcome":{"type":"string","enum":["thermal_anomaly","no_thermal_anomaly","inconclusive"]},"disposition":{"type":"string","enum":["monitor","operator_review","evaluate_recovery"]},"candidate_ids":{"type":"array","items":{"type":"string","enum":candidates.iter().map(|c| c.anomaly_id.as_str()).collect::<Vec<_>>() }},"evidence_ids":{"type":"array","items":{"type":"string","enum":ledger.ids()}},"rationale":{"type":"string"},"uncertainty":{"type":"string"},"forecast_risks":{"type":"array","items":{"type":"string"}}}}}})
+    json!({"type":"function","function":{"name":"complete_thermal_assessment","description":"Complete the evidence-backed thermal assessment; this may finish without a recovery command","parameters":{"type":"object","additionalProperties":false,"required":["outcome","disposition","candidate_ids","evidence_ids","rationale","uncertainty"],"properties":{"outcome":{"type":"string","enum":["thermal_anomaly","no_thermal_anomaly","inconclusive"]},"disposition":{"type":"string","enum":["monitor","operator_review","evaluate_recovery"]},"candidate_ids":{"type":"array","items":{"type":"string","enum":candidates.iter().map(|c| c.anomaly_id.as_str()).collect::<Vec<_>>() }},"evidence_ids":{"type":"array","items":{"type":"string","enum":ledger.ids()}},"rationale":{"type":"string","maxLength":MAX_ASSESSMENT_RATIONALE_CHARS},"uncertainty":{"type":"string","maxLength":MAX_ASSESSMENT_UNCERTAINTY_CHARS},"forecast_risks":{"type":"array","maxItems":MAX_FORECAST_RISKS,"items":{"type":"string","maxLength":MAX_FORECAST_RISK_CHARS}}}}}})
 }
 
 fn latest_telemetry_tool() -> Value {
@@ -683,7 +738,7 @@ fn select_tool(candidates: &[AnomalyCandidate], assessment_id: Option<&str>) -> 
         || json!({"type": "string"}),
         |id| json!({"type": "string", "enum": [id]}),
     );
-    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"}}}}})
+    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection","maxLength":MAX_SELECTION_REASON_CHARS}}}}})
 }
 
 async fn chat(
@@ -937,7 +992,9 @@ fn evaluate<'a>(
     candidates: &'a [AnomalyCandidate],
     args: &SelectArguments,
 ) -> Result<(&'a AnomalyCandidate, AllowedAction)> {
-    if args.reason.trim().is_empty() || args.reason.chars().count() > 400 {
+    if args.reason.trim().is_empty()
+        || args.reason.chars().count() > MAX_SELECTION_REASON_CHARS
+    {
         bail!("final reason is invalid");
     }
     let candidate = candidates
@@ -1113,6 +1170,32 @@ mod tests {
                 .get("evidence_paths")
                 .is_none()
         );
+        assert_eq!(
+            selection["function"]["parameters"]["properties"]["reason"]["maxLength"],
+            MAX_SELECTION_REASON_CHARS
+        );
+
+        let mut ledger = EvidenceLedger::default();
+        ledger.record("telemetry", 1, "ok", json!({}));
+        ledger.record("board", 1, "ok", json!({}));
+        let assessment = assessment_tool(&[candidate()], &ledger);
+        let properties = &assessment["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["rationale"]["maxLength"],
+            MAX_ASSESSMENT_RATIONALE_CHARS
+        );
+        assert_eq!(
+            properties["uncertainty"]["maxLength"],
+            MAX_ASSESSMENT_UNCERTAINTY_CHARS
+        );
+        assert_eq!(
+            properties["forecast_risks"]["maxItems"],
+            MAX_FORECAST_RISKS
+        );
+        assert_eq!(
+            properties["forecast_risks"]["items"]["maxLength"],
+            MAX_FORECAST_RISK_CHARS
+        );
 
         let telemetry = latest_telemetry_tool();
         assert_eq!(telemetry["function"]["name"], "get_latest_telemetry");
@@ -1174,6 +1257,10 @@ mod tests {
         ledger.record("telemetry", 1, "ok", json!({}));
         ledger.record("board", 1, "ok", json!({}));
         let before_selection = phase_tools(&[candidate()], &[&scenario], 0, &ledger, None);
+        assert_eq!(
+            tool_names(&before_selection),
+            vec!["complete_thermal_assessment"]
+        );
         assert!(
             !before_selection
                 .iter()
@@ -1189,6 +1276,23 @@ mod tests {
             after_assessment
                 .iter()
                 .any(|tool| tool["function"]["name"] == "complete_thermal_assessment")
+        );
+    }
+
+    #[test]
+    fn truncation_diagnostics_identify_turn_and_available_tools() {
+        assert_eq!(
+            truncation_detail(
+                2,
+                &[
+                    "get_latest_telemetry".to_string(),
+                    "get_command_board_state".to_string(),
+                ],
+                "ollama",
+                "mistral:7b",
+                1024,
+            ),
+            "turn=2/6 available_tools=[get_latest_telemetry,get_command_board_state] adapter=ollama model=mistral:7b max_output_tokens=1024"
         );
     }
 
