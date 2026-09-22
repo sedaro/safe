@@ -428,7 +428,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         let body_text = post_json_with_auth(
             &self.client,
             self.endpoint.clone(),
-            body,
+            body.clone(),
             request.timeout,
             self.api_key.as_deref(),
         )
@@ -481,49 +481,77 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         let body_text = post_json_with_auth(
             &self.client,
             self.endpoint.clone(),
-            body,
+            body.clone(),
             request.timeout,
             self.api_key.as_deref(),
         )
         .await?;
-        let response: OpenAiCompatibleResponse =
-            serde_json::from_str(&body_text).map_err(|error| {
-                AdapterError::Response(format!(
-                    "invalid OpenAI-compatible JSON payload: {error}; body={}",
-                    clip_chars(&body_text, 600)
-                ))
-            })?;
-        let choice = response.choices.into_iter().next().ok_or_else(|| {
-            AdapterError::Response(
-                "OpenAI-compatible response did not include a choice".to_string(),
+        let first = parse_tool_chat_response(&body_text)?;
+        if first.finish_reason == CompletionFinishReason::Length {
+            // Some OpenAI-compatible local servers ignore max_completion_tokens
+            // and only honor the legacy max_tokens field.
+            let mut legacy_body = body;
+            if let Some(object) = legacy_body.as_object_mut() {
+                object.remove("max_completion_tokens");
+                object.insert("max_tokens".to_string(), json!(request.max_output_tokens));
+            }
+            if let Ok(legacy_text) = post_json_with_auth(
+                &self.client,
+                self.endpoint.clone(),
+                legacy_body,
+                request.timeout,
+                self.api_key.as_deref(),
             )
-        })?;
-        let finish_reason = openai_finish_reason(choice.finish_reason.as_deref());
-        if finish_reason == CompletionFinishReason::Length {
-            return Ok(ToolChatCompletion {
-                message: ToolChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Vec::new(),
-                },
-                finish_reason,
-            });
+            .await
+            {
+                if let Ok(legacy_result) = parse_tool_chat_response(&legacy_text) {
+                    if legacy_result.finish_reason != CompletionFinishReason::Length
+                        || !legacy_result.message.tool_calls.is_empty()
+                    {
+                        return Ok(legacy_result);
+                    }
+                }
+            }
         }
-        let message = choice_message(&choice)?;
-        let tool_calls = message
-            .tool_calls
-            .into_iter()
-            .map(parse_openai_tool_call)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ToolChatCompletion {
+        Ok(first)
+    }
+}
+
+fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, AdapterError> {
+    let response: OpenAiCompatibleResponse = serde_json::from_str(body_text).map_err(|error| {
+        AdapterError::Response(format!(
+            "invalid OpenAI-compatible JSON payload: {error}; body={}",
+            clip_chars(body_text, 600)
+        ))
+    })?;
+    let choice = response.choices.into_iter().next().ok_or_else(|| {
+        AdapterError::Response("OpenAI-compatible response did not include a choice".to_string())
+    })?;
+    let finish_reason = openai_finish_reason(choice.finish_reason.as_deref());
+    if finish_reason == CompletionFinishReason::Length {
+        return Ok(ToolChatCompletion {
             message: ToolChatMessage {
-                role: message.role.unwrap_or_else(|| "assistant".to_string()),
-                content: message.content.unwrap_or_default(),
-                tool_calls,
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Vec::new(),
             },
             finish_reason,
-        })
+        });
     }
+    let message = choice_message(&choice)?;
+    let tool_calls = message
+        .tool_calls
+        .into_iter()
+        .map(parse_openai_tool_call)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ToolChatCompletion {
+        message: ToolChatMessage {
+            role: message.role.unwrap_or_else(|| "assistant".to_string()),
+            content: message.content.unwrap_or_default(),
+            tool_calls,
+        },
+        finish_reason,
+    })
 }
 
 #[derive(Debug, Deserialize, Serialize)]
