@@ -534,6 +534,11 @@ fn parse_tool_chat_response(body_text: &str) -> Result<ToolChatCompletion, Adapt
             clip_chars(body_text, 600)
         ))
     })?;
+    if response.object.as_deref() == Some("text_completion") {
+        return Err(AdapterError::Response(
+            "OpenAI-compatible tool calls require a Chat Completions endpoint, but the server returned object=text_completion; configure the adapter endpoint for /v1/chat/completions rather than /v1/completions".to_string(),
+        ));
+    }
     let choice = response.choices.into_iter().next().ok_or_else(|| {
         AdapterError::Response("OpenAI-compatible response did not include a choice".to_string())
     })?;
@@ -604,6 +609,8 @@ fn openai_tool_attempt_diagnostic(
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OpenAiCompatibleResponse {
+    #[serde(default)]
+    object: Option<String>,
     choices: Vec<OpenAiCompatibleChoice>,
 }
 
@@ -971,6 +978,33 @@ mod tests {
             .await
             .expect_err("missing choice message must fail closed");
         assert!(error.to_string().contains("neither message nor delta"));
+        let _ = server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_rejects_text_completion_for_tool_calls() {
+        let response = json!({
+            "object": "text_completion",
+            "choices": [{
+                "text": "unrelated continuation",
+                "finish_reason": "length"
+            }]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .expect("OpenAI-compatible adapter should build");
+
+        let error = adapter
+            .tool_chat(tool_chat_request())
+            .await
+            .expect_err("text completions cannot carry native tool calls");
+
+        assert!(error.to_string().contains("/v1/chat/completions"));
         let _ = server.await.expect("test server should finish");
     }
 
