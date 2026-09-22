@@ -14,7 +14,7 @@ rand_distr = "0.5.1"
 tokio = { version = "1.52.1", features = ["process", "rt", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
+tempfile = "3.27.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
 tokio = { version = "1.52.1", features = ["macros"] }
