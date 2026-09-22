@@ -98,6 +98,7 @@ parse or validation error prevents the mode from starting.
 | `on_deactivate` | SAFE switches away from the mode or receives a deactivation request. |
 | `on_telemetry` | Every telemetry frame is forwarded to every connected mode, including inactive modes. Check `runtime.is_active()` before proposing commands. |
 | `on_board_snapshot` | SAFE sends the current board to all connected modes. |
+| `on_tick` | The runtime provides a periodic opportunity to finish background work. |
 | `on_shutdown` | SAFE removes a mode, stops it, or shuts down the daemon. |
 
 Returning an error from a callback sends a fault when possible and exits the
