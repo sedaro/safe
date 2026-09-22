@@ -147,14 +147,8 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             .saturating_mul(MAX_TURNS as u64),
     );
     let scenarios = applicable_scenarios(&request.config, &request.candidates);
-    let mut ledger = EvidenceLedger::default();
-    let mut messages = vec![ToolChatMessage {
-        // Mistral receives concrete tool tasks reliably as a user turn. Tool
-        // definitions remain native Ollama fields rather than prompt syntax.
-        role: "user".into(),
-        content: prompt(&request, &scenarios)?,
-        tool_calls: Vec::new(),
-    }];
+    let mut ledger = initial_evidence(&request);
+    let mut messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
     let mut runs = 0u8;
     let mut assessment: Option<ThermalAssessment> = None;
     for turn in 1..=MAX_TURNS {
@@ -488,6 +482,32 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
     bail!("planning turn budget exhausted")
 }
 
+fn initial_evidence(request: &PlanningRequest) -> EvidenceLedger {
+    let snapshot = request.live_context.snapshot();
+    let mut ledger = EvidenceLedger::default();
+    ledger.record(
+        "telemetry",
+        snapshot.telemetry_version,
+        if snapshot.telemetry.is_some() {
+            "ok"
+        } else {
+            "unavailable"
+        },
+        telemetry_summary(&snapshot),
+    );
+    ledger.record(
+        "board",
+        snapshot.board_version,
+        if snapshot.board.is_some() {
+            "ok"
+        } else {
+            "unavailable"
+        },
+        board_summary(&snapshot),
+    );
+    ledger
+}
+
 fn cancelled(request: &PlanningRequest) -> bool {
     request.cancel.is_cancelled()
         || !request.active.load(Ordering::Acquire)
@@ -516,14 +536,6 @@ fn applicable_scenarios<'a>(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn prompt(request: &PlanningRequest, _scenarios: &[&SimulationScenario]) -> Result<String> {
-    let text = format!(
-        "Inspect telemetry and command-board context using the available tools. Use only supplied values and never invent IDs. Candidates: {}",
-        serde_json::to_string(&compact_candidates(request))?
-    );
-    bounded_prompt(request, text)
 }
 
 fn validate_assessment(

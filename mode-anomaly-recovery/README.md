@@ -13,9 +13,9 @@ into ordered milestones with file-level changes and verification criteria.
 ## Current Implementation
 
 `mode-anomaly-recovery` is an out-of-process SAFE autonomy mode. It evaluates
-configured static nominal profiles locally as investigation triggers, then uses
-native LLM tools to collect telemetry and command-board evidence before it can
-complete a thermal assessment. Completion records `thermal_anomaly`,
+configured static nominal profiles locally as investigation triggers, then
+records the latest host-owned telemetry and command-board evidence before it
+asks the LLM to complete a thermal assessment. Completion records `thermal_anomaly`,
 `no_thermal_anomaly`, or `inconclusive`; a recovery action is optional and may
 only follow an anomaly assessment requesting recovery evaluation.
 
@@ -326,11 +326,10 @@ completions with strict JSON-schema response formatting.
   configured bounded numeric parameters.
 - `select_recovery_action`, which may choose only a frozen candidate and one of
   its eligible configured actions. Evidence is derived from that candidate.
-- `get_latest_telemetry`, which returns the latest telemetry snapshot SAFE has
-  broadcast to the mode.
-- `get_command_board_state`, which returns the latest command-board snapshot
-  SAFE has broadcast to the mode, including proposals, approvals, rejections,
-  and source-of-truth IDs.
+- Telemetry and command-board snapshots are host-collected before the first
+  model request and supplied as compact evidence summaries. They are not
+  model-invoked tools, avoiding a native-tool round trip for data the mode
+  already owns.
 - `options.temperature` and `options.num_predict`.
 
 The configured Ollama model must support native tool calls. Unsupported tools,
