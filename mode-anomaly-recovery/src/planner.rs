@@ -202,6 +202,54 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             tool_call_count = calls.len(),
             "anomaly recovery received native tool-call response"
         );
+        if calls.len() > 1
+            && calls.iter().all(|call| {
+                matches!(
+                    call.name.as_str(),
+                    "get_latest_telemetry" | "get_command_board_state"
+                )
+            })
+        {
+            for call in &calls {
+                match call.name.as_str() {
+                    "get_latest_telemetry" => {
+                        parse_read_context_arguments(call, "get_latest_telemetry")?;
+                        let snapshot = request.live_context.snapshot();
+                        let _result = latest_telemetry_result(&request.live_context)?;
+                        let status = if snapshot.telemetry.is_some() {
+                            "ok"
+                        } else {
+                            "unavailable"
+                        };
+                        ledger.record(
+                            "telemetry",
+                            snapshot.telemetry_version,
+                            status,
+                            telemetry_summary(&snapshot),
+                        );
+                    }
+                    "get_command_board_state" => {
+                        parse_read_context_arguments(call, "get_command_board_state")?;
+                        let snapshot = request.live_context.snapshot();
+                        let result = command_board_result(&request.live_context)?;
+                        let status = if snapshot.board.is_some() {
+                            "ok"
+                        } else {
+                            "unavailable"
+                        };
+                        ledger.record(
+                            "board",
+                            snapshot.board_version,
+                            status,
+                            serde_json::from_str(&result)?,
+                        );
+                    }
+                    _ => unreachable!("parallel context-call allow-list checked above"),
+                }
+            }
+            messages = fresh_selection_messages(context_prompt(&request, &scenarios, &ledger)?);
+            continue;
+        }
         if calls.len() != 1 {
             // Do not reinterpret content as a tool request. Give tool-capable
             // models one bounded repair opportunity per remaining turn.
@@ -315,12 +363,38 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 let assessment = assessment.as_ref().ok_or_else(|| {
                     anyhow!("recovery selection requires a completed anomaly assessment")
                 })?;
-                let args: SelectArguments = serde_json::from_value(call.arguments.clone())
-                    .map_err(|e| anyhow!("invalid select_recovery_action arguments: {e}"))?;
+                let args: SelectArguments = match serde_json::from_value(call.arguments.clone()) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        messages = fresh_selection_messages(format!(
+                            "{} Selection validation failed: invalid arguments: {error}. Retry select_recovery_action with a non-empty reason and exact IDs.",
+                            context_prompt(&request, &scenarios, &ledger)?
+                        ));
+                        continue;
+                    }
+                };
                 if args.assessment_id != assessment.episode_id {
-                    bail!("recovery selection did not reference the completed assessment");
+                    messages = fresh_selection_messages(format!(
+                        "{} Selection validation failed: assessment_id must be exactly '{}'. Retry select_recovery_action.",
+                        context_prompt(&request, &scenarios, &ledger)?,
+                        assessment.episode_id
+                    ));
+                    continue;
                 }
-                let (candidate, action) = evaluate(&request.config, &request.candidates, &args)?;
+                let (candidate, action) = match evaluate(
+                    &request.config,
+                    &request.candidates,
+                    &args,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        messages = fresh_selection_messages(format!(
+                            "{} Selection validation failed: {error}. Retry select_recovery_action with a non-empty reason and exact configured IDs.",
+                            context_prompt(&request, &scenarios, &ledger)?
+                        ));
+                        continue;
+                    }
+                };
                 let simulation = request.config.simulation.as_ref().ok_or_else(|| {
                     anyhow!("recovery requires an action-specific simulation contract")
                 })?;
@@ -548,14 +622,24 @@ fn phase_tools(
     ledger: &EvidenceLedger,
     assessment: Option<&ThermalAssessment>,
 ) -> Vec<Value> {
-    let mut tools = vec![latest_telemetry_tool(), command_board_tool()];
+    let mut tools = Vec::new();
+    if !ledger.has_kind("telemetry") {
+        tools.push(latest_telemetry_tool());
+    }
+    if !ledger.has_kind("board") {
+        tools.push(command_board_tool());
+    }
     if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
         return tools;
     }
     if assessment.is_some() {
-        tools.push(select_tool(candidates));
+        tools.push(select_tool(
+            candidates,
+            assessment.map(|assessment| assessment.episode_id.as_str()),
+        ));
+    } else {
+        tools.push(assessment_tool(candidates, ledger));
     }
-    tools.push(assessment_tool(candidates, ledger));
     tools
 }
 
@@ -581,7 +665,7 @@ fn read_context_tool(name: &str, description: &str) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","additionalProperties":false}}})
 }
 
-fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
+fn select_tool(candidates: &[AnomalyCandidate], assessment_id: Option<&str>) -> Value {
     let mut anomaly_ids = Vec::new();
     let mut action_ids = Vec::new();
     for candidate in candidates {
@@ -595,7 +679,11 @@ fn select_tool(candidates: &[AnomalyCandidate]) -> Value {
             }
         }
     }
-    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":{"type":"string"},"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"}}}}})
+    let assessment_schema = assessment_id.map_or_else(
+        || json!({"type": "string"}),
+        |id| json!({"type": "string", "enum": [id]}),
+    );
+    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection"}}}}})
 }
 
 async fn chat(
@@ -1007,7 +1095,7 @@ mod tests {
                 .is_none()
         );
 
-        let selection = select_tool(&[candidate()]);
+        let selection = select_tool(&[candidate()], None);
         assert_eq!(
             selection["function"]["parameters"]["properties"]["anomaly_id"]["enum"][0],
             "profile-r"

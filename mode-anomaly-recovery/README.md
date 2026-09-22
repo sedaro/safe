@@ -428,3 +428,18 @@ Run the advisor unit and integration tests with:
 ```bash
 cargo test -p mode-anomaly-recovery
 ```
+
+The opt-in live example uses the OpenAI-compatible endpoint and model from
+`safe/autonomy_mode_config.json`, sends fake high-temperature telemetry through
+the real SAFE mode transport, and runs the configured real EDS twice for the
+baseline/recovery viability check. It requires `OPENAI_API_KEY` and the
+configured EDS workspace (the checked-in example uses `/workspace/bundle_juno`):
+
+```bash
+cargo test -p mode-anomaly-recovery --test live_openai_simulation_e2e \
+  -- --ignored --nocapture
+```
+
+The test captures mode logs and verifies thermal assessment, post-selection
+simulation, power-only thermal separation, and command proposal stages. It is
+ignored by default because it consumes OpenAI API and EDS resources.
