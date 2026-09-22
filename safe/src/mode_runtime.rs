@@ -139,6 +139,10 @@ where
         Ok(())
     }
 
+    async fn on_tick(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        Ok(())
+    }
+
     async fn on_shutdown(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
         Ok(())
     }
@@ -200,6 +204,7 @@ where
     runtime.output_tx.lifecycle(AutonomyModeLifecycle::Ready)?;
 
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut handler_tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     async fn send_fault_to_safe(
         stream: &mut Box<dyn crate::transports::Stream<SafeToMode, ModeToSafe>>,
@@ -301,6 +306,14 @@ where
                 if let Err(e) = stream.write(ModeToSafe::Output(out)).await {
                     error!(reason = %e, "failed sending autonomy mode output to SAFE");
                     return Err(anyhow!(e));
+                }
+            }
+            _ = handler_tick.tick() => {
+                if let Err(e) = handler.on_tick(&mut runtime).await {
+                    let msg = format!("on_tick failed: {e:#}");
+                    error!(reason = %msg, "autonomy mode handler failure");
+                    send_fault_to_safe(&mut stream, msg.clone()).await;
+                    return Err(anyhow!(msg));
                 }
             }
             _ = heartbeat.tick() => {

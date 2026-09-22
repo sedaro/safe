@@ -132,6 +132,7 @@ pub(crate) struct AnomalyRecoveryMode {
     pub(crate) adapter_registry: AdapterRegistry,
     pub(crate) adapter: Option<Arc<dyn LlmAdapter>>,
     pub(crate) latest_telemetry: Option<TelemetrySample>,
+    pub(crate) pending_telemetry: Option<TelemetrySample>,
     pub(crate) live_context: LiveContext,
     pub(crate) current_candidates: Vec<AnomalyCandidate>,
     pub(crate) rule_states: HashMap<String, RuleState>,
@@ -142,6 +143,7 @@ pub(crate) struct AnomalyRecoveryMode {
     pub(crate) planning_generation: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) planning_cancel: Option<CancellationToken>,
+    pub(crate) planning_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AnomalyRecoveryMode {
@@ -151,6 +153,7 @@ impl AnomalyRecoveryMode {
             adapter_registry,
             adapter: None,
             latest_telemetry: None,
+            pending_telemetry: None,
             live_context: LiveContext::default(),
             current_candidates: Vec::new(),
             rule_states: HashMap::new(),
@@ -161,6 +164,7 @@ impl AnomalyRecoveryMode {
             planning_generation: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(false)),
             planning_cancel: None,
+            planning_task: None,
         }
     }
 }
