@@ -278,6 +278,18 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             continue;
         }
+        if calls.is_empty() {
+            let detail = truncation_detail(
+                turn,
+                &available_tools,
+                request.adapter.kind(),
+                &request.config.llm.model,
+                max_output_tokens,
+            );
+            bail!(
+                "native tool call missing; {detail}; server accepted the request but did not produce message.tool_calls; configure a compatible chat template and tool-call parser"
+            );
+        }
         if calls.len() != 1 {
             // Do not reinterpret content as a tool request. Give tool-capable
             // models one bounded repair opportunity per remaining turn.
