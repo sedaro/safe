@@ -136,6 +136,7 @@ generation settings:
 
 | Field | Default |
 | --- | --- |
+| `llm.enable_tool_calls` | `true` |
 | `llm.request_timeout_ms` | `20000` |
 | `llm.response_temperature` | `0.0` |
 | `llm.max_output_tokens` | `256` |
@@ -187,6 +188,28 @@ The adapter validates its own `config` object and rejects unknown provider
 fields. `ollama_host`, `ollama_port`, `ollama_path`, top-level `model`, and
 `num_predict` are no longer accepted. Migrate them to the `llm` block, using a
 full Ollama endpoint and `max_output_tokens`.
+
+Set `llm.enable_tool_calls` to `false` when the configured model or server does
+not support native tool calls:
+
+```json
+{
+  "llm": {
+    "adapter": {
+      "kind": "ollama",
+      "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}
+    },
+    "model": "mistral:7b",
+    "enable_tool_calls": false
+  }
+}
+```
+
+In this mode the adapter uses its normal constrained-completion endpoint. Each
+planner phase requests strict JSON arguments for its one available operation,
+then feeds the parsed result through the same host-owned assessment, selection,
+simulation, staleness, and board-conflict validation as a native tool call.
+Malformed, truncated, ambiguous, or oversized textual responses fail closed.
 
 The `safe-llm-adapter` crate exposes `LlmAdapter`, `LlmAdapterFactory`, and
 `AdapterRegistry` for mission-specific Rust adapters. Custom adapters must be
@@ -332,9 +355,10 @@ completions with strict JSON-schema response formatting.
   already owns.
 - `options.temperature` and `options.num_predict`.
 
-The configured Ollama model must support native tool calls. Unsupported tools,
-parallel calls, extra or malformed arguments, HTTP failures, oversized payloads,
-timeouts, and exhausted turn/run budgets fail safely without a command.
+When `llm.enable_tool_calls` is `true`, the configured model must support native
+tool calls. Unsupported tools, parallel calls, extra or malformed arguments,
+HTTP failures, oversized payloads, timeouts, and exhausted turn/run budgets fail
+safely without a command.
 
 ## Local EDS Scenarios
 

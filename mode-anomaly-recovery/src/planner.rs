@@ -9,7 +9,8 @@ use anyhow::{Result, anyhow, bail};
 use safe::mode_runtime::ModeOutputTx;
 use safe::protocol::{AutonomyModeId, Command, CommandEnvelope, TimedCommand};
 use safe_llm_adapter::{
-    CompletionFinishReason, LlmAdapter, ToolChatCompletion, ToolChatMessage, ToolChatRequest,
+    CompletionFinishReason, CompletionRequest, LlmAdapter, ToolCall, ToolChatCompletion,
+    ToolChatMessage, ToolChatRequest,
 };
 use safe_sim::{CancellationToken, EdsPatch, SedaroSimulator, SimulationResult};
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     assistant_content = %sanitize(&response.message.content),
                     parsed_tool_call_count = response.message.tool_calls.len(),
                     provider_attempts = ?response.diagnostic,
-                    "anomaly recovery truncated tool-call diagnostic"
+                    "anomaly recovery truncated planner diagnostic"
                 );
             }
             warn!(
@@ -196,10 +197,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 adapter = request.adapter.kind(),
                 model = %request.config.llm.model,
                 max_output_tokens,
-                "anomaly recovery tool-call response stopped at token limit"
+                "anomaly recovery planner response stopped at token limit"
             );
             bail!(
-                "tool-call response stopped at token limit; {detail}; use a tool-capable model with sufficient context"
+                "planner response stopped at token limit; {detail}; use a compatible model with sufficient context"
             );
         }
         let response_chars = response.message.content.chars().count()
@@ -210,7 +211,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 .map(|call| call.name.chars().count() + call.arguments.to_string().chars().count())
                 .sum::<usize>();
         if response_chars > request.config.max_response_chars.saturating_mul(8) {
-            bail!("tool-call response exceeded bounded limit");
+            bail!("planner response exceeded bounded limit");
         }
         let calls = response.message.tool_calls.clone();
         if request.config.decision_trace {
@@ -228,7 +229,12 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             stage = "tool_calls",
             turn,
             tool_call_count = calls.len(),
-            "anomaly recovery received native tool-call response"
+            transport = if request.config.llm.enable_tool_calls {
+                "native_tools"
+            } else {
+                "textual_json"
+            },
+            "anomaly recovery received structured planner response"
         );
         if calls.len() > 1
             && calls.iter().all(|call| {
@@ -286,9 +292,12 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 &request.config.llm.model,
                 max_output_tokens,
             );
-            bail!(
-                "native tool call missing; {detail}; server accepted the request but did not produce message.tool_calls; configure a compatible chat template and tool-call parser"
-            );
+            if request.config.llm.enable_tool_calls {
+                bail!(
+                    "native tool call missing; {detail}; server accepted the request but did not produce message.tool_calls; configure a compatible chat template and tool-call parser"
+                );
+            }
+            bail!("textual JSON operation missing; {detail}");
         }
         if calls.len() != 1 {
             // Do not reinterpret content as a tool request. Give tool-capable
@@ -497,7 +506,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 info!(decision_trace = request.config.decision_trace, stage = "final_validation", turn, runs, anomaly_id = %candidate.anomaly_id, action_id = action.as_str(), elapsed_ms = started.elapsed().as_millis() as u64, "anomaly recovery validated and submitted command board proposal");
                 return Ok(());
             }
-            _ => bail!("Ollama requested an unknown tool"),
+            _ => bail!("model requested an unknown operation"),
         }
     }
     bail!("planning turn budget exhausted")
@@ -818,23 +827,108 @@ async fn chat(
             request.config.llm.context_window_tokens,
         );
     }
-    request
-        .adapter
-        .tool_chat(ToolChatRequest {
-            model: request.config.llm.model.clone(),
-            messages,
-            tools,
-            temperature: request.config.llm.response_temperature,
+    dispatch_chat(
+        &request.config,
+        request.adapter.as_ref(),
+        messages,
+        tools,
+        max_output_tokens,
+    )
+    .await
+}
+
+async fn dispatch_chat(
+    config: &AnomalyRecoveryModeConfig,
+    adapter: &dyn LlmAdapter,
+    messages: Vec<ToolChatMessage>,
+    tools: Vec<Value>,
+    max_output_tokens: u32,
+) -> Result<ToolChatCompletion> {
+    if config.llm.enable_tool_calls {
+        return adapter
+            .tool_chat(ToolChatRequest {
+                model: config.llm.model.clone(),
+                messages,
+                tools,
+                temperature: config.llm.response_temperature,
+                max_output_tokens,
+                timeout: Duration::from_millis(config.llm.request_timeout_ms),
+            })
+            .await
+            .map_err(|error| anyhow!("{} tool-call request failed: {error}", adapter.kind()));
+    }
+
+    textual_chat(config, adapter, messages, tools, max_output_tokens).await
+}
+
+async fn textual_chat(
+    config: &AnomalyRecoveryModeConfig,
+    adapter: &dyn LlmAdapter,
+    messages: Vec<ToolChatMessage>,
+    tools: Vec<Value>,
+    max_output_tokens: u32,
+) -> Result<ToolChatCompletion> {
+    let [tool] = tools.as_slice() else {
+        bail!("textual JSON mode requires exactly one available operation");
+    };
+    if messages
+        .iter()
+        .any(|message| !message.tool_calls.is_empty())
+    {
+        bail!("textual JSON mode cannot encode native tool-call history");
+    }
+    let name = tool
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("textual JSON operation is missing a name"))?;
+    let response_schema = tool
+        .pointer("/function/parameters")
+        .cloned()
+        .ok_or_else(|| anyhow!("textual JSON operation is missing a parameter schema"))?;
+    let mut prompt = messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    prompt.push_str(&format!(
+        "\nReturn only the JSON arguments for {name}. Do not include markdown or explanatory text."
+    ));
+    if prompt.chars().count() > config.max_prompt_chars {
+        bail!("textual JSON prompt exceeds max_prompt_chars");
+    }
+
+    let completion = adapter
+        .complete(CompletionRequest {
+            prompt,
+            response_schema,
+            model: config.llm.model.clone(),
+            temperature: config.llm.response_temperature,
             max_output_tokens,
-            timeout: Duration::from_millis(request.config.llm.request_timeout_ms),
+            timeout: Duration::from_millis(config.llm.request_timeout_ms),
         })
         .await
-        .map_err(|error| {
-            anyhow!(
-                "{} tool-call request failed: {error}",
-                request.adapter.kind()
-            )
-        })
+        .map_err(|error| anyhow!("{} textual JSON request failed: {error}", adapter.kind()))?;
+    if completion.text.chars().count() > config.max_response_chars {
+        bail!("textual JSON response exceeded max_response_chars");
+    }
+    let tool_calls = if completion.finish_reason == CompletionFinishReason::Length {
+        Vec::new()
+    } else {
+        vec![ToolCall {
+            name: name.to_string(),
+            arguments: serde_json::from_str(completion.text.trim())
+                .map_err(|error| anyhow!("invalid textual JSON response: {error}"))?,
+        }]
+    };
+    Ok(ToolChatCompletion {
+        message: ToolChatMessage {
+            role: "assistant".to_string(),
+            content: completion.text,
+            tool_calls,
+        },
+        finish_reason: completion.finish_reason,
+        diagnostic: None,
+    })
 }
 
 fn output_budget(tools: &[Value], configured_budget: u32) -> u32 {
@@ -1176,7 +1270,31 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use safe_llm_adapter::{AdapterError, Completion};
+
+    struct TextCompletionAdapter {
+        requests: Mutex<Vec<CompletionRequest>>,
+        completion: Completion,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAdapter for TextCompletionAdapter {
+        fn kind(&self) -> &'static str {
+            "text-test"
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(self.completion.clone())
+        }
+    }
+
+    fn config() -> AnomalyRecoveryModeConfig {
+        serde_json::from_str(include_str!("../testdata/static_nominal_profile.json")).unwrap()
+    }
 
     fn scenario() -> SimulationScenario {
         serde_json::from_value(json!({
@@ -1431,6 +1549,166 @@ mod tests {
         let with_tools = estimate_request_tokens(&messages, &[latest_telemetry_tool()]).unwrap();
         assert!(without_tools > 0);
         assert!(with_tools > without_tools);
+    }
+
+    #[tokio::test]
+    async fn textual_mode_uses_completion_and_normalizes_json_as_the_available_operation() {
+        let mut mode_config = config();
+        mode_config.llm.enable_tool_calls = false;
+        let adapter = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: r#"{"outcome":"inconclusive","disposition":"monitor","candidate_ids":[],"evidence_ids":[],"rationale":"More evidence is needed.","uncertainty":"Telemetry is limited."}"#.into(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+        let mut ledger = EvidenceLedger::default();
+        ledger.record("telemetry", 1, "ok", json!({}));
+        ledger.record("board", 1, "ok", json!({}));
+
+        let response = dispatch_chat(
+            &mode_config,
+            &adapter,
+            fresh_selection_messages("assess now".into()),
+            vec![assessment_tool(&[candidate()], &ledger)],
+            256,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(
+            response.message.tool_calls[0].name,
+            "complete_thermal_assessment"
+        );
+        assert_eq!(
+            response.message.tool_calls[0].arguments["outcome"],
+            "inconclusive"
+        );
+        let requests = adapter.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .prompt
+                .contains("Return only the JSON arguments for complete_thermal_assessment")
+        );
+        assert_eq!(requests[0].response_schema["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn textual_mode_normalizes_recovery_selection() {
+        let adapter = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: r#"{"assessment_id":"assessment-1","anomaly_id":"profile-r","action_id":"point_nadir","reason":"Use the configured recovery."}"#.into(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+        let response = textual_chat(
+            &config(),
+            &adapter,
+            fresh_selection_messages("select now".into()),
+            vec![select_tool(&[candidate()], Some("assessment-1"))],
+            256,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(
+            response.message.tool_calls[0].name,
+            "select_recovery_action"
+        );
+        assert_eq!(
+            response.message.tool_calls[0].arguments["action_id"],
+            "point_nadir"
+        );
+    }
+
+    #[tokio::test]
+    async fn textual_mode_rejects_ambiguous_malformed_and_oversized_responses() {
+        let mut mode_config = config();
+        let operation = assessment_tool(&[candidate()], &EvidenceLedger::default());
+        let messages = fresh_selection_messages("assess now".into());
+        let malformed = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: "not JSON".into(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+        assert!(
+            textual_chat(
+                &mode_config,
+                &malformed,
+                messages.clone(),
+                vec![operation.clone()],
+                256,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid textual JSON response")
+        );
+
+        let valid = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: "{}".into(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+        assert!(
+            textual_chat(
+                &mode_config,
+                &valid,
+                messages.clone(),
+                vec![operation.clone(), operation.clone()],
+                256,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one available operation")
+        );
+
+        mode_config.max_response_chars = 4;
+        let oversized = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: "{\"x\":1}".into(),
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+        assert!(
+            textual_chat(&mode_config, &oversized, messages, vec![operation], 256,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("max_response_chars")
+        );
+    }
+
+    #[tokio::test]
+    async fn textual_mode_preserves_truncation_without_parsing_partial_json() {
+        let adapter = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text: "{".into(),
+                finish_reason: CompletionFinishReason::Length,
+            },
+        };
+        let response = textual_chat(
+            &config(),
+            &adapter,
+            fresh_selection_messages("assess now".into()),
+            vec![assessment_tool(&[candidate()], &EvidenceLedger::default())],
+            256,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.finish_reason, CompletionFinishReason::Length);
+        assert!(response.message.tool_calls.is_empty());
     }
 
     #[test]
