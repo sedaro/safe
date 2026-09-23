@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
 use safe::protocol::AutonomyModeBoardState;
@@ -8,7 +8,7 @@ use safe::telemetry_frame::TelemetryFrame;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::config::{AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
 use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
 
 enum RuleEvaluation {
@@ -215,6 +215,7 @@ impl AnomalyRecoveryMode {
     }
 
     fn stop_planning(&mut self) {
+        self.shutdown_intent = None;
         self.planning_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(cancel) = self.planning_cancel.take() {
@@ -230,7 +231,10 @@ impl AnomalyRecoveryMode {
             return;
         };
         match task.await {
-            Ok(Ok(())) => self.next_plan_retry = None,
+            Ok(Ok(intent)) => {
+                self.next_plan_retry = None;
+                self.shutdown_intent = intent;
+            }
             Ok(Err(error)) => {
                 warn!(reason = %error, "anomaly recovery planning task failed");
                 if self.config.replanning.failed_plan_retry_ms > 0 {
@@ -246,6 +250,62 @@ impl AnomalyRecoveryMode {
             Err(_) => {}
         }
         self.planning_cancel = None;
+    }
+
+    fn validate_shutdown_intent(&self, intent: &crate::actions::ShutdownIntent) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        ensure!(
+            self.active.load(Ordering::Acquire),
+            "shutdown mode is inactive"
+        );
+        ensure!(
+            self.planning_generation.load(Ordering::Acquire) == intent.generation,
+            "shutdown investigation was superseded"
+        );
+        // Telemetry is coalesced during planning; it must also invalidate local
+        // execution, even before the queued sample is evaluated by the handler.
+        ensure!(
+            self.pending_telemetry.is_none(),
+            "shutdown has newer pending telemetry"
+        );
+        let current = self.live_context.snapshot();
+        ensure!(
+            current.telemetry_version == intent.telemetry_version
+                && current.board_version == intent.board_version,
+            "shutdown evidence is stale"
+        );
+        let board = current
+            .board
+            .as_ref()
+            .ok_or_else(|| anyhow!("shutdown requires a known board"))?;
+        ensure!(
+            board.proposals.is_empty()
+                && board.approved.is_empty()
+                && board.source_of_truth.is_empty(),
+            "shutdown simulation cannot omit existing board commands"
+        );
+        ensure!(
+            self.current_candidates
+                .iter()
+                .any(|c| c.anomaly_id == intent.anomaly_id
+                    && c.eligible_actions.contains(&AllowedAction::Shutdown)),
+            "shutdown candidate is no longer eligible"
+        );
+        Ok(())
+    }
+
+    async fn execute_pending_shutdown(&mut self, directory: &std::path::Path) {
+        let Some(intent) = self.shutdown_intent.take() else {
+            return;
+        };
+        if let Err(error) = self.validate_shutdown_intent(&intent) {
+            warn!(reason = %error, "discarding obsolete shutdown intent");
+            return;
+        }
+        if let Err(error) = self.shutdown_controller.execute(&intent, directory).await {
+            warn!(assessment_id = %intent.assessment_id, reason = %format!("{error:#}"),
+                "anomaly recovery shutdown attempt failed or was suppressed");
+        }
     }
 
     async fn accept_telemetry(
@@ -345,7 +405,6 @@ impl AnomalyRecoveryMode {
             generations: self.planning_generation.clone(),
             active: self.active.clone(),
             cancel: cancel.clone(),
-            output: runtime.output_tx(),
             adapter: self
                 .adapter
                 .clone()
@@ -353,9 +412,10 @@ impl AnomalyRecoveryMode {
             telemetry_version: self.live_context.snapshot().telemetry_version,
             board_version: self.live_context.snapshot().board_version,
         };
-        self.planning_task = Some(tokio::spawn(
-            async move { crate::planner::run(request).await },
-        ));
+        let output = runtime.output_tx();
+        self.planning_task = Some(tokio::spawn(async move {
+            crate::planner::run(request, output).await
+        }));
         self.planning_cancel = Some(cancel);
         self.last_plan_signature = Some(signature);
         self.next_plan_retry = None;
@@ -502,6 +562,8 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
 
     async fn on_tick(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
         self.reap_finished_plan().await;
+        self.execute_pending_shutdown(runtime.working_directory())
+            .await;
         if !runtime.is_active() || self.planning_in_flight() {
             return Ok(());
         }
@@ -550,6 +612,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_handler_serializes_execution_and_rejects_obsolete_intents() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Executor(AtomicUsize);
+        #[async_trait]
+        impl crate::actions::ShutdownExecutor for Executor {
+            async fn shutdown(&self) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        for invalidation in [
+            "none",
+            "inactive",
+            "generation",
+            "telemetry",
+            "board",
+            "pending",
+            "cleared",
+            "reconfigure",
+        ] {
+            let mut mode = AnomalyRecoveryMode::new(AdapterRegistry::with_builtin_adapters());
+            let config: AnomalyRecoveryModeConfig =
+                serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap();
+            mode.set_config(config).unwrap();
+            mode.active.store(true, Ordering::Release);
+            mode.planning_generation.store(1, Ordering::Release);
+            let frame = sample(1, json!({"telemetry": {"temperature_c": 70.0}}));
+            mode.evaluate_static_profile(&frame);
+            mode.evaluate_static_profile(&frame);
+            mode.live_context.update_telemetry(frame.clone(), 8);
+            mode.live_context.update_board(Default::default());
+            mode.shutdown_intent = Some(crate::actions::tests::intent());
+            match invalidation {
+                "none" => {}
+                "inactive" => mode.active.store(false, Ordering::Release),
+                "generation" => {
+                    mode.planning_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                "telemetry" => mode.live_context.update_telemetry(frame.clone(), 8),
+                "board" => mode.live_context.update_board(Default::default()),
+                "pending" => mode.pending_telemetry = Some(frame),
+                "cleared" => mode.current_candidates.clear(),
+                "reconfigure" => mode.set_config(mode.config.clone()).unwrap(),
+                _ => unreachable!(),
+            }
+            let executor = Arc::new(Executor(AtomicUsize::new(0)));
+            mode.shutdown_controller =
+                crate::actions::ShutdownController::with_executor(executor.clone());
+            let directory = tempfile::tempdir().unwrap();
+            mode.execute_pending_shutdown(directory.path()).await;
+            mode.execute_pending_shutdown(directory.path()).await;
+            assert_eq!(
+                executor.0.load(Ordering::SeqCst),
+                usize::from(invalidation == "none"),
+                "{invalidation}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn telemetry_is_coalesced_without_invalidating_an_in_flight_plan() {
         let mut mode = configured_mode();
         let frozen = sample(1, json!({"telemetry":{"temperature_c":50.0}}));
@@ -559,7 +684,7 @@ mod tests {
             .planning_generation
             .load(std::sync::atomic::Ordering::Acquire);
         mode.planning_task = Some(tokio::spawn(async {
-            std::future::pending::<Result<()>>().await
+            std::future::pending::<Result<Option<crate::actions::ShutdownIntent>>>().await
         }));
 
         assert!(mode.defer_telemetry_while_planning(sample(
@@ -587,7 +712,7 @@ mod tests {
         let mut mode = configured_mode();
         mode.pending_telemetry = Some(sample(2, json!({"telemetry":{}})));
         mode.planning_cancel = Some(safe_sim::CancellationToken::new());
-        mode.planning_task = Some(tokio::spawn(async { Ok(()) }));
+        mode.planning_task = Some(tokio::spawn(async { Ok(None) }));
         tokio::task::yield_now().await;
 
         mode.reap_finished_plan().await;

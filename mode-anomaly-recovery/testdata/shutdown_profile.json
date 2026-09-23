@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "llm": {
+    "adapter": {"kind": "ollama", "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}},
+    "model": "mistral:7b",
+    "context_window_tokens": 16384
+  },
+  "replanning": {"require_board_snapshot": true},
+  "planner": {"limits": {"max_prompt_chars": 6000}},
+  "action_catalog": [
+    {"id": "shutdown", "description": "Immediately shut down the Linux processing unit to reduce compute-generated heat, after checking power viability."}
+  ],
+  "nominal_profiles": [{
+    "id": "example", "source": "example",
+    "rules": [{"id": "hot", "path": "telemetry.temperature_c", "kind": "number_range", "max": 60.0, "min_consecutive_samples": 2, "eligible_actions": ["shutdown"]}]
+  }],
+  "simulation": {
+    "eds_path": "/path/to/eds/workspace",
+    "max_runs": 2,
+    "run_timeout_ms": 10000,
+    "initialization": {
+      "source": "example",
+      "epoch_path": "telemetry.time_mjd_utc",
+      "patches": [{"agent_id": "spacecraft", "engine": "power", "field": "battery.soc", "type": "f64", "telemetry_path": "telemetry.state_of_charge"}],
+      "requirements": [{"path": "telemetry.state_of_charge", "min": 0.0, "max": 1.0}],
+      "compute_power_bindings": [{
+        "id": "compute_load", "agent_id": "spacecraft", "engine": "power", "field": "compute.power",
+        "operating_power_w": 12.0, "shutdown_power_w": 0.5
+      }]
+    },
+    "scenarios": [
+      {
+        "id": "compute_on", "description": "Synthetic example: compute continues operating.",
+        "applicable_rule_ids": ["hot"], "allowed_actions": ["shutdown"], "role": "baseline",
+        "duration_days": 0.001,
+        "state_bindings": [{"id": "soc", "source": "example", "path": "telemetry.state_of_charge"}],
+        "metrics": [
+          {"id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last"},
+          {"id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min"}
+        ]
+      },
+      {
+        "id": "compute_shutdown", "description": "Synthetic example: compute uses its residual shutdown draw.",
+        "applicable_rule_ids": ["hot"], "allowed_actions": ["shutdown"], "role": "recovery",
+        "baseline_scenario_id": "compute_on", "modeled_action": "shutdown", "compute_power_binding": "compute_load",
+        "duration_days": 0.001, "thermal": false,
+        "state_bindings": [{"id": "soc", "source": "example", "path": "telemetry.state_of_charge"}],
+        "constraints": [
+          {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.3, "units": "fraction"},
+          {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+          {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+        ],
+        "metrics": [
+          {"id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last"},
+          {"id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min"}
+        ]
+      }
+    ]
+  }
+}

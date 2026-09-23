@@ -257,3 +257,17 @@ duplicate/conflicting results are rejected. Power-only success is explicitly
 command viability only and never thermal benefit evidence. A future thermal EDS
 integration would be separately gated on exact output fields, state/schedule
 bindings, and units.
+
+### Mode-local compute shutdown
+
+The `shutdown` recovery action extends this workflow with paired compute-on and
+compute-shutdown power simulations. Deployment-configured constant-watt load
+bindings replace pointing schedules for this action. After successful paired
+validation the planner returns a local intent; the serialized mode handler
+checks activation, generation, latest evidence and pending telemetry before
+calling `/sbin/shutdown -h now`. This action is not submitted to the command
+board. The mode persists an attempt and simulation record before invoking it,
+and suppresses replay/retry while that record exists. See
+[local shutdown recovery](./README.md#local-shutdown-recovery) for configuration
+and Linux launch requirements. Actual compute field IDs and on/off load values
+remain deployment inputs; synthetic fixtures do not establish flight calibration.

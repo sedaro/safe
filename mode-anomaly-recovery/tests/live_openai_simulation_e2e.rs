@@ -31,13 +31,24 @@ async fn live_openai_tool_calls_run_assessment_and_post_selection_juno_viability
         std::env::var_os("OPENAI_API_KEY").is_some(),
         "OPENAI_API_KEY is required for this live test"
     );
-    let mut mode_config = serde_json::from_str::<serde_json::Value>(AUTONOMY_CONFIG)
+    let config_text = std::env::var_os("SAFE_LIVE_POINTING_CONFIG")
+        .map(|path| std::fs::read_to_string(path).expect("read SAFE_LIVE_POINTING_CONFIG"))
+        .unwrap_or_else(|| AUTONOMY_CONFIG.to_string());
+    let mut mode_config = serde_json::from_str::<serde_json::Value>(&config_text)
         .expect("autonomy config should be valid JSON")
         .as_array()
         .and_then(|entries| entries.first())
         .and_then(|entry| entry.get("mode_config"))
         .cloned()
         .expect("anomaly recovery mode config should be present");
+    assert!(
+        mode_config["action_catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["id"] != "shutdown"),
+        "this live test launches the real mode: supply a pointing-only outer config through SAFE_LIVE_POINTING_CONFIG; local shutdown is tested with fake executors"
+    );
     mode_config["observability"]["decision_trace"] = serde_json::json!(true);
     mode_config["planner"]["limits"]["max_prompt_chars"] = serde_json::json!(1600);
     mode_config["llm"]["max_output_tokens"] = serde_json::json!(256);

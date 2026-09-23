@@ -1,4 +1,4 @@
-//! Trusted, deployment-configured EDS state and pointing-schedule bindings.
+//! Trusted, deployment-configured EDS state, pointing and compute-power bindings.
 //! IDs and frame conventions are supplied by configuration, never by the LLM.
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,23 @@ pub(crate) struct SimulationInitialization {
     pub(crate) patches: Vec<StatePatch>,
     #[serde(default)]
     pub(crate) requirements: Vec<InputRequirement>,
+    #[serde(default)]
     pub(crate) command_schedules: Vec<CommandSchedule>,
+    #[serde(default)]
+    pub(crate) compute_power_bindings: Vec<ComputePowerBinding>,
+}
+
+/// A constant-watt compute load for the simulation horizon. Deployment supplies
+/// the EDS field and measured on/off draws; no spacecraft IDs live in host code.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComputePowerBinding {
+    pub(crate) id: String,
+    pub(crate) agent_id: String,
+    pub(crate) engine: String,
+    pub(crate) field: String,
+    pub(crate) operating_power_w: f64,
+    pub(crate) shutdown_power_w: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,8 +102,8 @@ impl SimulationInitialization {
             "initialization patches are required"
         );
         ensure!(
-            !self.command_schedules.is_empty(),
-            "executable command schedules are required"
+            !self.command_schedules.is_empty() || !self.compute_power_bindings.is_empty(),
+            "executable command or compute-power bindings are required"
         );
         let mut targets = HashSet::new();
         for patch in &self.patches {
@@ -168,6 +184,27 @@ impl SimulationInitialization {
             }
         }
         let mut ids = HashSet::new();
+        for binding in &self.compute_power_bindings {
+            ensure!(
+                !binding.id.trim().is_empty()
+                    && ids.insert(&binding.id)
+                    && !binding.agent_id.trim().is_empty()
+                    && !binding.engine.trim().is_empty()
+                    && !binding.field.trim().is_empty(),
+                "invalid compute-power binding"
+            );
+            ensure!(
+                binding.operating_power_w.is_finite()
+                    && binding.shutdown_power_w.is_finite()
+                    && binding.shutdown_power_w >= 0.0
+                    && binding.operating_power_w > binding.shutdown_power_w,
+                "compute power must be finite, nonnegative and lower after shutdown"
+            );
+            ensure!(
+                targets.insert((&binding.agent_id, &binding.engine, &binding.field)),
+                "duplicate compute/state/schedule target"
+            );
+        }
         for schedule in &self.command_schedules {
             ensure!(
                 !schedule.id.trim().is_empty()
@@ -327,7 +364,9 @@ pub(crate) fn prepare_inputs(
     let selected = match scenario.role {
         Some(SimulationScenarioRole::Baseline) => {
             ensure!(
-                scenario.modeled_action.is_none() && scenario.command_schedule_binding.is_none(),
+                scenario.modeled_action.is_none()
+                    && scenario.command_schedule_binding.is_none()
+                    && scenario.compute_power_binding.is_none(),
                 "baseline cannot contain a recovery action"
             );
             None
@@ -336,24 +375,42 @@ pub(crate) fn prepare_inputs(
             let action = scenario
                 .modeled_action
                 .ok_or_else(|| anyhow!("missing modeled action"))?;
-            let id = scenario
-                .command_schedule_binding
-                .as_deref()
-                .ok_or_else(|| anyhow!("missing command schedule binding"))?;
-            let schedule = initialization
-                .command_schedules
-                .iter()
-                .find(|s| s.id == id)
-                .ok_or_else(|| anyhow!("unknown executable command schedule '{id}'"))?;
-            let mode = schedule
-                .action_modes
-                .get(&action)
-                .ok_or_else(|| anyhow!("action has no executable mode mapping"))?;
+            ensure!(
+                scenario.has_action_binding(),
+                "wrong recovery action binding"
+            );
             ensure!(
                 scenario.allowed_actions.contains(&action),
                 "modeled action is not allowed by scenario"
             );
-            Some((id, mode))
+            if action == AllowedAction::Shutdown {
+                ensure!(
+                    initialization.compute_power_bindings.iter().any(|b| {
+                        Some(b.id.as_str()) == scenario.compute_power_binding.as_deref()
+                    }),
+                    "unknown executable compute-power binding"
+                );
+                None
+            } else {
+                let id = scenario
+                    .command_schedule_binding
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("missing command schedule binding"))?;
+                let schedule = initialization
+                    .command_schedules
+                    .iter()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| anyhow!("unknown executable command schedule '{id}'"))?;
+                let mode = schedule
+                    .action_modes
+                    .get(&action)
+                    .ok_or_else(|| anyhow!("action has no executable mode mapping"))?;
+                ensure!(
+                    scenario.allowed_actions.contains(&action),
+                    "modeled action is not allowed by scenario"
+                );
+                Some((id, mode))
+            }
         }
         None => bail!("initialized simulation requires an explicit scenario role"),
     };
@@ -376,6 +433,22 @@ pub(crate) fn prepare_inputs(
             ));
         }
     }
+    for binding in &initialization.compute_power_bindings {
+        let power = if scenario.modeled_action == Some(AllowedAction::Shutdown)
+            && scenario.compute_power_binding.as_deref() == Some(binding.id.as_str())
+        {
+            binding.shutdown_power_w
+        } else {
+            binding.operating_power_w
+        };
+        patches.push(EdsPatch::new(
+            &binding.agent_id,
+            &binding.engine,
+            &binding.field,
+            "f64",
+            &format!("{power:?}"),
+        ));
+    }
     patches.extend(scenario_patches);
     let mut targets = HashSet::new();
     for patch in &patches {
@@ -395,6 +468,81 @@ mod tests {
     use super::*;
     use crate::config::AnomalyRecoveryModeConfig;
     use serde_json::json;
+
+    fn shutdown_config() -> AnomalyRecoveryModeConfig {
+        serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap()
+    }
+
+    #[test]
+    fn shutdown_changes_only_compute_power_and_uses_frozen_state() {
+        let config = shutdown_config();
+        config.validate().unwrap();
+        let simulation = config.simulation.as_ref().unwrap();
+        let frame = TelemetrySample {
+            source: Some("example".into()),
+            ts_mono: 1,
+            payload: json!({"telemetry": {"time_mjd_utc": 61290.0, "state_of_charge": 0.8}}),
+        };
+        let before = prepare_inputs(simulation, &simulation.scenarios[0], &frame, vec![]).unwrap();
+        let after = prepare_inputs(simulation, &simulation.scenarios[1], &frame, vec![]).unwrap();
+        assert_eq!(before.epoch_mjd, after.epoch_mjd);
+        assert_eq!(before.patches.len(), after.patches.len());
+        let differences: Vec<_> = before
+            .patches
+            .iter()
+            .zip(&after.patches)
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].0.field, "compute.power");
+        assert_eq!(differences[0].0.value, "12.0");
+        assert_eq!(differences[0].1.value, "0.5");
+        assert!(
+            prepare_inputs(
+                simulation,
+                &simulation.scenarios[1],
+                &frame,
+                vec![after.patches.last().unwrap().clone()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shutdown_contract_rejects_missing_or_ambiguous_and_invalid_bindings() {
+        for mutation in 0..9 {
+            let mut config = shutdown_config();
+            let sim = config.simulation.as_mut().unwrap();
+            match mutation {
+                0 => sim.initialization = None,
+                1 => sim.scenarios[1].compute_power_binding = Some("unknown".into()),
+                2 => sim.scenarios[1].command_schedule_binding = Some("pointing".into()),
+                3 => {
+                    sim.initialization.as_mut().unwrap().compute_power_bindings[0]
+                        .shutdown_power_w = -1.0
+                }
+                4 => {
+                    sim.initialization.as_mut().unwrap().compute_power_bindings[0]
+                        .shutdown_power_w = 12.0
+                }
+                5 => {
+                    sim.initialization.as_mut().unwrap().compute_power_bindings[0]
+                        .operating_power_w = f64::NAN
+                }
+                6 => {
+                    sim.initialization.as_mut().unwrap().compute_power_bindings[0].field =
+                        "battery.soc".into()
+                }
+                7 => sim.scenarios[1].compute_power_binding = None,
+                8 => sim.scenarios[0].compute_power_binding = Some("compute_load".into()),
+                _ => unreachable!(),
+            }
+            assert!(config.validate().is_err(), "mutation {mutation}");
+        }
+        let mut config = shutdown_config();
+        config.simulation = None;
+        assert!(config.validate().is_err());
+    }
 
     fn deployment_config() -> AnomalyRecoveryModeConfig {
         let config: AnomalyRecoveryModeConfig =
