@@ -898,7 +898,7 @@ async fn textual_chat(
     }
 
     let completion = adapter
-        .complete(CompletionRequest {
+        .complete_json_object(CompletionRequest {
             prompt,
             response_schema,
             model: config.llm.model.clone(),
