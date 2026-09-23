@@ -651,6 +651,8 @@ impl Default for ObservabilityConfig {
 pub(crate) struct AnomalyRecoveryModeConfig {
     pub(crate) schema_version: u32,
     pub(crate) llm: LlmConfig,
+    #[serde(default = "default_shutdown_command")]
+    pub(crate) shutdown_command: Vec<String>,
     #[serde(default)]
     pub(crate) planner: PlannerConfig,
     #[serde(default)]
@@ -678,6 +680,16 @@ impl AnomalyRecoveryModeConfig {
             bail!("anomaly recovery requires at least one nominal profile");
         }
         self.llm.validate()?;
+        if self
+            .shutdown_command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+            || self.shutdown_command.iter().any(|arg| arg.contains('\0'))
+        {
+            bail!(
+                "shutdown_command must contain a nonempty executable followed by arguments, with no NUL characters"
+            );
+        }
         self.validate_runtime_settings()?;
         let mut action_ids = HashSet::new();
         for action in &self.action_catalog {
@@ -1064,6 +1076,7 @@ impl Default for AnomalyRecoveryModeConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             llm: LlmConfig::default(),
+            shutdown_command: default_shutdown_command(),
             planner: PlannerConfig::default(),
             prompts: PromptConfig::default(),
             evidence: EvidenceConfig::default(),
@@ -1074,6 +1087,10 @@ impl Default for AnomalyRecoveryModeConfig {
             simulation: None,
         }
     }
+}
+
+pub(crate) fn default_shutdown_command() -> Vec<String> {
+    vec!["/sbin/shutdown".into(), "-h".into(), "now".into()]
 }
 
 impl AnomalyRecoveryModeConfig {
@@ -1415,6 +1432,56 @@ mod tests {
     #[test]
     fn accepts_valid_static_nominal_profile() {
         valid_config().validate().expect("config should validate");
+    }
+
+    #[test]
+    fn shutdown_command_defaults_and_json_override() {
+        assert_eq!(
+            valid_config().shutdown_command,
+            ["/sbin/shutdown", "-h", "now"]
+        );
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["shutdown_command"] = json!(["/opt/power helper", "--reason", "thermal anomaly", ""]);
+        let config: AnomalyRecoveryModeConfig = serde_json::from_value(value.clone()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["shutdown_command"],
+            value["shutdown_command"]
+        );
+        value["shutdown_command"] = json!(["poweroff"]);
+        serde_json::from_value::<AnomalyRecoveryModeConfig>(value)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_shutdown_commands() {
+        for command in [
+            json!([]),
+            json!([""]),
+            json!(["  "]),
+            json!(["bad\u{0}program"]),
+            json!(["shutdown", "bad\u{0}argument"]),
+        ] {
+            let mut value = serde_json::to_value(valid_config()).unwrap();
+            value["shutdown_command"] = command;
+            assert!(
+                serde_json::from_value::<AnomalyRecoveryModeConfig>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        for command in [
+            json!("shutdown -h now"),
+            json!(null),
+            json!(["shutdown", 1]),
+        ] {
+            let mut value = serde_json::to_value(valid_config()).unwrap();
+            value["shutdown_command"] = command;
+            assert!(serde_json::from_value::<AnomalyRecoveryModeConfig>(value).is_err());
+        }
     }
 
     #[test]

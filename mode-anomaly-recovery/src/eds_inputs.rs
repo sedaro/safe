@@ -544,7 +544,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    fn deployment_config() -> AnomalyRecoveryModeConfig {
+    fn pointing_config() -> AnomalyRecoveryModeConfig {
         let config: AnomalyRecoveryModeConfig =
             serde_json::from_str(include_str!("../testdata/pointing_profile.json")).unwrap();
         config.validate().unwrap();
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn frozen_state_is_identical_and_only_selected_schedule_changes() {
-        let config = deployment_config();
+        let config = pointing_config();
         let simulation = config.simulation.as_ref().unwrap();
         let initialization = simulation.initialization.as_ref().unwrap();
         let frame = telemetry(&config);
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn input_requirements_shapes_sources_and_overwrites_are_enforced() {
-        let config = deployment_config();
+        let config = pointing_config();
         let simulation = config.simulation.as_ref().unwrap();
         let scenario = &simulation.scenarios[1];
         let original = telemetry(&config);
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn configured_vector_and_rate_conversions_are_applied() {
-        let config = deployment_config();
+        let config = pointing_config();
         let simulation = config.simulation.as_ref().unwrap();
         let mut frame = telemetry(&config);
         frame.payload["sensors"]["gyro_deg_s"][0] = json!(180.0);
@@ -681,15 +681,15 @@ mod tests {
 
     #[test]
     fn config_rejects_mismatched_action_binding_and_paired_state() {
-        let mut config = deployment_config();
+        let mut config = pointing_config();
         config.simulation.as_mut().unwrap().scenarios[1].command_schedule_binding =
             Some("label_only".into());
         assert!(config.validate().is_err());
-        let mut config = deployment_config();
+        let mut config = pointing_config();
         config.simulation.as_mut().unwrap().scenarios[1].state_bindings[0].path =
             "different".into();
         assert!(config.validate().is_err());
-        let mut config = deployment_config();
+        let mut config = pointing_config();
         config.simulation.as_mut().unwrap().scenarios[1].duration_days = 1.0;
         assert!(config.validate().is_err());
     }

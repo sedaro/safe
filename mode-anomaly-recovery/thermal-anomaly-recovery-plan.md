@@ -265,7 +265,8 @@ compute-shutdown power simulations. Deployment-configured constant-watt load
 bindings replace pointing schedules for this action. After successful paired
 validation the planner returns a local intent; the serialized mode handler
 checks activation, generation, latest evidence and pending telemetry before
-calling `/sbin/shutdown -h now`. This action is not submitted to the command
+calling the mode-configured `shutdown_command` (default `/sbin/shutdown -h now`).
+This action is not submitted to the command
 board. The mode persists an attempt and simulation record before invoking it,
 and suppresses replay/retry while that record exists. See
 [local shutdown recovery](./README.md#local-shutdown-recovery) for configuration

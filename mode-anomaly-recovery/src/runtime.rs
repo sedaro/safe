@@ -302,7 +302,11 @@ impl AnomalyRecoveryMode {
             warn!(reason = %error, "discarding obsolete shutdown intent");
             return;
         }
-        if let Err(error) = self.shutdown_controller.execute(&intent, directory).await {
+        if let Err(error) = self
+            .shutdown_controller
+            .execute(&intent, directory, &self.config.shutdown_command)
+            .await
+        {
             warn!(assessment_id = %intent.assessment_id, reason = %format!("{error:#}"),
                 "anomaly recovery shutdown attempt failed or was suppressed");
         }
@@ -620,7 +624,8 @@ mod tests {
         struct Executor(AtomicUsize);
         #[async_trait]
         impl crate::actions::ShutdownExecutor for Executor {
-            async fn shutdown(&self) -> Result<()> {
+            async fn shutdown(&self, command: &[String]) -> Result<()> {
+                assert_eq!(command, ["/opt/custom-shutdown", "--poweroff"]);
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -636,8 +641,9 @@ mod tests {
             "reconfigure",
         ] {
             let mut mode = AnomalyRecoveryMode::new(AdapterRegistry::with_builtin_adapters());
-            let config: AnomalyRecoveryModeConfig =
+            let mut config: AnomalyRecoveryModeConfig =
                 serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap();
+            config.shutdown_command = vec!["/opt/custom-shutdown".into(), "--poweroff".into()];
             mode.set_config(config).unwrap();
             mode.active.store(true, Ordering::Release);
             mode.planning_generation.store(1, Ordering::Release);
