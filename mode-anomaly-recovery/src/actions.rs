@@ -26,25 +26,30 @@ pub(crate) struct ShutdownIntent {
 
 #[async_trait]
 pub(crate) trait ShutdownExecutor: Send + Sync {
-    async fn shutdown(&self) -> Result<()>;
+    async fn shutdown(&self, command: &[String]) -> Result<()>;
 }
 
 pub(crate) struct LinuxShutdown;
 
 #[async_trait]
 impl ShutdownExecutor for LinuxShutdown {
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self, command: &[String]) -> Result<()> {
         if !cfg!(target_os = "linux") {
             bail!("host shutdown is supported only on Linux");
         }
-        invoke_shutdown(shutdown_command(), Duration::from_secs(5)).await
+        invoke_shutdown(shutdown_command(command)?, Duration::from_secs(5)).await
     }
 }
 
 async fn invoke_shutdown(mut command: tokio::process::Command, timeout: Duration) -> Result<()> {
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
     let mut child = command
         .spawn()
-        .context("could not invoke /sbin/shutdown -h now")?;
+        .with_context(|| format!("could not invoke shutdown executable '{program}'"))?;
     let status = tokio::time::timeout(timeout, child.wait())
         .await
         .context("shutdown invocation timed out; host outcome is unknown")??;
@@ -54,13 +59,11 @@ async fn invoke_shutdown(mut command: tokio::process::Command, timeout: Duration
     Ok(())
 }
 
-fn shutdown_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("/sbin/shutdown");
-    command
-        .args(["-h", "now"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    command
+fn shutdown_command(argv: &[String]) -> Result<tokio::process::Command> {
+    let (program, args) = argv.split_first().context("shutdown_command is empty")?;
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    Ok(command)
 }
 
 pub(crate) const SHUTDOWN_JOURNAL: &str = "shutdown-attempt.jsonl";
@@ -95,6 +98,7 @@ impl ShutdownController {
         &mut self,
         intent: &ShutdownIntent,
         directory: &Path,
+        command: &[String],
     ) -> Result<()> {
         if self.attempted {
             bail!("shutdown was already attempted by this mode");
@@ -106,13 +110,13 @@ impl ShutdownController {
         writeln!(
             journal,
             "{}",
-            json!({"state": "attempting", "intent": intent})
+            json!({"state": "attempting", "intent": intent, "command": command})
         )?;
         journal.sync_all()?;
         File::open(directory)?.sync_all()?;
-        info!(assessment_id = %intent.assessment_id, anomaly_id = %intent.anomaly_id,
-            "power-validated anomaly recovery invoking /sbin/shutdown -h now");
-        let result = self.executor.shutdown().await;
+        info!(assessment_id = %intent.assessment_id, anomaly_id = %intent.anomaly_id, command = ?command,
+            "power-validated anomaly recovery invoking configured shutdown command");
+        let result = self.executor.shutdown(command).await;
         let record = match &result {
             Ok(()) => {
                 json!({"state": "accepted", "detail": "shutdown command succeeded; power-off is not acknowledged"})
@@ -128,6 +132,7 @@ impl ShutdownController {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::config::default_shutdown_command;
     use crate::simulation::ScenarioRun;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -164,7 +169,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ShutdownExecutor for FakeExecutor {
-        async fn shutdown(&self) -> Result<()> {
+        async fn shutdown(&self, _command: &[String]) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 bail!("permission denied");
@@ -184,26 +189,29 @@ pub(crate) mod tests {
             let mut controller = ShutdownController::with_executor(executor.clone());
             assert_eq!(
                 controller
-                    .execute(&intent(), directory.path())
+                    .execute(&intent(), directory.path(), &default_shutdown_command())
                     .await
                     .is_err(),
                 fail
             );
             assert!(
                 controller
-                    .execute(&intent(), directory.path())
+                    .execute(&intent(), directory.path(), &default_shutdown_command())
                     .await
                     .is_err()
             );
             let mut restarted = ShutdownController::with_executor(executor.clone());
             assert!(
                 restarted
-                    .execute(&intent(), directory.path())
+                    .execute(&intent(), directory.path(), &default_shutdown_command())
                     .await
                     .is_err()
             );
             assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
             let journal = std::fs::read_to_string(directory.path().join(SHUTDOWN_JOURNAL)).unwrap();
+            let attempt: serde_json::Value =
+                serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+            assert_eq!(attempt["command"], json!(default_shutdown_command()));
             assert!(journal.contains("attempting"));
             assert!(journal.contains(if fail {
                 "failed_or_unknown"
@@ -223,7 +231,11 @@ pub(crate) mod tests {
         let mut controller = ShutdownController::with_executor(executor.clone());
         assert!(
             controller
-                .execute(&intent(), &directory.path().join("missing"))
+                .execute(
+                    &intent(),
+                    &directory.path().join("missing"),
+                    &default_shutdown_command()
+                )
                 .await
                 .is_err()
         );
@@ -231,12 +243,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn linux_command_has_fixed_executable_and_arguments() {
-        let command = shutdown_command();
+    fn linux_command_defaults_and_custom_arguments_are_preserved() {
+        let command = shutdown_command(&default_shutdown_command()).unwrap();
         assert_eq!(command.as_std().get_program(), "/sbin/shutdown");
         assert_eq!(
             command.as_std().get_args().collect::<Vec<_>>(),
             ["-h", "now"]
+        );
+        let argv = [
+            "/opt/host control",
+            "argument with spaces",
+            "$(command)",
+            "",
+        ]
+        .map(String::from);
+        let command = shutdown_command(&argv).unwrap();
+        assert_eq!(command.as_std().get_program(), argv[0].as_str());
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [argv[1].as_str(), argv[2].as_str(), argv[3].as_str()]
         );
     }
 

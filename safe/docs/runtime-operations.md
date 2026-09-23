@@ -111,7 +111,8 @@ does not prove host execution.
 
 The anomaly-recovery mode also supports a mode-local `shutdown` action. After
 its own compute-on/shutdown power simulations pass, the mode invokes
-`/sbin/shutdown -h now` directly. This action does not enter the command board,
+its configured `shutdown_command` (default `/sbin/shutdown -h now`) directly.
+This action does not enter the command board,
 gatekeeper or egress adapters; its durable attempt/results record is
 `state/modes/<mode-uuid>/shutdown-attempt.jsonl`. See the
 [shutdown recovery configuration](../../mode-anomaly-recovery/README.md#local-shutdown-recovery)

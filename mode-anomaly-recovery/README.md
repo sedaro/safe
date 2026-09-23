@@ -19,6 +19,11 @@ asks the LLM to complete a thermal assessment. Completion records `thermal_anoma
 `no_thermal_anomaly`, or `inconclusive`; a recovery action is optional and may
 only follow an anomaly assessment requesting recovery evaluation.
 
+Recovery can issue a SAFE board command or execute the mode-local `shutdown`
+action after a compute-on/compute-shutdown power comparison. Shutdown invokes
+the configured Linux command directly from the anomaly mode (default:
+`/sbin/shutdown -h now`).
+
 Evidence is retained in a configurable bounded, host-owned ledger across tool calls. Telemetry
 history is source-scoped and ignores duplicate or out-of-order timestamps for
 trend/persistence use. Board proposals and approvals are command intent, not
@@ -35,8 +40,8 @@ power-only command viability.
 
 ### Post-selection viability
 
-Recovery selection is only an assessment disposition. Before SAFE receives a
-command, host code requires an exact action-specific recovery scenario and its
+Recovery selection is only an assessment disposition. Before a board command or
+local shutdown is issued, mode code requires an exact action-specific recovery scenario and its
 baseline association, then runs both from the same frozen evidence revision,
 state bindings, and horizon. Both runs must succeed and return finite,
 unit-declared `final_state_of_charge` and `minimum_state_of_charge` metrics;
@@ -120,17 +125,119 @@ sample count is reached.
 
 The action catalog may contain only these recommendable actions:
 
-| Action ID | SAFE command |
+| Action ID | Execution |
 | --- | --- |
 | `point_sun_yaw` | `Command::PointSunYaw` |
 | `point_nadir` | `Command::PointNadir` |
 | `thruster_off` | `Command::ThrusterOff` |
+| `shutdown` | Mode-local `shutdown_command` (default `/sbin/shutdown -h now`), after paired power simulation |
 
 `capture_image` and `noop` are representable enum values but are rejected for
 recommendations. A rule with no `eligible_actions` is observable and can appear
 in diagnostics, but cannot emit a command. An empty action catalog is valid for
 assessment-only operation; rules that name an action still require it to be
 defined.
+
+### Local shutdown recovery
+
+The [shutdown profile](./testdata/shutdown_profile.json) is a complete synthetic
+`mode_config` example. The anomaly entry in
+[`../safe/autonomy_mode_config.json`](../safe/autonomy_mode_config.json) also uses
+shutdown for high-temperature recovery. Replace example EDS paths, agent/field
+names, load values and policy thresholds with deployment values before use.
+
+The sequence is thermal assessment → eligible `shutdown` selection → paired
+power simulation → final lifecycle/evidence checks → local Linux shutdown.
+Shutdown is not a SAFE board proposal and does not go through gatekeeper approval
+or platform egress. Board context is still required: existing proposals,
+approvals or source-of-truth commands block the simulation because their effects
+are not projected into either run.
+
+Set `shutdown_command` inside `mode_config` to an array containing the executable
+followed by its arguments. Omitting it preserves the default:
+
+```json
+{
+  "shutdown_command": ["/sbin/shutdown", "-h", "now"]
+}
+```
+
+For a deployment-specific helper, for example:
+
+```json
+{
+  "shutdown_command": ["/usr/local/sbin/compute-poweroff", "--reason", "thermal anomaly"]
+}
+```
+
+Arguments are passed literally, including spaces; there is no implicit shell
+parsing, expansion or quoting. A bare executable name uses the mode process's
+`PATH`; relative paths are relative to its process working directory. The array
+must contain a nonblank executable and only strings, with no NUL characters.
+The command is deployment configuration and is not supplied to or editable by
+the LLM. Updating the configuration changes subsequent invocations without
+clearing the attempt latch or journal.
+
+Configure `simulation.initialization.compute_power_bindings`, for example:
+
+```json
+{
+  "compute_power_bindings": [
+    {
+      "id": "compute_load",
+      "agent_id": "spacecraft",
+      "engine": "power",
+      "field": "compute.power",
+      "operating_power_w": 12.0,
+      "shutdown_power_w": 0.5
+    }
+  ]
+}
+```
+
+These numbers and identifiers are **synthetic examples**, not measured hardware
+values. The target must be an executable `f64` EDS load field in watts. Supply
+measured operating and residual shutdown draw; shutdown draw must be nonnegative
+and lower than operating draw. The binding describes a constant load over the
+simulation horizon, with shutdown applied at the start; it does not model Linux
+shutdown latency or transients. A shutdown-state load need not be zero.
+
+The recovery scenario uses `modeled_action: "shutdown"`,
+`compute_power_binding: "compute_load"`, `role: "recovery"`, `thermal: false`,
+and an exact `baseline_scenario_id`. It does not use `command_schedule_binding`.
+The baseline uses operating draw; recovery uses shutdown draw. Shared state,
+epoch, other loads and horizon are identical. A compute-only initialization may
+omit `command_schedules`. Model schedules that could override the configured
+load must be cleared through shared initialization patches.
+
+Both runs must pass the existing final/minimum SOC and degradation checks with
+finite, consistent-unit metrics. Missing initialization, wrong bindings,
+simulation failure/timeout, missing metrics or stale evidence prevent shutdown.
+Power viability does not predict cooling; thermal justification comes from the
+assessment. New telemetry coalesced during planning also blocks local execution
+until a fresh investigation validates it.
+
+**Linux deployment:** the mode must run with permission to shut down the host,
+and the configured executable must be available. The current SAFE namespace launcher uses a new
+PID namespace. Launch SAFE with `SAFE_SANDBOX_ISOLATION=disabled` on the target
+host for this action, and use a service identity authorized for host shutdown.
+That setting applies to all modes in this SAFE instance. Running SAFE inside a
+container does not establish host shutdown access. The mode runs exactly the
+configured executable and arguments; the LLM cannot supply them.
+
+The serialized mode handler owns the final decision and invocation. Before
+invocation it creates and syncs `shutdown-attempt.jsonl` in the mode working
+directory, including the configured command, assessment ID, anomaly ID, evidence revisions and both
+simulation results. It appends `accepted` or `failed_or_unknown` if it remains
+running long enough. `accepted` means the command exited successfully, not that
+power-off or cooling was observed. Invocation has a five-second timeout.
+
+An existing journal suppresses further attempts, including after mode restart
+or reboot; keep `persist_work_dir: true`. After investigating an unsuccessful or
+interrupted attempt, archive/remove the journal while the mode is stopped to
+permit a fresh assessment and attempt. Reconfiguration does not clear the
+in-process attempt latch. This deliberately avoids automatically retrying an
+action whose host outcome may be unknown.
 
 ## LLM Adapters
 
@@ -415,7 +522,9 @@ safely without a command.
 
 ## Local EDS Scenarios
 
-`simulation` is optional. It names one trusted local `eds_path` and allow-listed
+`simulation` is optional for assessment-only operation; eligible shutdown rules
+require initialized simulation contracts at configuration validation. It names
+one trusted local `eds_path` and allow-listed
 scenarios. A scenario declares applicable nominal-rule IDs, allowed actions,
 duration, trusted constant or telemetry-derived patch bindings, optional bounded
 parameters, and compact numeric output metrics. The model never receives EDS
@@ -423,6 +532,40 @@ paths, patches, raw frames, stdout, stderr, shell arguments, or filesystem paths
 Post-selection validation creates independent baseline and recovery
 `SedaroSimulator` runs. `simulation.max_runs` must allow at least those two runs.
 There is no cloud API.
+
+For executable recovery scenarios, configure `simulation.initialization`:
+
+- `source`: exact telemetry source; `epoch_path`: dot-separated payload path to
+  finite UTC MJD, passed to EDS as `--start`.
+- `patches`: shared typed state patches with `agent_id`, `engine`, `field`, `type`
+  and exactly one of `value`, `telemetry_path`, or `telemetry_paths` (component
+  paths for a vector). Supported types are `f64`, `bool`, `#[f64; 3]`,
+  `#[f64; 4]`, and constant empty lists for clearing bundled schedules. Optional
+  `scale` applies to numeric values/components, allowing explicit unit conversion.
+- `requirements`: input paths with either an `expected` non-null value or
+  inclusive numeric `min`/`max` bounds.
+- `command_schedules`: bindings with `id`, `agent_id`, `engines`, `field`, and
+  `action_modes` mapping configured pointing actions to model-specific mode IDs.
+  The runner clears these schedules for the baseline and writes the selected
+  recovery's mode at the common start epoch as `[(f64, str)]`.
+- `compute_power_bindings`: constant-watt operating/shutdown load bindings for
+  mode-local shutdown, as described above.
+
+Both scenarios share the initialization, state descriptors and horizon. State
+descriptor paths and sources are now checked at runtime; shared patch targets
+cannot be overwritten by per-scenario patches. The action's command-schedule or
+compute-power label must
+resolve to an executable binding. Numeric-only legacy baseline scenarios remain
+supported, but label-only recovery scenarios without initialization fail before
+their EDS run. Existing generic examples need deployment-specific initialization
+before they can issue recovery commands.
+
+This runner models a standalone recovery with an empty command board. It rejects
+existing proposals, approvals and source-of-truth commands because they are not
+yet projected into the baseline/recovery schedules. See the
+[synthetic pointing profile](./testdata/pointing_profile.json) for the state and
+schedule binding structure. Executable model IDs and fields belong in deployment
+configuration.
 
 `simulation.viability` configures the IDs used for final SOC, minimum SOC,
 maximum SOC degradation, and the quantity name that identifies temperature
@@ -445,7 +588,7 @@ board and gatekeeper validation.
 
 ## SAFE Integration
 
-The advisor emits:
+For board-backed recovery actions, the advisor emits:
 
 ```text
 TimedCommand::Now(Command::<configured action>)
@@ -455,6 +598,8 @@ to SAFE as a board proposal. Emitting a command means submitting it to SAFE;
 it does not by itself mean that a host vehicle executed it. Gatekeeper and
 platform egress behavior is described in
 [`../safe/docs/runtime-operations.md`](../safe/docs/runtime-operations.md).
+The local `shutdown` action instead executes inside the mode after simulation
+and final validation, without a SAFE command enum or egress round trip.
 
 A minimal outer SAFE mode entry is:
 
@@ -530,6 +675,10 @@ The generic fixtures are:
 
 - [`testdata/static_nominal_profile.json`](./testdata/static_nominal_profile.json)
 - [`testdata/static_nominal_telemetry.jsonl`](./testdata/static_nominal_telemetry.jsonl)
+- [`testdata/pointing_profile.json`](./testdata/pointing_profile.json): synthetic
+  baseline, sun-yaw and nadir state/schedule bindings for deterministic tests.
+- [`testdata/shutdown_profile.json`](./testdata/shutdown_profile.json): synthetic
+  compute-on/shutdown power bindings. Shutdown tests use fake executors.
 
 Run the advisor unit and integration tests with:
 
@@ -537,13 +686,31 @@ Run the advisor unit and integration tests with:
 cargo test -p mode-anomaly-recovery
 ```
 
-The opt-in live example uses the OpenAI-compatible endpoint and model from
-`safe/autonomy_mode_config.json`, sends fake high-temperature telemetry through
-the real SAFE mode transport, and runs the configured real EDS twice for the
-baseline/recovery viability check. It requires `OPENAI_API_KEY` and the
-configured EDS workspace (the checked-in example uses `/workspace/bundle_juno`):
+The ignored, LLM-free EDS pointing test takes its deployment configuration and
+telemetry from files rather than a checked-in mission configuration:
 
 ```bash
+ANOMALY_RECOVERY_EDS_CONFIG=/path/to/mode-config.json \
+ANOMALY_RECOVERY_EDS_TELEMETRY=/path/to/telemetry-payload.json \
+cargo test -p mode-anomaly-recovery \
+  local_eds_executes_distinct_baseline_sun_and_nadir_scenarios -- --ignored --nocapture
+```
+
+Supply the inner `mode_config` object and decoded telemetry payload, with
+scenarios ordered baseline, sun-yaw recovery, nadir recovery. The test expects
+compatible CDH/GNC pointing outputs and fraction-valued SOC metrics. Set
+`ANOMALY_RECOVERY_EDS_PATH` to optionally override the configured EDS path.
+
+The opt-in live pointing example reads an outer mode configuration from
+`SAFE_LIVE_POINTING_CONFIG`, sends fake high-temperature telemetry through
+the real SAFE mode transport, and runs the configured real EDS twice for the
+baseline/recovery viability check. It requires a configured provider, its API
+credentials, and an executable pointing EDS configuration. It rejects any action
+catalog containing shutdown before launching the real mode. The checked-in
+shutdown example is not suitable for this pointing-only live test:
+
+```bash
+SAFE_LIVE_POINTING_CONFIG=/path/to/pointing-autonomy-config.json \
 cargo test -p mode-anomaly-recovery --features https \
   --test live_openai_simulation_e2e \
   -- --ignored --nocapture
