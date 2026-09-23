@@ -203,16 +203,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 "planner response stopped at token limit; {detail}; use a compatible model with sufficient context"
             );
         }
-        let response_chars = response.message.content.chars().count()
-            + response
-                .message
-                .tool_calls
-                .iter()
-                .map(|call| call.name.chars().count() + call.arguments.to_string().chars().count())
-                .sum::<usize>();
-        if response_chars > request.config.max_response_chars.saturating_mul(8) {
-            bail!("planner response exceeded bounded limit");
-        }
+        validate_response_size(&response.message, request.config.max_response_chars)?;
         let calls = response.message.tool_calls.clone();
         if request.config.decision_trace {
             info!(
@@ -908,9 +899,6 @@ async fn textual_chat(
         })
         .await
         .map_err(|error| anyhow!("{} textual JSON request failed: {error}", adapter.kind()))?;
-    if completion.text.chars().count() > config.max_response_chars {
-        bail!("textual JSON response exceeded max_response_chars");
-    }
     let tool_calls = if completion.finish_reason == CompletionFinishReason::Length {
         Vec::new()
     } else {
@@ -929,6 +917,19 @@ async fn textual_chat(
         finish_reason: completion.finish_reason,
         diagnostic: None,
     })
+}
+
+fn validate_response_size(message: &ToolChatMessage, max_response_chars: usize) -> Result<()> {
+    let response_chars = message.content.chars().count()
+        + message
+            .tool_calls
+            .iter()
+            .map(|call| call.name.chars().count() + call.arguments.to_string().chars().count())
+            .sum::<usize>();
+    if response_chars > max_response_chars.saturating_mul(8) {
+        bail!("planner response exceeded bounded limit");
+    }
+    Ok(())
 }
 
 fn output_budget(tools: &[Value], configured_budget: u32) -> u32 {
@@ -1626,7 +1627,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn textual_mode_rejects_ambiguous_malformed_and_oversized_responses() {
+    async fn textual_assessment_can_exceed_the_legacy_completion_limit() {
+        let mode_config = config();
+        let text = json!({
+            "outcome": "inconclusive",
+            "disposition": "monitor",
+            "candidate_ids": ["profile-r"],
+            "evidence_ids": ["telemetry:1", "board:1"],
+            "rationale": "r".repeat(MAX_ASSESSMENT_RATIONALE_CHARS),
+            "uncertainty": "u".repeat(MAX_ASSESSMENT_UNCERTAINTY_CHARS),
+            "forecast_risks": [
+                "a".repeat(MAX_FORECAST_RISK_CHARS),
+                "b".repeat(MAX_FORECAST_RISK_CHARS)
+            ]
+        })
+        .to_string();
+        assert!(text.chars().count() > mode_config.max_response_chars);
+        let adapter = TextCompletionAdapter {
+            requests: Mutex::new(Vec::new()),
+            completion: Completion {
+                text,
+                finish_reason: CompletionFinishReason::Complete,
+            },
+        };
+
+        let response = textual_chat(
+            &mode_config,
+            &adapter,
+            fresh_selection_messages("assess now".into()),
+            vec![assessment_tool(&[candidate()], &EvidenceLedger::default())],
+            256,
+        )
+        .await
+        .expect("bounded assessment fields may exceed the legacy completion limit");
+        validate_response_size(&response.message, mode_config.max_response_chars)
+            .expect("assessment should remain within the structured planner bound");
+    }
+
+    #[tokio::test]
+    async fn textual_mode_rejects_ambiguous_and_malformed_responses() {
         let mut mode_config = config();
         let operation = assessment_tool(&[candidate()], &EvidenceLedger::default());
         let messages = fresh_selection_messages("assess now".into());
@@ -1676,16 +1715,18 @@ mod tests {
         let oversized = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
-                text: "{\"x\":1}".into(),
+                text: format!(r#"{{"x":"{}"}}"#, "x".repeat(40)),
                 finish_reason: CompletionFinishReason::Complete,
             },
         };
+        let response = textual_chat(&mode_config, &oversized, messages, vec![operation], 256)
+            .await
+            .expect("textual transport should use the shared planner response bound");
         assert!(
-            textual_chat(&mode_config, &oversized, messages, vec![operation], 256,)
-                .await
+            validate_response_size(&response.message, mode_config.max_response_chars)
                 .unwrap_err()
                 .to_string()
-                .contains("max_response_chars")
+                .contains("bounded limit")
         );
     }
 
