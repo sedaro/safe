@@ -238,7 +238,13 @@ impl CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         telemetry: &TelemetryFrame,
     ) -> anyhow::Result<()> {
-        let PlanningOutcome::Schedule(plan) = self.build_plan(telemetry).await? else {
+        let outcome = self.build_plan(telemetry).await?;
+        let simulation_count = match &outcome {
+            PlanningOutcome::NoBoardChange => 1,
+            PlanningOutcome::Schedule(_) => 2,
+        };
+        runtime.simulation_completed(simulation_count).await?;
+        let PlanningOutcome::Schedule(plan) = outcome else {
             info!("coorbital-evasion baseline is clear; no pointing change required");
             return Ok(());
         };

@@ -172,6 +172,7 @@ pub enum AutonomyModeOutput {
     Command(CommandEnvelope),
     Fault(String),
     CancelBoard { id: BoardCmdId, reason: String },
+    SimulationCompleted { count: u64 },
     Lifecycle { state: AutonomyModeLifecycle },
     Heartbeat,
 }

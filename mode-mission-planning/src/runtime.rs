@@ -90,6 +90,7 @@ impl MissionPlanningMode {
             run_schedule(&self.config, telemetry, accepted_commands.clone())
                 .await
                 .context("baseline simulation")?;
+        runtime.simulation_completed(1).await?;
         let samples = extract_planning_samples(&self.config, &baseline_result)?;
         // The planning samples retain the needed values; release full EDS frames before validation.
         drop(baseline_result);
@@ -138,6 +139,9 @@ impl MissionPlanningMode {
         validate_candidate_schedule(&self.config, telemetry, validation_schedule)
             .await
             .context("candidate-command Monte Carlo validation")?;
+        runtime
+            .simulation_completed(validation_simulation_count as u64)
+            .await?;
 
         let command_count = candidates.len();
         for command in candidates {

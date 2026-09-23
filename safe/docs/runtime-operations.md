@@ -25,6 +25,11 @@ defaults to `/tmp/safe`.
     commands.csv
 ```
 
+`out/summary.json` is durable across SAFE restarts. In addition to telemetry
+and command counters, it contains `num_gatekeeper_simulations_completed` for
+gatekeeper EDS runs and `num_simulations_completed` for each mode. Mode counts
+are reported by the mode after its simulator runs complete.
+
 Logs are written beside the configured `logging.file_path` parent, not to a
 single file with exactly the configured filename. SAFE creates `default.log`
 and one `<mode-uuid>.log` file per mode. Each line is a JSON object containing
