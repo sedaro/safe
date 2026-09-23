@@ -5,16 +5,13 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::config::AllowedAction;
-use crate::config::{ConstraintKind, SimulationScenario, SimulationScenarioRole};
-
-pub(crate) const FINAL_SOC: &str = "final_state_of_charge";
-pub(crate) const MIN_SOC: &str = "minimum_state_of_charge";
-pub(crate) const MAX_SOC_DEGRADATION: &str = "maximum_state_of_charge_degradation";
+use crate::config::{
+    ConstraintKind, SimulationScenario, SimulationScenarioRole, SimulationViabilityConfig,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScenarioRunRequest {
     pub(crate) scenario_id: String,
-    pub(crate) modeled_action: Option<AllowedAction>,
     pub(crate) evidence_revision: u64,
     pub(crate) horizon_days: f64,
 }
@@ -42,8 +39,6 @@ pub(crate) trait ScenarioRunner: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PairedSimulation {
-    pub(crate) baseline: ScenarioRun,
-    pub(crate) recovery: ScenarioRun,
     pub(crate) thermal_benefit_verified: bool,
 }
 
@@ -53,6 +48,7 @@ pub(crate) async fn run_and_validate(
     runner: Arc<dyn ScenarioRunner>,
     baseline: &SimulationScenario,
     recovery: &SimulationScenario,
+    viability: &SimulationViabilityConfig,
     action: AllowedAction,
     evidence_revision: u64,
     horizon_days: f64,
@@ -72,9 +68,12 @@ pub(crate) async fn run_and_validate(
         bail!("baseline and recovery are not paired to the same frozen state and horizon");
     }
     for (metric_id, kind) in [
-        (FINAL_SOC, ConstraintKind::Minimum),
-        (MIN_SOC, ConstraintKind::Minimum),
-        (MAX_SOC_DEGRADATION, ConstraintKind::Maximum),
+        (viability.final_soc_metric.as_str(), ConstraintKind::Minimum),
+        (viability.min_soc_metric.as_str(), ConstraintKind::Minimum),
+        (
+            viability.max_soc_degradation_metric.as_str(),
+            ConstraintKind::Maximum,
+        ),
     ] {
         if !recovery
             .constraints
@@ -91,7 +90,6 @@ pub(crate) async fn run_and_validate(
     let baseline_run = runner
         .run(ScenarioRunRequest {
             scenario_id: baseline.id.clone(),
-            modeled_action: None,
             evidence_revision,
             horizon_days,
         })
@@ -99,7 +97,6 @@ pub(crate) async fn run_and_validate(
     let recovery_run = runner
         .run(ScenarioRunRequest {
             scenario_id: recovery.id.clone(),
-            modeled_action: Some(action),
             evidence_revision,
             horizon_days,
         })
@@ -107,25 +104,23 @@ pub(crate) async fn run_and_validate(
 
     validate_run(&baseline_run, &baseline.id, evidence_revision, horizon_days)?;
     validate_run(&recovery_run, &recovery.id, evidence_revision, horizon_days)?;
-    let baseline_final = required_metric(&baseline_run, FINAL_SOC)?;
-    let baseline_min = required_metric(&baseline_run, MIN_SOC)?;
-    let recovery_final = required_metric(&recovery_run, FINAL_SOC)?;
-    let recovery_min = required_metric(&recovery_run, MIN_SOC)?;
+    let baseline_final = required_metric(&baseline_run, &viability.final_soc_metric)?;
+    let baseline_min = required_metric(&baseline_run, &viability.min_soc_metric)?;
+    let recovery_final = required_metric(&recovery_run, &viability.final_soc_metric)?;
+    let recovery_min = required_metric(&recovery_run, &viability.min_soc_metric)?;
     let degradation = UnitMetric {
         value: (baseline_final.value - recovery_final.value)
             .max(baseline_min.value - recovery_min.value)
             .max(0.0),
         units: baseline_final.units.clone(),
     };
-    validate_constraints(recovery, &recovery_run, &degradation)?;
+    validate_constraints(recovery, &recovery_run, &degradation, viability)?;
     Ok(PairedSimulation {
         thermal_benefit_verified: recovery.thermal
             && recovery
                 .metrics
                 .iter()
-                .any(|metric| metric.quantity == "temperature"),
-        baseline: baseline_run,
-        recovery: recovery_run,
+                .any(|metric| metric.quantity == viability.temperature_quantity),
     })
 }
 
@@ -157,9 +152,10 @@ fn validate_constraints(
     scenario: &SimulationScenario,
     run: &ScenarioRun,
     degradation: &UnitMetric,
+    viability: &SimulationViabilityConfig,
 ) -> Result<()> {
     for constraint in &scenario.constraints {
-        let metric = if constraint.metric_id == MAX_SOC_DEGRADATION {
+        let metric = if constraint.metric_id == viability.max_soc_degradation_metric {
             degradation
         } else {
             run.metrics.get(&constraint.metric_id).ok_or_else(|| {
@@ -191,6 +187,10 @@ mod tests {
     use super::*;
     use crate::config::{SimulationConstraint, SimulationMetric};
     use std::sync::Mutex;
+
+    const FINAL_SOC: &str = "final_state_of_charge";
+    const MIN_SOC: &str = "minimum_state_of_charge";
+    const MAX_SOC_DEGRADATION: &str = "maximum_state_of_charge_degradation";
 
     struct FakeRunner {
         runs: Mutex<Vec<Result<ScenarioRun, String>>>,
@@ -300,6 +300,7 @@ mod tests {
             }),
             &scenario("baseline", SimulationScenarioRole::Baseline),
             &scenario("recovery", SimulationScenarioRole::Recovery),
+            &SimulationViabilityConfig::default(),
             AllowedAction::PointNadir,
             7,
             1.0,
@@ -330,6 +331,7 @@ mod tests {
                     }),
                     &baseline,
                     &recovery,
+                    &SimulationViabilityConfig::default(),
                     AllowedAction::PointNadir,
                     7,
                     1.0
@@ -347,6 +349,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0
@@ -361,6 +364,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0
@@ -381,6 +385,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointSunYaw,
                 7,
                 1.0
@@ -397,6 +402,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0

@@ -19,11 +19,13 @@ asks the LLM to complete a thermal assessment. Completion records `thermal_anoma
 `no_thermal_anomaly`, or `inconclusive`; a recovery action is optional and may
 only follow an anomaly assessment requesting recovery evaluation.
 
-Evidence is retained in a bounded, host-owned ledger across tool calls. Telemetry
+Evidence is retained in a configurable bounded, host-owned ledger across tool calls. Telemetry
 history is source-scoped and ignores duplicate or out-of-order timestamps for
 trend/persistence use. Board proposals and approvals are command intent, not
-execution acknowledgement. A telemetry or board update cancels pending work
-before it can submit a stale proposal.
+execution acknowledgement. Telemetry received during planning is coalesced for
+the next investigation. Board updates invalidate planning when
+`replanning.replan_on_board_change` is enabled. Final staleness checks prevent a
+proposal based on changed telemetry or board evidence.
 
 The EDS is intentionally used only for power and command-side-effect viability;
 it does not contain a thermal model and is not thermal evidence. Thermal
@@ -60,6 +62,7 @@ started by SAFE with the launch contract documented in
 
 ```json
 {
+  "schema_version": 1,
   "llm": {
     "adapter": {
       "kind": "ollama",
@@ -142,12 +145,37 @@ generation settings:
 | `llm.max_output_tokens` | `256` |
 | `llm.context_window_tokens` | `2048` |
 | `llm.context_safety_margin_tokens` | `256` |
-| `max_prompt_chars` | `1600` |
-| `max_response_chars` | `800` |
-| `max_decision_attempts` | `3` |
-| `max_feedback_chars` | `400` |
-| `require_board_snapshot` | `false` |
-| `decision_trace` | `false` |
+| `planner.max_turns` | `6` |
+| `planner.total_timeout_ms` | `120000` |
+| `planner.provider_attempts` | `1` |
+| `planner.provider_retry_backoff_ms` | `250` |
+| `planner.repair_attempts` | `3` |
+| `planner.limits.max_prompt_chars` | `1600` |
+| `planner.limits.max_response_chars` | `800` |
+| `planner.limits.response_size_multiplier` | `8` |
+| `planner.limits.tool_result_max_chars` | `2000` |
+| `planner.limits.context_tool_output_tokens` | `128` |
+| `planner.limits.assessment_rationale_max_chars` | `400` |
+| `planner.limits.assessment_uncertainty_max_chars` | `160` |
+| `planner.limits.forecast_risk_max_items` | `2` |
+| `planner.limits.forecast_risk_max_chars` | `100` |
+| `planner.limits.selection_reason_max_chars` | `200` |
+| `planner.limits.textual_assessment_rationale_max_chars` | `200` |
+| `planner.limits.textual_assessment_uncertainty_max_chars` | `100` |
+| `planner.limits.textual_selection_reason_max_chars` | `120` |
+| `evidence.max_items` | `16` |
+| `evidence.history_samples_per_source` | `8` |
+| `evidence.require_telemetry` | `true` |
+| `evidence.require_board` | `true` |
+| `replanning.require_board_snapshot` | `false` |
+| `replanning.replan_on_board_change` | `true` |
+| `replanning.failed_plan_retry_ms` | `0` (disabled) |
+| `observability.decision_trace` | `false` |
+| `observability.trace_max_chars` | `1000` |
+| `observability.candidate_value_max_chars` | `120` |
+| `observability.diagnostic_max_chars` | `240` |
+| `observability.simulation_trace_max_files` | `16` |
+| `observability.simulation_trace_max_fields` | `32` |
 
 The supported adapter kinds are:
 
@@ -221,8 +249,32 @@ The `safe-llm-adapter` crate exposes `LlmAdapter`, `LlmAdapterFactory`, and
 linked into the mode binary and registered at startup; runtime shared-library
 loading is not supported.
 
-`goal` and `analysis_instructions` also have safe default text and may be
-overridden to constrain the decision prompt.
+All mission-facing wording can be changed without recompiling under `prompts`:
+
+```json
+{
+  "prompts": {
+    "planner_instructions": "Build a mission-specific evidence-backed assessment.",
+    "assessment_instructions": "Treat persistent battery temperature excursions as thermal candidates.",
+    "selection_instructions": "Prefer the least disruptive eligible recovery.",
+    "multiple_calls_repair": "Use exactly the one operation currently offered.",
+    "selection_repair": "Retry with exact configured identifiers.",
+    "assessment_tool_description": "Complete this mission's thermal assessment.",
+    "telemetry_tool_description": "Read the newest SAFE telemetry evidence.",
+    "board_tool_description": "Read current command intent.",
+    "selection_tool_description": "Select one eligible recovery.",
+    "textual_transport_instructions": "Return only one compact JSON object.",
+    "textual_assessment_guide": "Emit all required assessment keys using exact IDs.",
+    "textual_selection_guide": "Emit all required selection keys using exact IDs.",
+    "textual_generic_guide": "Emit required keys before optional keys."
+  }
+}
+```
+
+The mode appends evidence, candidates, action IDs, JSON schemas, and fail-closed
+identifier rules in host code. Configurable prose cannot replace those safety
+contracts. `schema_version` is required and currently must be `1`; removed flat
+fields such as `goal`, `max_decision_attempts`, and `decision_trace` are rejected.
 
 `context_window_tokens` is the server's total context window, not a completion
 allowance. Before every native-tool request, the mode conservatively estimates
@@ -240,15 +292,13 @@ validation enforces these limits even when a provider ignores JSON Schema.
 
 ## Live Decision Trace
 
-For a terminal demo, set `decision_trace` to `true` in the mode's
+For a terminal demo, set `observability.decision_trace` to `true` in the mode's
 `mode_config`. The advisor emits a compact, ordered `LLM DEMO` trace for the
 configured candidates, each adapter request, the model's selected action and
 rationale, validation or repair attempts, and the command-board proposal. The
 trace is an auditable decision summary, not hidden model chain-of-thought.
 
-Use at least two actionable choices to exercise the adapter path. A single
-candidate with a single eligible action deliberately skips the model and the
-trace says so. This `mode_config` is a compact local-demo example:
+This `mode_config` is a compact local-demo example:
 
 ```json
 {
@@ -259,7 +309,8 @@ trace says so. This `mode_config` is a compact local-demo example:
     },
     "model": "mistral:7b"
   },
-  "decision_trace": true,
+  "schema_version": 1,
+  "observability": {"decision_trace": true},
   "action_catalog": [
     {"id": "point_sun_yaw", "description": "Point solar arrays toward the sun."},
     {"id": "point_nadir", "description": "Point the payload toward nadir."}
@@ -329,11 +380,10 @@ The advisor uses this decision matrix:
 | --- | --- |
 | No matching profile, missing field, invalid type, or normal telemetry | No candidate and no command. |
 | Candidates exist but none have eligible actions | No command. |
-| One actionable candidate with one eligible action | Emit that action deterministically. The LLM is not contacted. |
-| Multiple actionable candidates or one candidate with multiple actions | Ask the configured adapter to select one configured candidate and action. |
+| One or more actionable candidates | Ask the configured adapter to assess evidence before any recovery selection. |
 
 The same candidate set is not planned repeatedly until its signature changes.
-When `require_board_snapshot` is true, planning waits for the first board
+When `replanning.require_board_snapshot` is true, planning waits for the first board
 snapshot from SAFE. Telemetry is evaluated while the mode is inactive, but
 commands are planned only while the mode is active.
 
@@ -350,8 +400,6 @@ temperature, output-token limit, and request timeout. Ollama translates this to
 completions with strict JSON-schema response formatting.
 
 - `model`, chat `messages`, native `tools`, and `stream: false`.
-- `run_eds_simulation`, which accepts only a configured scenario ID and its
-  configured bounded numeric parameters.
 - `select_recovery_action`, which may choose only a frozen candidate and one of
   its eligible configured actions. Evidence is derived from that candidate.
 - Telemetry and command-board snapshots are host-collected before the first
@@ -372,17 +420,25 @@ scenarios. A scenario declares applicable nominal-rule IDs, allowed actions,
 duration, trusted constant or telemetry-derived patch bindings, optional bounded
 parameters, and compact numeric output metrics. The model never receives EDS
 paths, patches, raw frames, stdout, stderr, shell arguments, or filesystem paths.
-Each call creates an independent `SedaroSimulator` run. There is no cloud API.
+Post-selection validation creates independent baseline and recovery
+`SedaroSimulator` runs. `simulation.max_runs` must allow at least those two runs.
+There is no cloud API.
+
+`simulation.viability` configures the IDs used for final SOC, minimum SOC,
+maximum SOC degradation, and the quantity name that identifies temperature
+metrics. Its defaults are `final_state_of_charge`, `minimum_state_of_charge`,
+`maximum_state_of_charge_degradation`, and `temperature`.
 
 The adapter returns only normalized completion text and finish status. The mode
 then enforces the response size, strict JSON parsing, selected anomaly ID,
 eligible action, and exact evidence path. HTTP errors, timeouts, malformed
 responses, token-limit truncation, empty responses, oversized responses, and
-validation failures are retried up to `max_decision_attempts`. Parse and
-validation failures include bounded repair feedback.
+provider failures are retried up to `planner.provider_attempts`; malformed or
+invalid selections may consume up to `planner.repair_attempts`. Exhausting
+either budget fails closed.
 
 The telemetry and board tools are read-only. Their responses are bounded to
-2,000 characters and report `unavailable` until SAFE has broadcast the
+`planner.limits.tool_result_max_chars` characters and report `unavailable` until SAFE has broadcast the
 corresponding snapshot. They read the newest snapshot available at invocation
 time, but do not change the frozen candidate/action allow-list or bypass SAFE
 board and gatekeeper validation.
@@ -417,6 +473,7 @@ A minimal outer SAFE mode entry is:
     },
     "persist_work_dir": true,
     "mode_config": {
+      "schema_version": 1,
       "llm": {
         "adapter": {
           "kind": "ollama",

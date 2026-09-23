@@ -1,50 +1,15 @@
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use safe::mode_runtime::{ModeHandler, ModeRuntime};
-use safe::protocol::{AutonomyModeBoardState, Command, CommandEnvelope, TimedCommand};
+use safe::protocol::AutonomyModeBoardState;
 use safe::telemetry_frame::TelemetryFrame;
-use safe_llm_adapter::{CompletionFinishReason, CompletionRequest};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use serde_json::Value;
+use tracing::{info, warn};
 
-use crate::config::{AllowedAction, AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
+use crate::config::{AnomalyRecoveryModeConfig, NominalRule, NominalRuleKind};
 use crate::types::{AnomalyCandidate, AnomalyRecoveryMode, TelemetrySample};
-
-#[derive(Debug, Clone, Serialize)]
-struct DecisionEnvelope {
-    goal: String,
-    analysis_instructions: String,
-    board: BoardSummary,
-    candidates: Vec<AnomalyCandidate>,
-    action_catalog: Vec<ActionPromptEntry>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BoardSummary {
-    proposal_count: usize,
-    approved_proposals: usize,
-    rejected_proposals: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ActionPromptEntry {
-    id: AllowedAction,
-    description: String,
-    preconditions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AdvisorDecision {
-    anomaly_id: String,
-    action_id: String,
-    reason: String,
-    evidence_paths: Vec<String>,
-}
 
 enum RuleEvaluation {
     Normal,
@@ -54,8 +19,11 @@ enum RuleEvaluation {
 
 impl AnomalyRecoveryMode {
     fn log_decision_trace(&self, stage: &str, detail: impl std::fmt::Display) {
-        if self.config.decision_trace {
-            let detail = trace_text(&detail.to_string());
+        if self.config.observability.decision_trace {
+            let detail = trace_text(
+                &detail.to_string(),
+                self.config.observability.trace_max_chars,
+            );
             info!(decision_trace = true, stage, "LLM DEMO | {detail}");
         }
     }
@@ -78,360 +46,6 @@ impl AnomalyRecoveryMode {
             reason = %format!("{err:#}"),
             "anomaly recovery planning failed without emitting a command"
         );
-    }
-
-    fn build_board_summary(board: &AutonomyModeBoardState) -> BoardSummary {
-        BoardSummary {
-            proposal_count: board.proposals.len(),
-            approved_proposals: board.approved.len(),
-            rejected_proposals: board.rejected.len(),
-        }
-    }
-
-    fn action_prompt_entries(&self, candidates: &[AnomalyCandidate]) -> Vec<ActionPromptEntry> {
-        let eligible_actions = candidates
-            .iter()
-            .flat_map(|candidate| candidate.eligible_actions.iter().copied())
-            .collect::<HashSet<_>>();
-
-        self.config
-            .action_catalog
-            .iter()
-            .filter(|action| eligible_actions.contains(&action.id))
-            .map(|action| ActionPromptEntry {
-                id: action.id,
-                description: action.description.clone(),
-                preconditions: action.preconditions.clone(),
-            })
-            .collect()
-    }
-
-    fn build_decision_envelope(&self, candidates: Vec<AnomalyCandidate>) -> DecisionEnvelope {
-        DecisionEnvelope {
-            goal: self.config.goal.clone(),
-            analysis_instructions: self.config.analysis_instructions.clone(),
-            board: Self::build_board_summary(&self.latest_board_snapshot),
-            action_catalog: self.action_prompt_entries(&candidates),
-            candidates,
-        }
-    }
-
-    fn build_prompt(&self, envelope: &DecisionEnvelope, feedback: Option<&str>) -> Result<String> {
-        let mut prompt = String::new();
-        prompt.push_str("You are a constrained telemetry anomaly action selector.\n");
-        prompt.push_str(
-            "The supplied candidates are already established by configured nominal-profile rules. Do not reinterpret them as baseline observations.\n",
-        );
-        prompt.push_str("Choose exactly one candidate and exactly one action that candidate lists in eligible_actions.\n");
-        prompt.push_str("Copy the selected candidate's anomaly_id exactly; do not construct a new identifier.\n");
-        prompt.push_str("Return strict JSON only with this schema: ");
-        prompt.push_str(
-            "{\"anomaly_id\":string,\"action_id\":string,\"reason\":string,\"evidence_paths\":array<string>}.\n",
-        );
-        prompt.push_str(
-            "evidence_paths must contain exactly the selected candidate's path. No markdown or text outside JSON.\n",
-        );
-        if let Some(feedback) = feedback {
-            prompt.push_str("Previous attempt failed validation. Repair it using this feedback:\n");
-            prompt.push_str(feedback);
-            prompt.push('\n');
-        }
-        prompt.push_str("Decision envelope JSON: ");
-
-        let envelope_json = serde_json::to_string(envelope)?;
-        let remaining = self
-            .config
-            .max_prompt_chars
-            .checked_sub(prompt.chars().count())
-            .ok_or_else(|| anyhow!("prompt instructions exceed max_prompt_chars"))?;
-        if envelope_json.chars().count() > remaining {
-            return Err(anyhow!(
-                "decision envelope is {} characters but only {} remain in max_prompt_chars",
-                envelope_json.chars().count(),
-                remaining
-            ));
-        }
-        prompt.push_str(&envelope_json);
-        Ok(prompt)
-    }
-
-    fn build_repair_feedback(
-        &self,
-        stage: &str,
-        err: &anyhow::Error,
-        prior_response: &str,
-    ) -> String {
-        let feedback = format!(
-            "Failure stage: {stage}. Error: {err:#}. Previous response: {}",
-            clip_chars(prior_response, self.config.max_feedback_chars)
-        );
-        clip_chars(&feedback, self.config.max_feedback_chars)
-    }
-
-    async fn plan_decision_with_feedback_loop(
-        &self,
-        envelope: &DecisionEnvelope,
-    ) -> Result<AdvisorDecision> {
-        let mut feedback: Option<String> = None;
-        let max_attempts = self.config.max_decision_attempts as usize;
-
-        for attempt in 1..=max_attempts {
-            let prompt = self
-                .build_prompt(envelope, feedback.as_deref())
-                .map_err(|e| {
-                    anyhow!("attempt {attempt}/{max_attempts} build_prompt failed: {e:#}")
-                })?;
-
-            self.log_decision_trace(
-                "request",
-                format!(
-                    "attempt {attempt}/{max_attempts} | asking {} via {} to select one action from {} configured candidate(s)",
-                    self.config.llm.model,
-                    self.config.llm.adapter.kind,
-                    envelope.candidates.len(),
-                ),
-            );
-
-            let response_text = match self.query_model(&prompt).await {
-                Ok(response) => response,
-                Err(err) if attempt < max_attempts => {
-                    self.log_decision_trace(
-                        "retry",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | model request failed; retrying: {err:#}"
-                        ),
-                    );
-                    warn!(
-                        attempt,
-                        max_attempts,
-                        reason = %format!("{err:#}"),
-                        "anomaly recovery request failed; retrying"
-                    );
-                    feedback = None;
-                    continue;
-                }
-                Err(err) => {
-                    self.log_decision_trace(
-                        "failure",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | model request failed with no retries left: {err:#}"
-                        ),
-                    );
-                    return Err(anyhow!(
-                        "attempt {attempt}/{max_attempts} query failed: {err:#}"
-                    ));
-                }
-            };
-
-            warn!("LLM response: {response_text}");
-
-            let decision = match self.parse_advisor_decision(&response_text) {
-                Ok(decision) => {
-                    self.log_decision_trace(
-                        "response",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | model selected {} -> {} | rationale: {}",
-                            decision.anomaly_id, decision.action_id, decision.reason,
-                        ),
-                    );
-                    decision
-                }
-                Err(err) if attempt < max_attempts => {
-                    self.log_decision_trace(
-                        "repair",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | model reply was not valid decision JSON; requesting repair: {err:#}"
-                        ),
-                    );
-                    warn!(
-                        attempt,
-                        max_attempts,
-                        reason = %format!("{err:#}"),
-                        "anomaly recovery response failed parsing; requesting repair"
-                    );
-                    feedback = Some(self.build_repair_feedback(
-                        "parse_advisor_decision",
-                        &err,
-                        &response_text,
-                    ));
-                    continue;
-                }
-                Err(err) => {
-                    self.log_decision_trace(
-                        "failure",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | model reply was not valid decision JSON: {err:#}"
-                        ),
-                    );
-                    return Err(err);
-                }
-            };
-
-            if let Err(err) = self.evaluate_decision(&decision, &envelope.candidates) {
-                if attempt < max_attempts {
-                    self.log_decision_trace(
-                        "repair",
-                        format!(
-                            "attempt {attempt}/{max_attempts} | selection was outside the configured candidates or actions; requesting repair: {err:#}"
-                        ),
-                    );
-                    warn!(
-                        attempt,
-                        max_attempts,
-                        reason = %format!("{err:#}"),
-                        "anomaly recovery response failed validation; requesting repair"
-                    );
-                    feedback =
-                        Some(self.build_repair_feedback("evaluate_decision", &err, &response_text));
-                    continue;
-                }
-                self.log_decision_trace(
-                    "failure",
-                    format!("attempt {attempt}/{max_attempts} | selection was rejected: {err:#}"),
-                );
-                return Err(err);
-            }
-
-            self.log_decision_trace(
-                "validation",
-                format!(
-                    "attempt {attempt}/{max_attempts} | accepted {} -> {}; evidence path is allowed",
-                    decision.anomaly_id, decision.action_id,
-                ),
-            );
-
-            info!(
-                attempt,
-                max_attempts,
-                anomaly_id = %decision.anomaly_id,
-                action_id = %decision.action_id,
-                "anomaly recovery selected a configured anomaly action"
-            );
-            return Ok(decision);
-        }
-
-        Err(anyhow!("anomaly recovery exhausted decision attempts"))
-    }
-
-    async fn query_model(&self, prompt: &str) -> Result<String> {
-        let adapter = self
-            .adapter
-            .as_ref()
-            .ok_or_else(|| anyhow!("anomaly recovery LLM adapter has not been configured"))?;
-        let request_start = Instant::now();
-
-        info!(
-            adapter = adapter.kind(),
-            model = %self.config.llm.model,
-            timeout_ms = self.config.llm.request_timeout_ms,
-            prompt_chars = prompt.chars().count(),
-            "anomaly recovery sending constrained LLM request"
-        );
-
-        let completion = adapter
-            .complete(CompletionRequest {
-                prompt: prompt.to_string(),
-                response_schema: decision_response_schema(),
-                model: self.config.llm.model.clone(),
-                temperature: self.config.llm.response_temperature,
-                max_output_tokens: self.config.llm.max_output_tokens,
-                timeout: Duration::from_millis(self.config.llm.request_timeout_ms),
-            })
-            .await
-            .map_err(|error| anyhow!("{} adapter request failed: {error}", adapter.kind()))?;
-        if completion.finish_reason == CompletionFinishReason::Length {
-            return Err(anyhow!(
-                "{} response stopped at token limit",
-                adapter.kind()
-            ));
-        }
-
-        info!(
-            elapsed_ms = request_start.elapsed().as_millis() as u64,
-            response_chars = completion.text.chars().count(),
-            "anomaly recovery completed constrained LLM request"
-        );
-        debug!(
-            adapter = adapter.kind(),
-            finish_reason = ?completion.finish_reason,
-            "anomaly recovery received normalized LLM completion"
-        );
-
-        let response_text = completion.text.trim();
-        if response_text.is_empty() {
-            return Err(anyhow!("{} response was empty", adapter.kind()));
-        }
-        if response_text.chars().count() > self.config.max_response_chars {
-            return Err(anyhow!(
-                "{} response exceeded max_response_chars ({})",
-                adapter.kind(),
-                self.config.max_response_chars
-            ));
-        }
-        Ok(response_text.to_string())
-    }
-
-    fn parse_advisor_decision(&self, response_text: &str) -> Result<AdvisorDecision> {
-        serde_json::from_str(response_text.trim())
-            .map_err(|e| anyhow!("could not parse strict advisor decision JSON: {e}"))
-    }
-
-    fn evaluate_decision<'a>(
-        &self,
-        decision: &AdvisorDecision,
-        candidates: &'a [AnomalyCandidate],
-    ) -> Result<(&'a AnomalyCandidate, AllowedAction)> {
-        if decision.anomaly_id.trim().is_empty() || decision.action_id.trim().is_empty() {
-            return Err(anyhow!("anomaly_id and action_id must not be empty"));
-        }
-        if decision.reason.trim().is_empty() {
-            return Err(anyhow!("reason must not be empty"));
-        }
-
-        let candidate = candidates
-            .iter()
-            .find(|candidate| {
-                candidate.anomaly_id == decision.anomaly_id
-                    || candidate.rule_id == decision.anomaly_id
-            })
-            .ok_or_else(|| {
-                let supplied = candidates
-                    .iter()
-                    .map(|candidate| candidate.anomaly_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow!(
-                    "anomaly_id '{}' was not supplied; choose one of [{supplied}]",
-                    decision.anomaly_id
-                )
-            })?;
-        if decision.evidence_paths != vec![candidate.path.clone()] {
-            return Err(anyhow!(
-                "evidence_paths must exactly equal ['{}'] for anomaly '{}'",
-                candidate.path,
-                candidate.anomaly_id
-            ));
-        }
-
-        let action = candidate
-            .eligible_actions
-            .iter()
-            .copied()
-            .find(|action| action.as_str() == decision.action_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "action_id '{}' is not eligible for anomaly '{}'",
-                    decision.action_id,
-                    candidate.anomaly_id
-                )
-            })?;
-        if self.config.action_definition(action).is_none() {
-            return Err(anyhow!(
-                "action_id '{}' is not in the action catalog",
-                decision.action_id
-            ));
-        }
-        Ok((candidate, action))
     }
 
     fn evaluate_rule(rule: &NominalRule, observed: &Value) -> RuleEvaluation {
@@ -615,10 +229,21 @@ impl AnomalyRecoveryMode {
         let Some(task) = self.planning_task.take_if(|task| task.is_finished()) else {
             return;
         };
-        if let Err(error) = task.await
-            && !error.is_cancelled()
-        {
-            warn!(reason = %error, "anomaly recovery planning task failed");
+        match task.await {
+            Ok(Ok(())) => self.next_plan_retry = None,
+            Ok(Err(error)) => {
+                warn!(reason = %error, "anomaly recovery planning task failed");
+                if self.config.replanning.failed_plan_retry_ms > 0 {
+                    self.next_plan_retry = Some(
+                        Instant::now()
+                            + Duration::from_millis(self.config.replanning.failed_plan_retry_ms),
+                    );
+                }
+            }
+            Err(error) if !error.is_cancelled() => {
+                warn!(reason = %error, "anomaly recovery planning task failed");
+            }
+            Err(_) => {}
         }
         self.planning_cancel = None;
     }
@@ -629,7 +254,10 @@ impl AnomalyRecoveryMode {
         sample: TelemetrySample,
     ) -> Result<()> {
         self.latest_telemetry = Some(sample.clone());
-        self.live_context.update_telemetry(sample.clone());
+        self.live_context.update_telemetry(
+            sample.clone(),
+            self.config.evidence.history_samples_per_source,
+        );
         self.evaluate_static_profile(&sample);
 
         if runtime.is_active() {
@@ -638,44 +266,8 @@ impl AnomalyRecoveryMode {
         Ok(())
     }
 
-    async fn emit_action(
-        &self,
-        runtime: &mut ModeRuntime,
-        candidate: &AnomalyCandidate,
-        action: AllowedAction,
-        reason: &str,
-    ) -> Result<()> {
-        let command = command_for_action(action)?;
-        runtime
-            .command(CommandEnvelope {
-                from: runtime.mode_id(),
-                cmd: TimedCommand::Now(command),
-            })
-            .await?;
-        info!(
-            profile_id = %candidate.profile_id,
-            anomaly_id = %candidate.anomaly_id,
-            source = %candidate.source,
-            ts_mono = candidate.ts_mono,
-            action_id = action.as_str(),
-            evidence_path = %candidate.path,
-            reason = %reason,
-            "anomaly recovery emitted profile-backed anomaly action"
-        );
-        self.log_decision_trace(
-            "proposal",
-            format!(
-                "submitted {} for {} ({}) to the SAFE command board",
-                action.as_str(),
-                candidate.anomaly_id,
-                candidate.path,
-            ),
-        );
-        Ok(())
-    }
-
     async fn plan_current_candidates(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
-        if self.config.require_board_snapshot && !self.has_board_snapshot {
+        if self.config.replanning.require_board_snapshot && !self.has_board_snapshot {
             if !self.warned_missing_board_snapshot {
                 warn!("anomaly recovery waiting for initial board snapshot before planning");
                 self.warned_missing_board_snapshot = true;
@@ -696,7 +288,7 @@ impl AnomalyRecoveryMode {
             return Ok(());
         }
 
-        if self.config.decision_trace {
+        if self.config.observability.decision_trace {
             self.log_decision_trace(
                 "candidates",
                 format!(
@@ -721,7 +313,10 @@ impl AnomalyRecoveryMode {
                         "{} | {}={} | expected {} | actions: {}",
                         candidate.anomaly_id,
                         candidate.path,
-                        clip_chars(&candidate.observed.to_string(), 120),
+                        clip_chars(
+                            &candidate.observed.to_string(),
+                            self.config.observability.candidate_value_max_chars,
+                        ),
                         candidate.expectation,
                         actions,
                     ),
@@ -758,26 +353,13 @@ impl AnomalyRecoveryMode {
             telemetry_version: self.live_context.snapshot().telemetry_version,
             board_version: self.live_context.snapshot().board_version,
         };
-        self.planning_task = Some(tokio::spawn(async move {
-            if let Err(error) = crate::planner::run(request).await {
-                warn!(reason = %error, "anomaly recovery background planning failed without emitting a command");
-            }
-        }));
+        self.planning_task = Some(tokio::spawn(
+            async move { crate::planner::run(request).await },
+        ));
         self.planning_cancel = Some(cancel);
         self.last_plan_signature = Some(signature);
+        self.next_plan_retry = None;
         Ok(())
-    }
-}
-
-fn command_for_action(action: AllowedAction) -> Result<Command> {
-    match action {
-        AllowedAction::PointNadir => Ok(Command::PointNadir),
-        AllowedAction::PointSunYaw => Ok(Command::PointSunYaw),
-        AllowedAction::ThrusterOff => Ok(Command::ThrusterOff),
-        AllowedAction::CaptureImage | AllowedAction::Noop => Err(anyhow!(
-            "action '{}' is not supported for anomaly recommendations",
-            action.as_str()
-        )),
     }
 }
 
@@ -793,24 +375,6 @@ pub(crate) fn value_at_payload_path<'a>(payload: &'a Value, path: &str) -> Optio
         })
 }
 
-fn decision_response_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["anomaly_id", "action_id", "reason", "evidence_paths"],
-        "properties": {
-            "anomaly_id": {"type": "string"},
-            "action_id": {"type": "string"},
-            "reason": {"type": "string"},
-            "evidence_paths": {
-                "type": "array",
-                "minItems": 1,
-                "items": {"type": "string"}
-            }
-        }
-    })
-}
-
 fn clip_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -818,9 +382,9 @@ fn clip_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
-fn trace_text(input: &str) -> String {
+fn trace_text(input: &str, max_chars: usize) -> String {
     let mut output = String::new();
-    for character in input.chars().take(1_000) {
+    for character in input.chars().take(max_chars) {
         match character {
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
@@ -860,6 +424,7 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         self.has_board_snapshot = false;
         self.last_plan_signature = None;
         self.warned_missing_board_snapshot = false;
+        self.next_plan_retry = None;
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
         self.stop_planning();
@@ -918,18 +483,19 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         self.has_board_snapshot = true;
         self.live_context.update_board(board.clone());
         self.latest_board_snapshot = board;
-        // Board intent can explain, conflict with, or duplicate recovery. It always invalidates a pending decision.
-        self.stop_planning();
-        self.last_plan_signature = None;
-        if runtime.is_active()
-            && let Err(err) = self.plan_current_candidates(runtime).await
-        {
-            self.log_planning_error(
-                "on_board_snapshot",
-                "plan_current_candidates",
-                &err,
-                self.latest_telemetry.as_ref(),
-            );
+        if self.config.replanning.replan_on_board_change {
+            self.stop_planning();
+            self.last_plan_signature = None;
+            if runtime.is_active()
+                && let Err(err) = self.plan_current_candidates(runtime).await
+            {
+                self.log_planning_error(
+                    "on_board_snapshot",
+                    "plan_current_candidates",
+                    &err,
+                    self.latest_telemetry.as_ref(),
+                );
+            }
         }
         Ok(())
     }
@@ -941,6 +507,10 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         }
         if let Some(sample) = self.pending_telemetry.take() {
             self.accept_telemetry(runtime, sample).await?;
+        } else if self.next_plan_retry.is_some_and(|at| Instant::now() >= at) {
+            self.last_plan_signature = None;
+            self.next_plan_retry = None;
+            self.plan_current_candidates(runtime).await?;
         }
         Ok(())
     }
@@ -956,10 +526,10 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use safe_llm_adapter::{AdapterError, AdapterRegistry, Completion, LlmAdapter};
+    use crate::config::AllowedAction;
+    use safe_llm_adapter::AdapterRegistry;
+    use serde_json::json;
 
     const PROFILE_FIXTURE: &str = include_str!("../testdata/static_nominal_profile.json");
     const TELEMETRY_FIXTURE: &str = include_str!("../testdata/static_nominal_telemetry.jsonl");
@@ -969,26 +539,6 @@ mod tests {
         let mut mode = AnomalyRecoveryMode::new(AdapterRegistry::with_builtin_adapters());
         mode.set_config(config).expect("fixture should validate");
         mode
-    }
-
-    struct RecordingAdapter {
-        requests: Arc<Mutex<Vec<CompletionRequest>>>,
-        completion: Completion,
-    }
-
-    #[async_trait::async_trait]
-    impl LlmAdapter for RecordingAdapter {
-        fn kind(&self) -> &'static str {
-            "recording"
-        }
-
-        async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
-            self.requests
-                .lock()
-                .expect("request lock should not be poisoned")
-                .push(request);
-            Ok(self.completion.clone())
-        }
     }
 
     fn sample(ts_mono: u64, payload: Value) -> TelemetrySample {
@@ -1004,12 +554,12 @@ mod tests {
         let mut mode = configured_mode();
         let frozen = sample(1, json!({"telemetry":{"temperature_c":50.0}}));
         mode.latest_telemetry = Some(frozen.clone());
-        mode.live_context.update_telemetry(frozen);
+        mode.live_context.update_telemetry(frozen, 8);
         let generation = mode
             .planning_generation
             .load(std::sync::atomic::Ordering::Acquire);
         mode.planning_task = Some(tokio::spawn(async {
-            std::future::pending::<()>().await;
+            std::future::pending::<Result<()>>().await
         }));
 
         assert!(mode.defer_telemetry_while_planning(sample(
@@ -1037,7 +587,7 @@ mod tests {
         let mut mode = configured_mode();
         mode.pending_telemetry = Some(sample(2, json!({"telemetry":{}})));
         mode.planning_cancel = Some(safe_sim::CancellationToken::new());
-        mode.planning_task = Some(tokio::spawn(async {}));
+        mode.planning_task = Some(tokio::spawn(async { Ok(()) }));
         tokio::task::yield_now().await;
 
         mode.reap_finished_plan().await;
@@ -1153,19 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn strict_parser_rejects_wrapped_text() {
-        let mode = configured_mode();
-        assert!(mode
-            .parse_advisor_decision(
-                "preface {\"anomaly_id\":\"mode_invalid\",\"action_id\":\"point_nadir\",\"reason\":\"x\",\"evidence_paths\":[\"telemetry.mode\"]}"
-            )
-            .is_err());
-    }
-
-    #[test]
     fn decision_trace_text_is_single_line_and_bounded() {
         let input = format!("line one\nline two\t{}", "x".repeat(1_000));
-        let trace = trace_text(&input);
+        let trace = trace_text(&input, 1_000);
         assert_eq!(trace, format!("line one\\nline two\\t{}", "x".repeat(982)));
         assert!(!trace.contains('\n'));
     }
@@ -1178,102 +718,5 @@ mod tests {
             Some(&serde_json::json!(21.0))
         );
         assert!(value_at_payload_path(&payload, "sensors.1.temperature_c").is_none());
-    }
-
-    #[test]
-    fn decision_must_select_configured_candidate_action_and_evidence() {
-        let mut mode = configured_mode();
-        mode.evaluate_static_profile(&sample(
-            1,
-            serde_json::json!({"telemetry": {"temperature_c": 20.0, "mode": "unknown", "enabled": true}}),
-        ));
-        let candidates = mode
-            .current_candidates
-            .iter()
-            .filter(|candidate| !candidate.eligible_actions.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        let valid = AdvisorDecision {
-            anomaly_id: candidates[0].anomaly_id.clone(),
-            action_id: "point_nadir".to_string(),
-            reason: "Configured mode rule is violated.".to_string(),
-            evidence_paths: vec!["telemetry.mode".to_string()],
-        };
-        assert!(mode.evaluate_decision(&valid, &candidates).is_ok());
-
-        let legacy_rule_id = AdvisorDecision {
-            anomaly_id: "mode_invalid".to_string(),
-            ..valid.clone()
-        };
-        assert!(mode.evaluate_decision(&legacy_rule_id, &candidates).is_ok());
-
-        let invalid = AdvisorDecision {
-            action_id: "thruster_off".to_string(),
-            ..valid
-        };
-        assert!(mode.evaluate_decision(&invalid, &candidates).is_err());
-    }
-
-    #[test]
-    fn prompt_contains_only_profile_backed_candidates() {
-        let mut mode = configured_mode();
-        mode.evaluate_static_profile(&sample(
-            1,
-            serde_json::json!({"telemetry": {"temperature_c": 20.0, "mode": "unknown", "enabled": true}}),
-        ));
-        let candidates = mode
-            .current_candidates
-            .iter()
-            .filter(|candidate| !candidate.eligible_actions.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        let prompt = mode
-            .build_prompt(&mode.build_decision_envelope(candidates), None)
-            .expect("prompt should build");
-        assert!(prompt.contains("example-v1-mode_invalid"));
-        assert!(prompt.contains("eligible_actions"));
-        assert!(!prompt.contains("telemetry_latest"));
-    }
-
-    #[tokio::test]
-    async fn generic_adapter_receives_constrained_completion_request() {
-        let mut mode = configured_mode();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        mode.adapter = Some(Arc::new(RecordingAdapter {
-            requests: Arc::clone(&requests),
-            completion: Completion {
-                text: "{}".to_string(),
-                finish_reason: CompletionFinishReason::Complete,
-            },
-        }));
-
-        assert_eq!(mode.query_model("test prompt").await.unwrap(), "{}");
-        let request = requests
-            .lock()
-            .expect("request lock should not be poisoned")
-            .pop()
-            .expect("adapter should receive a request");
-        assert_eq!(request.prompt, "test prompt");
-        assert_eq!(request.response_schema["required"][0], "anomaly_id");
-        assert_eq!(request.temperature, 0.0);
-        assert_eq!(request.max_output_tokens, 256);
-    }
-
-    #[tokio::test]
-    async fn truncated_completion_is_rejected_before_decision_parsing() {
-        let mut mode = configured_mode();
-        mode.adapter = Some(Arc::new(RecordingAdapter {
-            requests: Arc::new(Mutex::new(Vec::new())),
-            completion: Completion {
-                text: "{\"action_id\":\"point_nadir\"}".to_string(),
-                finish_reason: CompletionFinishReason::Length,
-            },
-        }));
-
-        let error = mode
-            .query_model("test prompt")
-            .await
-            .expect_err("truncated completions must not reach decision parsing");
-        assert!(error.to_string().contains("stopped at token limit"));
     }
 }
