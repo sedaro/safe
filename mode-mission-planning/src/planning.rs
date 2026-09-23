@@ -226,7 +226,7 @@ fn quaternion_to_ypr(x: f64, y: f64, z: f64, w: f64) -> (f64, f64, f64) {
     (
         roll * radians_to_degrees,
         pitch * radians_to_degrees,
-        yaw * radians_to_degrees,
+        -yaw * radians_to_degrees,
     )
 }
 
@@ -304,6 +304,26 @@ mod tests {
                 pitch_deg: 0.0,
                 yaw_deg: 0.0,
             }
+        ));
+    }
+
+    #[test]
+    fn quaternion_default_pointing_uses_flight_yaw_sign() {
+        let half_turn = (90.0_f64.to_radians() / 2.0).sin();
+        assert!(matches!(
+            default_pointing_command(&PointingConfig::Quaternion {
+                x: 0.0,
+                y: 0.0,
+                z: half_turn,
+                w: half_turn,
+            }),
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            } if roll_deg.abs() < 1.0e-12
+                && pitch_deg.abs() < 1.0e-12
+                && (yaw_deg + 90.0).abs() < 1.0e-12
         ));
     }
 
