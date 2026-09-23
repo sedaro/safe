@@ -12,6 +12,7 @@
     },
     "persist_work_dir": true,
     "mode_config": {
+      "schema_version": 1,
       "llm": {
         "adapter": {
           "kind": "ollama",
@@ -48,8 +49,7 @@
               "min_consecutive_samples": 2,
               "severity": "high",
               "eligible_actions": [
-                "point_sun_yaw",
-                "point_nadir"
+                "point_sun_yaw"
               ]
             }
           ]
@@ -57,20 +57,69 @@
       ],
 
       "simulation": {
-        "eds_path": "/Users/wdaughtridge/Downloads/bundle/eds",
+        "eds_path": "/path/to/eds/workspace",
         "max_runs": 2,
         "run_timeout_ms": 10000,
         "scenarios": [
           {
-            "id": "thermal_recovery",
-            "description": "Evaluate approved thermal-recovery postures.",
+            "id": "thermal_baseline",
+            "description": "Evaluate the frozen pre-recovery spacecraft state.",
             "applicable_rule_ids": ["temperature_high"],
-            "allowed_actions": [
-              "point_sun_yaw",
-              "point_nadir"
-            ],
+            "allowed_actions": ["point_sun_yaw"],
+            "role": "baseline",
             "duration_days": 0.05,
-
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
+            ],
+            "patches": [
+              {
+                "agent_id": "spacecraft",
+                "engine": "power",
+                "field": "root!.battery_temperature_c",
+                "type": "f64",
+                "telemetry_path": "telemetry.temperature_c"
+              }
+            ],
+            "metrics": [
+              {
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "state_of_charge",
+                "aggregation": "last"
+              },
+              {
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "state_of_charge",
+                "aggregation": "min"
+              }
+            ]
+          },
+          {
+            "id": "sun_yaw_thermal_recovery",
+            "description": "Evaluate the approved sun-yaw thermal recovery posture.",
+            "applicable_rule_ids": ["temperature_high"],
+            "allowed_actions": ["point_sun_yaw"],
+            "baseline_scenario_id": "thermal_baseline",
+            "modeled_action": "point_sun_yaw",
+            "role": "recovery",
+            "command_schedule_binding": "point_sun_yaw_at_start",
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
+            ],
+            "constraints": [
+              {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.3, "units": "fraction"},
+              {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+              {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+            ],
+            "thermal": true,
+            "duration_days": 0.05,
             "patches": [
               {
                 "agent_id": "spacecraft",
@@ -87,28 +136,33 @@
                 "value": 1.0
               }
             ],
-
             "parameters": [
-              {
-                "id": "thermal_gain",
-                "patch_index": 1,
-                "min": 0.8,
-                "max": 1.2
-              }
+              {"id": "thermal_gain", "patch_index": 1, "min": 0.8, "max": 1.2}
             ],
-
             "metrics": [
               {
                 "id": "peak_temperature_c",
+                "quantity": "temperature",
+                "units": "C",
                 "target_file": "spacecraft.power.jsonl",
                 "field": "battery_temperature_c",
                 "aggregation": "max"
               },
               {
-                "id": "final_temperature_c",
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
                 "target_file": "spacecraft.power.jsonl",
-                "field": "battery_temperature_c",
+                "field": "state_of_charge",
                 "aggregation": "last"
+              },
+              {
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "state_of_charge",
+                "aggregation": "min"
               }
             ]
           }

@@ -9,6 +9,8 @@ use serde_json::json;
 const MAX_OUTPUT_TOKENS: u32 = 2_048;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 2_048;
 const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u32 = 256;
+const CONFIG_SCHEMA_VERSION: u32 = 1;
+const MAX_CONFIGURED_TEXT_CHARS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -315,7 +317,33 @@ pub(crate) struct SimulationConfig {
     pub(crate) max_runs: u8,
     #[serde(default = "default_simulation_timeout_ms")]
     pub(crate) run_timeout_ms: u64,
+    #[serde(default)]
+    pub(crate) viability: SimulationViabilityConfig,
     pub(crate) scenarios: Vec<SimulationScenario>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationViabilityConfig {
+    #[serde(default = "default_final_soc_metric")]
+    pub(crate) final_soc_metric: String,
+    #[serde(default = "default_min_soc_metric")]
+    pub(crate) min_soc_metric: String,
+    #[serde(default = "default_max_soc_degradation_metric")]
+    pub(crate) max_soc_degradation_metric: String,
+    #[serde(default = "default_temperature_quantity")]
+    pub(crate) temperature_quantity: String,
+}
+
+impl Default for SimulationViabilityConfig {
+    fn default() -> Self {
+        Self {
+            final_soc_metric: default_final_soc_metric(),
+            min_soc_metric: default_min_soc_metric(),
+            max_soc_degradation_metric: default_max_soc_degradation_metric(),
+            temperature_quantity: default_temperature_quantity(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -391,24 +419,228 @@ impl Default for LlmConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnomalyRecoveryModeConfig {
-    pub(crate) llm: LlmConfig,
+pub(crate) struct PlannerLimitsConfig {
     #[serde(default = "default_max_prompt_chars")]
     pub(crate) max_prompt_chars: usize,
     #[serde(default = "default_max_response_chars")]
     pub(crate) max_response_chars: usize,
-    #[serde(default = "default_max_decision_attempts")]
-    pub(crate) max_decision_attempts: u8,
-    #[serde(default = "default_max_feedback_chars")]
-    pub(crate) max_feedback_chars: usize,
-    #[serde(default = "default_require_board_snapshot")]
+    #[serde(default = "default_response_size_multiplier")]
+    pub(crate) response_size_multiplier: usize,
+    #[serde(default = "default_tool_result_max_chars")]
+    pub(crate) tool_result_max_chars: usize,
+    #[serde(default = "default_context_tool_output_tokens")]
+    pub(crate) context_tool_output_tokens: u32,
+    #[serde(default = "default_assessment_rationale_max_chars")]
+    pub(crate) assessment_rationale_max_chars: usize,
+    #[serde(default = "default_assessment_uncertainty_max_chars")]
+    pub(crate) assessment_uncertainty_max_chars: usize,
+    #[serde(default = "default_forecast_risk_max_items")]
+    pub(crate) forecast_risk_max_items: usize,
+    #[serde(default = "default_forecast_risk_max_chars")]
+    pub(crate) forecast_risk_max_chars: usize,
+    #[serde(default = "default_selection_reason_max_chars")]
+    pub(crate) selection_reason_max_chars: usize,
+    #[serde(default = "default_textual_assessment_rationale_max_chars")]
+    pub(crate) textual_assessment_rationale_max_chars: usize,
+    #[serde(default = "default_textual_assessment_uncertainty_max_chars")]
+    pub(crate) textual_assessment_uncertainty_max_chars: usize,
+    #[serde(default = "default_textual_selection_reason_max_chars")]
+    pub(crate) textual_selection_reason_max_chars: usize,
+}
+
+impl Default for PlannerLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_prompt_chars: default_max_prompt_chars(),
+            max_response_chars: default_max_response_chars(),
+            response_size_multiplier: default_response_size_multiplier(),
+            tool_result_max_chars: default_tool_result_max_chars(),
+            context_tool_output_tokens: default_context_tool_output_tokens(),
+            assessment_rationale_max_chars: default_assessment_rationale_max_chars(),
+            assessment_uncertainty_max_chars: default_assessment_uncertainty_max_chars(),
+            forecast_risk_max_items: default_forecast_risk_max_items(),
+            forecast_risk_max_chars: default_forecast_risk_max_chars(),
+            selection_reason_max_chars: default_selection_reason_max_chars(),
+            textual_assessment_rationale_max_chars: default_textual_assessment_rationale_max_chars(
+            ),
+            textual_assessment_uncertainty_max_chars:
+                default_textual_assessment_uncertainty_max_chars(),
+            textual_selection_reason_max_chars: default_textual_selection_reason_max_chars(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlannerConfig {
+    #[serde(default = "default_max_turns")]
+    pub(crate) max_turns: u8,
+    #[serde(default = "default_total_timeout_ms")]
+    pub(crate) total_timeout_ms: u64,
+    #[serde(default = "default_provider_attempts")]
+    pub(crate) provider_attempts: u8,
+    #[serde(default = "default_provider_retry_backoff_ms")]
+    pub(crate) provider_retry_backoff_ms: u64,
+    #[serde(default = "default_repair_attempts")]
+    pub(crate) repair_attempts: u8,
+    #[serde(default)]
+    pub(crate) limits: PlannerLimitsConfig,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: default_max_turns(),
+            total_timeout_ms: default_total_timeout_ms(),
+            provider_attempts: default_provider_attempts(),
+            provider_retry_backoff_ms: default_provider_retry_backoff_ms(),
+            repair_attempts: default_repair_attempts(),
+            limits: PlannerLimitsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromptConfig {
+    #[serde(default = "default_planner_instructions")]
+    pub(crate) planner_instructions: String,
+    #[serde(default = "default_assessment_instructions")]
+    pub(crate) assessment_instructions: String,
+    #[serde(default = "default_selection_instructions")]
+    pub(crate) selection_instructions: String,
+    #[serde(default = "default_multiple_calls_repair")]
+    pub(crate) multiple_calls_repair: String,
+    #[serde(default = "default_selection_repair")]
+    pub(crate) selection_repair: String,
+    #[serde(default = "default_textual_transport_instructions")]
+    pub(crate) textual_transport_instructions: String,
+    #[serde(default = "default_textual_assessment_guide")]
+    pub(crate) textual_assessment_guide: String,
+    #[serde(default = "default_textual_selection_guide")]
+    pub(crate) textual_selection_guide: String,
+    #[serde(default = "default_textual_generic_guide")]
+    pub(crate) textual_generic_guide: String,
+    #[serde(default = "default_assessment_tool_description")]
+    pub(crate) assessment_tool_description: String,
+    #[serde(default = "default_telemetry_tool_description")]
+    pub(crate) telemetry_tool_description: String,
+    #[serde(default = "default_board_tool_description")]
+    pub(crate) board_tool_description: String,
+    #[serde(default = "default_selection_tool_description")]
+    pub(crate) selection_tool_description: String,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            planner_instructions: default_planner_instructions(),
+            assessment_instructions: default_assessment_instructions(),
+            selection_instructions: default_selection_instructions(),
+            multiple_calls_repair: default_multiple_calls_repair(),
+            selection_repair: default_selection_repair(),
+            textual_transport_instructions: default_textual_transport_instructions(),
+            textual_assessment_guide: default_textual_assessment_guide(),
+            textual_selection_guide: default_textual_selection_guide(),
+            textual_generic_guide: default_textual_generic_guide(),
+            assessment_tool_description: default_assessment_tool_description(),
+            telemetry_tool_description: default_telemetry_tool_description(),
+            board_tool_description: default_board_tool_description(),
+            selection_tool_description: default_selection_tool_description(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EvidenceConfig {
+    #[serde(default = "default_max_evidence_items")]
+    pub(crate) max_items: usize,
+    #[serde(default = "default_history_samples_per_source")]
+    pub(crate) history_samples_per_source: usize,
+    #[serde(default = "default_true")]
+    pub(crate) require_telemetry: bool,
+    #[serde(default = "default_true")]
+    pub(crate) require_board: bool,
+}
+
+impl Default for EvidenceConfig {
+    fn default() -> Self {
+        Self {
+            max_items: default_max_evidence_items(),
+            history_samples_per_source: default_history_samples_per_source(),
+            require_telemetry: true,
+            require_board: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplanningConfig {
+    #[serde(default)]
     pub(crate) require_board_snapshot: bool,
+    #[serde(default = "default_replan_on_board_change")]
+    pub(crate) replan_on_board_change: bool,
+    #[serde(default)]
+    pub(crate) failed_plan_retry_ms: u64,
+}
+
+impl Default for ReplanningConfig {
+    fn default() -> Self {
+        Self {
+            require_board_snapshot: false,
+            replan_on_board_change: default_replan_on_board_change(),
+            failed_plan_retry_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ObservabilityConfig {
     #[serde(default)]
     pub(crate) decision_trace: bool,
-    #[serde(default = "default_goal")]
-    pub(crate) goal: String,
-    #[serde(default = "default_analysis_instructions")]
-    pub(crate) analysis_instructions: String,
+    #[serde(default = "default_trace_max_chars")]
+    pub(crate) trace_max_chars: usize,
+    #[serde(default = "default_candidate_value_max_chars")]
+    pub(crate) candidate_value_max_chars: usize,
+    #[serde(default = "default_diagnostic_max_chars")]
+    pub(crate) diagnostic_max_chars: usize,
+    #[serde(default = "default_simulation_trace_max_files")]
+    pub(crate) simulation_trace_max_files: usize,
+    #[serde(default = "default_simulation_trace_max_fields")]
+    pub(crate) simulation_trace_max_fields: usize,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            decision_trace: false,
+            trace_max_chars: default_trace_max_chars(),
+            candidate_value_max_chars: default_candidate_value_max_chars(),
+            diagnostic_max_chars: default_diagnostic_max_chars(),
+            simulation_trace_max_files: default_simulation_trace_max_files(),
+            simulation_trace_max_fields: default_simulation_trace_max_fields(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnomalyRecoveryModeConfig {
+    pub(crate) schema_version: u32,
+    pub(crate) llm: LlmConfig,
+    #[serde(default)]
+    pub(crate) planner: PlannerConfig,
+    #[serde(default)]
+    pub(crate) prompts: PromptConfig,
+    #[serde(default)]
+    pub(crate) evidence: EvidenceConfig,
+    #[serde(default)]
+    pub(crate) replanning: ReplanningConfig,
+    #[serde(default)]
+    pub(crate) observability: ObservabilityConfig,
     #[serde(default)]
     pub(crate) action_catalog: Vec<ActionDefinition>,
     #[serde(default)]
@@ -419,16 +651,14 @@ pub(crate) struct AnomalyRecoveryModeConfig {
 
 impl AnomalyRecoveryModeConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            bail!("schema_version must be {CONFIG_SCHEMA_VERSION}");
+        }
         if self.nominal_profiles.is_empty() {
             bail!("anomaly recovery requires at least one nominal profile");
         }
         self.llm.validate()?;
-        if self.max_prompt_chars == 0 || self.max_response_chars == 0 {
-            bail!("prompt and response character limits must be greater than zero");
-        }
-        if self.max_decision_attempts == 0 {
-            bail!("max_decision_attempts must be greater than zero");
-        }
+        self.validate_runtime_settings()?;
         let mut action_ids = HashSet::new();
         for action in &self.action_catalog {
             if !action.id.is_recommendable() {
@@ -492,8 +722,20 @@ impl AnomalyRecoveryModeConfig {
             if simulation.eds_path.as_os_str().is_empty()
                 || simulation.max_runs < 2
                 || simulation.run_timeout_ms == 0
+                || simulation.scenarios.is_empty()
             {
                 bail!("simulation requires eds_path, max_runs >= 2, and run_timeout_ms > 0");
+            }
+            if [
+                &simulation.viability.final_soc_metric,
+                &simulation.viability.min_soc_metric,
+                &simulation.viability.max_soc_degradation_metric,
+                &simulation.viability.temperature_quantity,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            {
+                bail!("simulation viability metric and quantity names must not be empty");
             }
             let mut scenario_ids = HashSet::new();
             for scenario in &simulation.scenarios {
@@ -531,6 +773,18 @@ impl AnomalyRecoveryModeConfig {
                             action.as_str()
                         );
                     }
+                }
+                if scenario
+                    .allowed_actions
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != scenario.allowed_actions.len()
+                {
+                    bail!(
+                        "simulation scenario '{}': allowed actions must be unique",
+                        scenario.id
+                    );
                 }
                 let mut parameter_ids = HashSet::new();
                 for patch in &scenario.patches {
@@ -592,7 +846,7 @@ impl AnomalyRecoveryModeConfig {
                     && !scenario
                         .metrics
                         .iter()
-                        .any(|metric| metric.quantity == "temperature")
+                        .any(|metric| metric.quantity == simulation.viability.temperature_quantity)
                 {
                     bail!(
                         "thermal simulation scenario '{}' needs a temperature metric",
@@ -615,8 +869,10 @@ impl AnomalyRecoveryModeConfig {
                         scenario.id
                     );
                 }
+                let mut state_binding_ids = HashSet::new();
                 for binding in &scenario.state_bindings {
                     if binding.id.trim().is_empty()
+                        || !state_binding_ids.insert(binding.id.as_str())
                         || binding.source.trim().is_empty()
                         || validate_path(&binding.path).is_err()
                     {
@@ -632,6 +888,41 @@ impl AnomalyRecoveryModeConfig {
                         || !constraint.value.is_finite()
                     {
                         bail!("simulation scenario '{}': invalid constraint", scenario.id);
+                    }
+                    if constraint.metric_id != simulation.viability.max_soc_degradation_metric {
+                        let metric = scenario
+                            .metrics
+                            .iter()
+                            .find(|metric| metric.id == constraint.metric_id)
+                            .ok_or_else(|| anyhow!("simulation scenario '{}': constraint references unknown metric '{}'", scenario.id, constraint.metric_id))?;
+                        if metric.units != constraint.units {
+                            bail!(
+                                "simulation scenario '{}': constraint units do not match metric '{}'",
+                                scenario.id,
+                                constraint.metric_id
+                            );
+                        }
+                    }
+                }
+            }
+            for scenario in &simulation.scenarios {
+                if let Some(baseline_id) = &scenario.baseline_scenario_id {
+                    let baseline = simulation
+                        .scenarios
+                        .iter()
+                        .find(|candidate| candidate.id == *baseline_id)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "simulation scenario '{}': baseline '{}' is not configured",
+                                scenario.id,
+                                baseline_id
+                            )
+                        })?;
+                    if baseline.role != Some(SimulationScenarioRole::Baseline) {
+                        bail!(
+                            "simulation scenario '{}': associated baseline must have baseline role",
+                            scenario.id
+                        );
                     }
                 }
             }
@@ -656,19 +947,128 @@ impl AnomalyRecoveryModeConfig {
 impl Default for AnomalyRecoveryModeConfig {
     fn default() -> Self {
         Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
             llm: LlmConfig::default(),
-            max_prompt_chars: default_max_prompt_chars(),
-            max_response_chars: default_max_response_chars(),
-            max_decision_attempts: default_max_decision_attempts(),
-            max_feedback_chars: default_max_feedback_chars(),
-            require_board_snapshot: default_require_board_snapshot(),
-            decision_trace: false,
-            goal: default_goal(),
-            analysis_instructions: default_analysis_instructions(),
+            planner: PlannerConfig::default(),
+            prompts: PromptConfig::default(),
+            evidence: EvidenceConfig::default(),
+            replanning: ReplanningConfig::default(),
+            observability: ObservabilityConfig::default(),
             action_catalog: Vec::new(),
             nominal_profiles: Vec::new(),
             simulation: None,
         }
+    }
+}
+
+impl AnomalyRecoveryModeConfig {
+    fn validate_runtime_settings(&self) -> Result<()> {
+        let limits = &self.planner.limits;
+        if self.planner.max_turns == 0
+            || self.planner.total_timeout_ms == 0
+            || self.planner.provider_attempts == 0
+            || self.planner.repair_attempts == 0
+        {
+            bail!(
+                "planner turns, timeout, provider attempts, and repair attempts must be greater than zero"
+            );
+        }
+        let positive_limits = [
+            limits.max_prompt_chars,
+            limits.max_response_chars,
+            limits.response_size_multiplier,
+            limits.tool_result_max_chars,
+            limits.context_tool_output_tokens as usize,
+            limits.assessment_rationale_max_chars,
+            limits.assessment_uncertainty_max_chars,
+            limits.forecast_risk_max_items,
+            limits.forecast_risk_max_chars,
+            limits.selection_reason_max_chars,
+            limits.textual_assessment_rationale_max_chars,
+            limits.textual_assessment_uncertainty_max_chars,
+            limits.textual_selection_reason_max_chars,
+            self.evidence.max_items,
+            self.evidence.history_samples_per_source,
+            self.observability.trace_max_chars,
+            self.observability.candidate_value_max_chars,
+            self.observability.diagnostic_max_chars,
+            self.observability.simulation_trace_max_files,
+            self.observability.simulation_trace_max_fields,
+        ];
+        if positive_limits.contains(&0) {
+            bail!("planner, evidence, and observability limits must be greater than zero");
+        }
+        if self.planner.max_turns > 32
+            || self.planner.provider_attempts > 10
+            || self.planner.repair_attempts > 32
+            || self.planner.total_timeout_ms > 3_600_000
+            || self.planner.provider_retry_backoff_ms > 60_000
+            || positive_limits.iter().any(|value| *value > 1_000_000)
+        {
+            bail!("planner, evidence, or observability setting exceeds its safe upper bound");
+        }
+        if limits.context_tool_output_tokens > self.llm.max_output_tokens {
+            bail!(
+                "planner.limits.context_tool_output_tokens must not exceed llm.max_output_tokens"
+            );
+        }
+        if limits.textual_assessment_rationale_max_chars > limits.assessment_rationale_max_chars
+            || limits.textual_assessment_uncertainty_max_chars
+                > limits.assessment_uncertainty_max_chars
+            || limits.textual_selection_reason_max_chars > limits.selection_reason_max_chars
+        {
+            bail!("textual response limits must not exceed their planner response limits");
+        }
+        for (name, text) in [
+            ("planner_instructions", &self.prompts.planner_instructions),
+            (
+                "assessment_instructions",
+                &self.prompts.assessment_instructions,
+            ),
+            (
+                "selection_instructions",
+                &self.prompts.selection_instructions,
+            ),
+            ("multiple_calls_repair", &self.prompts.multiple_calls_repair),
+            ("selection_repair", &self.prompts.selection_repair),
+            (
+                "textual_transport_instructions",
+                &self.prompts.textual_transport_instructions,
+            ),
+            (
+                "textual_assessment_guide",
+                &self.prompts.textual_assessment_guide,
+            ),
+            (
+                "textual_selection_guide",
+                &self.prompts.textual_selection_guide,
+            ),
+            ("textual_generic_guide", &self.prompts.textual_generic_guide),
+            (
+                "assessment_tool_description",
+                &self.prompts.assessment_tool_description,
+            ),
+            (
+                "telemetry_tool_description",
+                &self.prompts.telemetry_tool_description,
+            ),
+            (
+                "board_tool_description",
+                &self.prompts.board_tool_description,
+            ),
+            (
+                "selection_tool_description",
+                &self.prompts.selection_tool_description,
+            ),
+        ] {
+            let chars = text.chars().count();
+            if text.trim().is_empty() || chars > MAX_CONFIGURED_TEXT_CHARS {
+                bail!(
+                    "prompts.{name} must contain 1 through {MAX_CONFIGURED_TEXT_CHARS} characters"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -693,6 +1093,18 @@ fn default_max_simulation_runs() -> u8 {
 fn default_simulation_timeout_ms() -> u64 {
     10_000
 }
+fn default_final_soc_metric() -> String {
+    "final_state_of_charge".to_string()
+}
+fn default_min_soc_metric() -> String {
+    "minimum_state_of_charge".to_string()
+}
+fn default_max_soc_degradation_metric() -> String {
+    "maximum_state_of_charge_degradation".to_string()
+}
+fn default_temperature_quantity() -> String {
+    "temperature".to_string()
+}
 
 fn default_model() -> String {
     "mistral:7b".to_string()
@@ -708,6 +1120,82 @@ fn default_enable_tool_calls() -> bool {
 
 fn default_max_prompt_chars() -> usize {
     1_600
+}
+
+fn default_response_size_multiplier() -> usize {
+    8
+}
+fn default_tool_result_max_chars() -> usize {
+    2_000
+}
+fn default_context_tool_output_tokens() -> u32 {
+    128
+}
+fn default_assessment_rationale_max_chars() -> usize {
+    400
+}
+fn default_assessment_uncertainty_max_chars() -> usize {
+    160
+}
+fn default_forecast_risk_max_items() -> usize {
+    2
+}
+fn default_forecast_risk_max_chars() -> usize {
+    100
+}
+fn default_selection_reason_max_chars() -> usize {
+    200
+}
+fn default_textual_assessment_rationale_max_chars() -> usize {
+    200
+}
+fn default_textual_assessment_uncertainty_max_chars() -> usize {
+    100
+}
+fn default_textual_selection_reason_max_chars() -> usize {
+    120
+}
+fn default_max_turns() -> u8 {
+    6
+}
+fn default_total_timeout_ms() -> u64 {
+    120_000
+}
+fn default_provider_attempts() -> u8 {
+    1
+}
+fn default_provider_retry_backoff_ms() -> u64 {
+    250
+}
+fn default_repair_attempts() -> u8 {
+    3
+}
+fn default_max_evidence_items() -> usize {
+    16
+}
+fn default_history_samples_per_source() -> usize {
+    8
+}
+fn default_true() -> bool {
+    true
+}
+fn default_replan_on_board_change() -> bool {
+    true
+}
+fn default_trace_max_chars() -> usize {
+    1_000
+}
+fn default_candidate_value_max_chars() -> usize {
+    120
+}
+fn default_diagnostic_max_chars() -> usize {
+    240
+}
+fn default_simulation_trace_max_files() -> usize {
+    16
+}
+fn default_simulation_trace_max_fields() -> usize {
+    32
 }
 
 fn default_max_response_chars() -> usize {
@@ -730,25 +1218,46 @@ fn default_context_safety_margin_tokens() -> u32 {
     DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
 }
 
-fn default_max_decision_attempts() -> u8 {
-    3
+fn default_planner_instructions() -> String {
+    "Build an evidence-backed assessment or select an eligible action when available.".to_string()
 }
-
-fn default_max_feedback_chars() -> usize {
-    400
+fn default_assessment_instructions() -> String {
+    "Assess the configured anomaly candidates using the supplied evidence.".to_string()
 }
-
-fn default_require_board_snapshot() -> bool {
-    false
+fn default_selection_instructions() -> String {
+    "Select only an action explicitly allowed by a supplied candidate.".to_string()
 }
-
-fn default_goal() -> String {
-    "Select a configured immediate action for detected telemetry anomalies.".to_string()
-}
-
-fn default_analysis_instructions() -> String {
-    "Treat the supplied anomaly candidates as established facts. Select only an action that the candidate explicitly allows."
+fn default_multiple_calls_repair() -> String {
+    "Use the only available tool now to complete the requested task with the supplied values."
         .to_string()
+}
+fn default_selection_repair() -> String {
+    "Retry select_recovery_action with a non-empty reason and exact configured IDs.".to_string()
+}
+fn default_textual_transport_instructions() -> String {
+    "Reply with exactly one compact JSON object containing only the operation arguments. Do not repeat or summarize the input. Do not include markdown or explanatory text.".to_string()
+}
+fn default_textual_assessment_guide() -> String {
+    "Emit required keys in this exact order: outcome, disposition, candidate_ids, evidence_ids, rationale, uncertainty. Use exact enum and ID values from the schema. Omit optional fields.".to_string()
+}
+fn default_textual_selection_guide() -> String {
+    "Emit required keys in this exact order: assessment_id, anomaly_id, action_id, reason. Use exact ID values from the schema.".to_string()
+}
+fn default_textual_generic_guide() -> String {
+    "Emit every required field before any optional field.".to_string()
+}
+fn default_assessment_tool_description() -> String {
+    "Complete the evidence-backed thermal assessment; this may finish without a recovery command"
+        .to_string()
+}
+fn default_telemetry_tool_description() -> String {
+    "Get the latest telemetry snapshot received from SAFE".to_string()
+}
+fn default_board_tool_description() -> String {
+    "Get the current command board snapshot received from SAFE".to_string()
+}
+fn default_selection_tool_description() -> String {
+    "Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation".to_string()
 }
 
 #[cfg(test)]
@@ -757,6 +1266,7 @@ mod tests {
 
     fn valid_config() -> AnomalyRecoveryModeConfig {
         serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
             "llm": {
                 "adapter": {
                     "kind": "ollama",
@@ -832,9 +1342,10 @@ mod tests {
     #[test]
     fn decision_trace_is_disabled_unless_requested() {
         let config = valid_config();
-        assert!(!config.decision_trace);
+        assert!(!config.observability.decision_trace);
 
         let config: AnomalyRecoveryModeConfig = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
             "llm": {
                 "adapter": {
                     "kind": "ollama",
@@ -842,7 +1353,7 @@ mod tests {
                 },
                 "model": "mistral:7b"
             },
-            "decision_trace": true,
+            "observability": {"decision_trace": true},
             "action_catalog": [
                 {"id": "point_sun_yaw", "description": "Point solar arrays at the sun."}
             ],
@@ -863,7 +1374,7 @@ mod tests {
             ]
         }))
         .expect("decision trace config should parse");
-        assert!(config.decision_trace);
+        assert!(config.observability.decision_trace);
         config
             .validate()
             .expect("decision trace config should validate");
@@ -923,11 +1434,32 @@ mod tests {
         );
     }
 
+    #[test]
     fn rejects_legacy_ollama_configuration() {
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/static_nominal_profile.json"))
                 .expect("fixture should parse");
         value["ollama_host"] = serde_json::json!("127.0.0.1");
+        assert!(serde_json::from_value::<AnomalyRecoveryModeConfig>(value).is_err());
+    }
+
+    #[test]
+    fn checked_in_autonomy_config_contains_a_valid_anomaly_mode_config() {
+        let entries: serde_json::Value =
+            serde_json::from_str(include_str!("../../safe/autonomy_mode_config.json"))
+                .expect("autonomy config should be JSON");
+        let value = entries[0]["mode_config"].clone();
+        let config: AnomalyRecoveryModeConfig =
+            serde_json::from_value(value).expect("anomaly mode config should match the schema");
+        config
+            .validate()
+            .expect("anomaly mode config should validate");
+    }
+
+    #[test]
+    fn rejects_removed_flat_planner_fields() {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["goal"] = serde_json::json!("legacy");
         assert!(serde_json::from_value::<AnomalyRecoveryModeConfig>(value).is_err());
     }
 }

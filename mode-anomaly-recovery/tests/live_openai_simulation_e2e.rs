@@ -38,13 +38,13 @@ async fn live_openai_tool_calls_run_assessment_and_post_selection_juno_viability
         .and_then(|entry| entry.get("mode_config"))
         .cloned()
         .expect("anomaly recovery mode config should be present");
-    mode_config["decision_trace"] = serde_json::json!(true);
-    mode_config["max_prompt_chars"] = serde_json::json!(1600);
+    mode_config["observability"]["decision_trace"] = serde_json::json!(true);
+    mode_config["planner"]["limits"]["max_prompt_chars"] = serde_json::json!(1600);
     mode_config["llm"]["max_output_tokens"] = serde_json::json!(256);
-    mode_config["goal"] = serde_json::json!(
+    mode_config["prompts"]["planner_instructions"] = serde_json::json!(
         "When the configured thermal anomaly is confirmed, request recovery evaluation for one eligible action so host code can validate command viability."
     );
-    mode_config["analysis_instructions"] = serde_json::json!(
+    mode_config["prompts"]["assessment_instructions"] = serde_json::json!(
         "After reading telemetry and board evidence, complete the assessment. For this persistent fake anomaly use thermal_anomaly with evaluate_recovery; do not use operator_review unless required evidence is unavailable."
     );
     let mode_id = AutonomyModeId(Uuid::from_u128(2));
