@@ -319,6 +319,8 @@ pub(crate) struct SimulationConfig {
     pub(crate) run_timeout_ms: u64,
     #[serde(default)]
     pub(crate) viability: SimulationViabilityConfig,
+    #[serde(default)]
+    pub(crate) initialization: Option<crate::eds_inputs::SimulationInitialization>,
     pub(crate) scenarios: Vec<SimulationScenario>,
 }
 
@@ -719,6 +721,12 @@ impl AnomalyRecoveryModeConfig {
         }
 
         if let Some(simulation) = &self.simulation {
+            if let Some(initialization) = &simulation.initialization {
+                initialization.validate()?;
+                if self.profile_for_source(&initialization.source).is_none() {
+                    bail!("simulation initialization source must match a nominal profile");
+                }
+            }
             if simulation.eds_path.as_os_str().is_empty()
                 || simulation.max_runs < 2
                 || simulation.run_timeout_ms == 0
@@ -739,6 +747,41 @@ impl AnomalyRecoveryModeConfig {
             }
             let mut scenario_ids = HashSet::new();
             for scenario in &simulation.scenarios {
+                if let Some(initialization) = &simulation.initialization {
+                    if scenario.state_bindings.is_empty()
+                        || scenario
+                            .state_bindings
+                            .iter()
+                            .any(|b| b.source != initialization.source)
+                    {
+                        bail!(
+                            "initialized scenario needs state bindings for the initialization source"
+                        );
+                    }
+                    match scenario.role {
+                        Some(SimulationScenarioRole::Baseline) => {
+                            if scenario.modeled_action.is_some()
+                                || scenario.command_schedule_binding.is_some()
+                            {
+                                bail!("baseline cannot specify a recovery command");
+                            }
+                        }
+                        Some(SimulationScenarioRole::Recovery) => {
+                            let binding = initialization.command_schedules.iter().find(|s| {
+                                Some(s.id.as_str()) == scenario.command_schedule_binding.as_deref()
+                            });
+                            if !scenario.modeled_action.is_some_and(|action| {
+                                scenario.allowed_actions.contains(&action)
+                                    && binding.is_some_and(|b| b.action_modes.contains_key(&action))
+                            }) {
+                                bail!(
+                                    "recovery scenario has no matching executable command schedule"
+                                );
+                            }
+                        }
+                        None => bail!("initialized scenarios require an explicit role"),
+                    }
+                }
                 if scenario.id.trim().is_empty()
                     || scenario.description.trim().is_empty()
                     || !scenario.duration_days.is_finite()
@@ -922,6 +965,21 @@ impl AnomalyRecoveryModeConfig {
                         bail!(
                             "simulation scenario '{}': associated baseline must have baseline role",
                             scenario.id
+                        );
+                    }
+                    if simulation.initialization.is_some()
+                        && (baseline.state_bindings != scenario.state_bindings
+                            || baseline.duration_days != scenario.duration_days
+                            || scenario
+                                .modeled_action
+                                .is_some_and(|a| !baseline.allowed_actions.contains(&a))
+                            || scenario
+                                .applicable_rule_ids
+                                .iter()
+                                .any(|id| !baseline.applicable_rule_ids.contains(id)))
+                    {
+                        bail!(
+                            "initialized recovery must share baseline state, horizon and rule applicability"
                         );
                     }
                 }

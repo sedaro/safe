@@ -412,6 +412,11 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     .find(|scenario| scenario.id == baseline_id)
                     .ok_or_else(|| anyhow!("recovery baseline scenario is not configured"))?;
                 let snapshot = request.live_context.snapshot();
+                if simulation.initialization.is_some() {
+                    // This initialization contract clears the bundled schedules;
+                    // it does not project existing command-board plans into EDS.
+                    require_empty_simulation_board(&snapshot)?;
+                }
                 let paired = run_and_validate(
                     Arc::new(SedaroScenarioRunner {
                         config: request.config.clone(),
@@ -1040,14 +1045,28 @@ async fn execute_scenario(
     parameters: &HashMap<String, f64>,
     _run_id: u8,
 ) -> Result<HashMap<String, f64>> {
+    let result = collect_scenario(config, scenario, telemetry, parameters).await?;
+    extract_metrics(scenario, &result)
+}
+
+pub(crate) async fn collect_scenario(
+    config: &AnomalyRecoveryModeConfig,
+    scenario: &SimulationScenario,
+    telemetry: &TelemetrySample,
+    parameters: &HashMap<String, f64>,
+) -> Result<SimulationResult> {
     let patches = build_patches(scenario, telemetry, parameters)?;
     let sim = config
         .simulation
         .as_ref()
         .ok_or_else(|| anyhow!("simulation is not configured"))?;
-    let simulator = SedaroSimulator::new(&sim.eds_path)
+    let prepared = crate::eds_inputs::prepare_inputs(sim, scenario, telemetry, patches)?;
+    let mut simulator = SedaroSimulator::new(&sim.eds_path)
         .timeout(Duration::from_millis(sim.run_timeout_ms))
-        .patch_multi(patches);
+        .patch_multi(prepared.patches);
+    if let Some(epoch) = prepared.epoch_mjd {
+        simulator = simulator.at_epoch(epoch);
+    }
     let result = simulator
         .run_collect(scenario.duration_days)
         .await
@@ -1060,7 +1079,7 @@ async fn execute_scenario(
     if config.observability.decision_trace {
         log_simulation_outputs(config, scenario, &result);
     }
-    extract_metrics(scenario, &result)
+    Ok(result)
 }
 
 fn log_simulation_outputs(
@@ -1255,6 +1274,20 @@ fn evaluate<'a>(
         bail!("final action is not configured");
     }
     Ok((candidate, action))
+}
+
+fn require_empty_simulation_board(snapshot: &crate::types::LiveContextSnapshot) -> Result<()> {
+    let board = snapshot
+        .board
+        .as_ref()
+        .ok_or_else(|| anyhow!("simulation requires a current command board"))?;
+    if !board.proposals.is_empty()
+        || !board.source_of_truth.is_empty()
+        || !board.approved.is_empty()
+    {
+        bail!("initialized recovery simulation cannot omit existing command-board plans");
+    }
+    Ok(())
 }
 
 fn board_conflicts_or_duplicates(
@@ -1893,6 +1926,40 @@ mod tests {
         .unwrap();
         assert_eq!(response.finish_reason, CompletionFinishReason::Length);
         assert!(response.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn standalone_simulation_requires_an_empty_known_command_board() {
+        let mut snapshot = crate::types::LiveContextSnapshot::default();
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board = Some(safe::protocol::AutonomyModeBoardState::default());
+        assert!(require_empty_simulation_board(&snapshot).is_ok());
+        let id = safe::protocol::BoardCmdId("existing".into());
+        snapshot
+            .board
+            .as_mut()
+            .unwrap()
+            .source_of_truth
+            .push(id.clone());
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board.as_mut().unwrap().source_of_truth.clear();
+        snapshot
+            .board
+            .as_mut()
+            .unwrap()
+            .approved
+            .insert(id.clone(), vec![]);
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board.as_mut().unwrap().approved.clear();
+        snapshot.board.as_mut().unwrap().proposals.insert(
+            id,
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                TimedCommand::Now(Command::CaptureImage),
+                1,
+            ),
+        );
+        assert!(require_empty_simulation_board(&snapshot).is_err());
     }
 
     #[test]
