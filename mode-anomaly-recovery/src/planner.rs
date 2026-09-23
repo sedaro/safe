@@ -876,17 +876,15 @@ async fn textual_chat(
         .pointer("/function/parameters")
         .cloned()
         .ok_or_else(|| anyhow!("textual JSON operation is missing a parameter schema"))?;
-    let mut prompt = messages
+    let input = messages
         .iter()
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    prompt.push_str(&format!(
-        "\nReturn only the JSON arguments for {name}. Do not include markdown or explanatory text."
-    ));
-    if prompt.chars().count() > config.max_prompt_chars {
-        bail!("textual JSON prompt exceeds max_prompt_chars");
-    }
+    let schema = serde_json::to_string(&response_schema)?;
+    let prompt = format!(
+        "Perform operation `{name}`. Reply with exactly one compact JSON object containing only its arguments. Do not repeat or summarize the input. Do not include markdown or explanatory text.\nArgument JSON Schema: {schema}\nInput: {input}\nJSON:"
+    );
 
     let completion = adapter
         .complete_json_object(CompletionRequest {
@@ -1588,10 +1586,15 @@ mod tests {
         );
         let requests = adapter.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        let prompt = &requests[0].prompt;
+        assert!(prompt.starts_with("Perform operation `complete_thermal_assessment`"));
+        assert!(prompt.contains("Do not repeat or summarize the input"));
+        assert!(prompt.contains("Argument JSON Schema: {\"additionalProperties\":false"));
+        assert!(prompt.contains("\"required\":[\"outcome\",\"disposition\""));
+        assert!(prompt.contains("Input: assess now\nJSON:"));
         assert!(
-            requests[0]
-                .prompt
-                .contains("Return only the JSON arguments for complete_thermal_assessment")
+            prompt.find("Argument JSON Schema:").unwrap() < prompt.find("Input:").unwrap(),
+            "the output contract should precede untrusted input"
         );
         assert_eq!(requests[0].response_schema["type"], "object");
     }
