@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "llm": {
+    "adapter": {"kind": "ollama", "config": {"endpoint": "http://127.0.0.1:11434/api/generate"}},
+    "model": "mistral:7b"
+  },
+  "action_catalog": [
+    {"id": "point_sun_yaw", "description": "Synthetic sun-pointing recovery."},
+    {"id": "point_nadir", "description": "Synthetic nadir-pointing recovery."}
+  ],
+  "nominal_profiles": [{
+    "id": "example", "source": "example",
+    "rules": [{"id": "hot", "path": "temperature_c", "kind": "number_range", "max": 60.0, "eligible_actions": ["point_sun_yaw", "point_nadir"]}]
+  }],
+  "simulation": {
+    "eds_path": "/path/to/eds/workspace",
+    "initialization": {
+      "source": "example",
+      "epoch_path": "augmented.time_mjd_utc",
+      "requirements": [
+        {"path": "augmented.state_of_charge", "min": 0.0, "max": 1.0},
+        {"path": "sensors.gyro_valid", "expected": true}
+      ],
+      "patches": [
+        {"agent_id": "spacecraft", "engine": "power", "field": "battery.soc", "type": "f64", "telemetry_path": "augmented.state_of_charge"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.position", "type": "#[f64; 3]", "telemetry_path": "augmented.position_eci_km"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.velocity", "type": "#[f64; 3]", "telemetry_path": "augmented.velocity_eci_km_s"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.attitude", "type": "#[f64; 4]", "telemetry_path": "augmented.body_to_eci_quaternion_xyzw"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.sun_eci", "type": "#[f64; 3]", "telemetry_path": "augmented.sun_eci_km"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.in_shadow", "type": "bool", "telemetry_path": "augmented.in_shadow"},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "root!.angular_velocity", "type": "#[f64; 3]", "telemetry_paths": ["sensors.gyro_deg_s.0", "sensors.gyro_deg_s.1", "sensors.gyro_deg_s.2"], "scale": 0.017453292519943295},
+        {"agent_id": "spacecraft", "engine": "gnc", "field": "wheel.speed", "type": "f64", "telemetry_path": "sensors.wheel_rpm", "scale": 0.10471975511965977},
+        {"agent_id": "spacecraft", "engine": "power", "field": "wheel.speed", "type": "f64", "telemetry_path": "sensors.wheel_rpm", "scale": 0.10471975511965977},
+        {"agent_id": "spacecraft", "engine": "cdh", "field": "controller.quaternion_schedule", "type": "[(f64, #[f64; 4])]", "value": []}
+      ],
+      "command_schedules": [{
+        "id": "pointing_schedule", "agent_id": "spacecraft", "engines": ["cdh", "gnc"], "field": "controller.mode_schedule",
+        "action_modes": {"point_sun_yaw": "sun_mode", "point_nadir": "nadir_mode"}
+      }]
+    },
+    "scenarios": [
+      {
+        "id": "baseline", "description": "Synthetic uncommanded baseline.",
+        "role": "baseline", "applicable_rule_ids": ["hot"], "allowed_actions": ["point_sun_yaw", "point_nadir"],
+        "duration_days": 0.001,
+        "state_bindings": [{"id": "soc", "source": "example", "path": "augmented.state_of_charge"}],
+        "metrics": [
+          {"id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last"},
+          {"id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min"}
+        ]
+      },
+      {
+        "id": "sun_recovery", "description": "Synthetic sun-pointing recovery.",
+        "role": "recovery", "applicable_rule_ids": ["hot"], "allowed_actions": ["point_sun_yaw"],
+        "baseline_scenario_id": "baseline", "modeled_action": "point_sun_yaw", "command_schedule_binding": "pointing_schedule",
+        "duration_days": 0.001,
+        "state_bindings": [{"id": "soc", "source": "example", "path": "augmented.state_of_charge"}],
+        "constraints": [
+          {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+          {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+          {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+        ],
+        "metrics": [
+          {"id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last"},
+          {"id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min"}
+        ]
+      },
+      {
+        "id": "nadir_recovery", "description": "Synthetic nadir-pointing recovery.",
+        "role": "recovery", "applicable_rule_ids": ["hot"], "allowed_actions": ["point_nadir"],
+        "baseline_scenario_id": "baseline", "modeled_action": "point_nadir", "command_schedule_binding": "pointing_schedule",
+        "duration_days": 0.001,
+        "state_bindings": [{"id": "soc", "source": "example", "path": "augmented.state_of_charge"}],
+        "constraints": [
+          {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+          {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+          {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+        ],
+        "metrics": [
+          {"id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last"},
+          {"id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min"}
+        ]
+      }
+    ]
+  }
+}
