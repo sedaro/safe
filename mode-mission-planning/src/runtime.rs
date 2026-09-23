@@ -103,7 +103,7 @@ impl MissionPlanningMode {
             self.power_saving,
         )?;
 
-        let candidates = plan
+        let mut candidates = plan
             .commands
             .into_iter()
             .filter(|candidate| {
@@ -114,6 +114,7 @@ impl MissionPlanningMode {
                 )
             })
             .collect::<Vec<_>>();
+        candidates = exclude_schedule_conflicts(candidates, &accepted_commands);
         if candidates.is_empty() {
             self.power_saving = plan.current_power_saving;
             self.emit(runtime, TimedCommand::NOOP).await?;
@@ -294,6 +295,35 @@ fn execution_time(command: &TimedCommand, current_gps_time: f64) -> f64 {
     }
 }
 
+/// The flight scheduler rejects imaging-program schedule transitions less than 20 seconds apart.
+/// Keep existing approved commands authoritative when composing a new plan.
+fn exclude_schedule_conflicts(
+    candidates: Vec<TimedCommand>,
+    accepted_commands: &[TimedCommand],
+) -> Vec<TimedCommand> {
+    const MIN_SCHEDULE_SEPARATION_SECS: f64 = 20.0;
+    let mut kept = accepted_commands.to_vec();
+    let mut filtered = Vec::new();
+    for candidate in candidates {
+        let candidate_time = match &candidate {
+            TimedCommand::Scheduled { gps_time, .. } => *gps_time,
+            TimedCommand::Now(_) | TimedCommand::NOOP => {
+                filtered.push(candidate);
+                continue;
+            }
+        };
+        let conflicts = kept.iter().any(|existing| {
+            matches!(existing, TimedCommand::Scheduled { gps_time, .. }
+                if (candidate_time - gps_time).abs() < MIN_SCHEDULE_SEPARATION_SECS)
+        });
+        if !conflicts {
+            kept.push(candidate.clone());
+            filtered.push(candidate);
+        }
+    }
+    filtered
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
@@ -339,5 +369,33 @@ mod tests {
         );
 
         assert!(!telemetry_is_not_ready(&error));
+    }
+
+    #[test]
+    fn schedule_conflicts_with_accepted_commands_are_excluded() {
+        let accepted = vec![TimedCommand::Scheduled {
+            cmd: Command::PointNadir,
+            gps_time: 100.0,
+        }];
+        let candidates = vec![
+            TimedCommand::Scheduled {
+                cmd: Command::CaptureImage,
+                gps_time: 110.0,
+            },
+            TimedCommand::Scheduled {
+                cmd: Command::CaptureImage,
+                gps_time: 120.0,
+            },
+        ];
+
+        let filtered = exclude_schedule_conflicts(candidates, &accepted);
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(
+            filtered.as_slice(),
+            [TimedCommand::Scheduled {
+                cmd: Command::CaptureImage,
+                gps_time,
+            }] if *gps_time == 120.0
+        ));
     }
 }

@@ -568,26 +568,15 @@ pub(crate) fn lift_boresight(
 
 fn lift_commands(samples: &[GeometrySample], commands: &[ModelCommand]) -> Vec<ScheduledPointing> {
     let mut result = Vec::with_capacity(commands.len());
-    let mut previous_quaternion = None;
-    let mut previous_was_nadir = false;
     for command in commands {
         let target = match command.target {
-            ModeledTarget::Nadir => {
-                previous_quaternion = None;
-                previous_was_nadir = true;
-                PointingTarget::Nadir
-            }
+            ModeledTarget::Nadir => PointingTarget::Nadir,
             ModeledTarget::Fixed(boresight) => {
-                let reference = if previous_was_nadir {
-                    nadir_reference(&samples[command.sample_index])
-                } else {
-                    previous_quaternion
-                        .unwrap_or(samples[command.sample_index].attitude_body_to_eci)
-                };
-                let quaternion = lift_boresight(&reference, boresight);
-                previous_quaternion = Some(quaternion);
-                previous_was_nadir = false;
-                PointingTarget::Quaternion(quaternion)
+                let reference = nadir_reference(&samples[command.sample_index]);
+                let attitude = lift_boresight(&reference, boresight);
+                // The flight controller command is an RPY offset from the moving
+                // Nadir/RAM reference, not an inertial Euler attitude.
+                PointingTarget::Quaternion(reference.inverse() * attitude)
             }
         };
         result.push(ScheduledPointing {
@@ -768,7 +757,7 @@ impl CoorbitalEvasionMode {
             }
         }
 
-        let modeled_boresights = modeled_boresights(
+        let modeled_path = modeled_boresights(
             &baseline,
             earliest,
             &commands,
@@ -776,7 +765,7 @@ impl CoorbitalEvasionMode {
         );
         let modeled_score = score_boresights(
             &baseline,
-            &modeled_boresights,
+            &modeled_path,
             earliest,
             baseline.len() - 1,
             fov_half_angle_rad,
@@ -798,6 +787,28 @@ impl CoorbitalEvasionMode {
             fov_half_angle_rad,
             &threat_ids,
         );
+        if validation.score.exposure_secs > 0.0 {
+            for (modeled, validated) in modeled_path.iter().zip(&validated_samples) {
+                if validated.time_mjd < baseline[earliest].time_mjd {
+                    continue;
+                }
+                let exposed = validated.threats.iter().any(|threat| {
+                    threat_is_within_range(threat, self.config.threat_max_range_km)
+                        && threat.line_of_sight
+                        && threat.in_field_of_view
+                });
+                if exposed {
+                    tracing::info!(
+                        time_mjd = validated.time_mjd,
+                        modeled_boresight = ?modeled,
+                        validated_boresight = ?validated.boresight_eci,
+                        modeled_to_validated_angle_deg = angle_between(modeled, &validated.boresight_eci.normalize()).to_degrees(),
+                        "coorbital-evasion compared model and finite-dynamics boresights during exposure"
+                    );
+                    break;
+                }
+            }
+        }
 
         Ok(PlanningOutcome::Schedule(CoorbitalEvasionPlan {
             earliest_command_mjd: baseline[earliest].time_mjd,
@@ -812,7 +823,7 @@ impl CoorbitalEvasionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ThreatGeometry;
+    use crate::types::{ThreatGeometry, quaternion_to_ypr, ypr_to_quaternion};
 
     fn sample(time_secs: f64, nadir: Vector3<f64>, threats: Vec<ThreatGeometry>) -> GeometrySample {
         GeometrySample {
@@ -1001,6 +1012,18 @@ mod tests {
                 .dot(&reference.quaternion().coords)
                 >= 0.0
         );
+    }
+
+    #[test]
+    fn lifted_rpy_is_relative_to_the_nadir_reference() {
+        let reference = UnitQuaternion::from_euler_angles(0.2, -0.4, 0.7);
+        let target = Vector3::new(0.4, -0.3, 0.866_025_403_784).normalize();
+        let attitude = lift_boresight(&reference, target);
+        let relative = reference.inverse() * attitude;
+        let (roll, pitch, yaw) = quaternion_to_ypr(&relative);
+        let reconstructed_attitude = reference * ypr_to_quaternion(roll, pitch, yaw);
+
+        assert_relative_eq(reconstructed_attitude * Vector3::z(), target);
     }
 
     #[test]

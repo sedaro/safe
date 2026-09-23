@@ -612,22 +612,47 @@ impl CoorbitalEvasionMode {
         threat_ids: &[String],
     ) -> anyhow::Result<Vec<GeometrySample>> {
         let sim_start_mjd = input.start_time_mjd;
-        let mut patches = input.patches.clone();
+        // Replace the adapter's pointing schedules for every engine it targets.
+        // The simulator uses the first duplicate patch, so leave one complete schedule
+        // per engine while preserving all unrelated adapter patches.
+        let mut schedule_engines = vec![self.config.schedule_patch_engine.clone()];
+        for patch in &input.patches {
+            if patch.agent_id == self.config.agent_id
+                && (patch.field == self.config.pointing_mode_schedule_field
+                    || patch.field == self.config.pointing_rpy_schedule_field)
+                && !schedule_engines.contains(&patch.engine)
+            {
+                schedule_engines.push(patch.engine.clone());
+            }
+        }
+        let mut patches = input
+            .patches
+            .iter()
+            .filter(|patch| {
+                patch.agent_id != self.config.agent_id
+                    || !schedule_engines.contains(&patch.engine)
+                    || (patch.field != self.config.pointing_mode_schedule_field
+                        && patch.field != self.config.pointing_rpy_schedule_field)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         patches.extend(self.mode_patches(telemetry, threat_ids)?);
-        patches.push(EdsPatch::new(
-            &self.config.agent_id,
-            &self.config.schedule_patch_engine,
-            &self.config.pointing_mode_schedule_field,
-            POINTING_MODE_SCHEDULE_TYPE,
-            &Self::serialize_mode_schedule(&schedule.mode_schedule),
-        ));
-        patches.push(EdsPatch::new(
-            &self.config.agent_id,
-            &self.config.schedule_patch_engine,
-            &self.config.pointing_rpy_schedule_field,
-            POINTING_RPY_SCHEDULE_TYPE,
-            &Self::serialize_rpy_schedule(&schedule.rpy_schedule),
-        ));
+        for engine in schedule_engines {
+            patches.push(EdsPatch::new(
+                &self.config.agent_id,
+                &engine,
+                &self.config.pointing_mode_schedule_field,
+                POINTING_MODE_SCHEDULE_TYPE,
+                &Self::serialize_mode_schedule(&schedule.mode_schedule),
+            ));
+            patches.push(EdsPatch::new(
+                &self.config.agent_id,
+                &engine,
+                &self.config.pointing_rpy_schedule_field,
+                POINTING_RPY_SCHEDULE_TYPE,
+                &Self::serialize_rpy_schedule(&schedule.rpy_schedule),
+            ));
+        }
         let simulator = safe_sim::SedaroSimulator::new(&self.config.eds_path)
             .at_epoch(sim_start_mjd)
             .timeout(Duration::from_secs(self.config.simulation_timeout_secs))

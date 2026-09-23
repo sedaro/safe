@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::config::CoorbitalEvasionModeConfig;
 use crate::types::{
     CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget, ScheduledPointing,
-    quaternion_to_ypr,
+    quaternion_to_ypr, ypr_to_quaternion,
 };
 
 impl CoorbitalEvasionMode {
@@ -74,11 +74,7 @@ impl CoorbitalEvasionMode {
                 },
                 PointingTarget::Quaternion(target),
             ) => {
-                let existing = UnitQuaternion::from_euler_angles(
-                    roll_deg.to_radians(),
-                    pitch_deg.to_radians(),
-                    yaw_deg.to_radians(),
-                );
+                let existing = ypr_to_quaternion(*roll_deg, *pitch_deg, *yaw_deg);
                 let dot = existing
                     .quaternion()
                     .coords
@@ -152,6 +148,10 @@ impl CoorbitalEvasionMode {
             let keep = if is_accepted {
                 Self::selected_target_at(plan, time_mjd)
                     .is_some_and(|target| self.command_matches_target(cmd, target))
+                    || plan
+                        .commands
+                        .iter()
+                        .any(|planned| self.scheduled_command_matches(timed_command, planned))
             } else {
                 plan.commands
                     .iter()
@@ -298,7 +298,9 @@ impl CoorbitalEvasionMode {
             return;
         }
         match self.maybe_plan(runtime, telemetry).await {
-            Ok(()) => self.last_replan_start = Some(Instant::now()),
+            Ok(()) => {
+                self.last_replan_start = Some(Instant::now());
+            }
             Err(error) if telemetry_is_not_ready(&error) => {}
             Err(error) => {
                 warn!("coorbital-evasion planning failed: {error:#}");

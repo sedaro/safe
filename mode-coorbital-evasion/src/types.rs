@@ -56,11 +56,23 @@ pub(crate) enum PointingTarget {
 pub(crate) fn quaternion_to_ypr(quaternion: &UnitQuaternion<f64>) -> (f64, f64, f64) {
     let (roll, pitch, yaw) = quaternion.euler_angles();
     let radians_to_degrees = 180.0 / std::f64::consts::PI;
+    // The flight controller applies RPY as reference * yaw(-Z) * pitch(Y) * roll(X).
+    // Flight yaw therefore has the opposite sign to a right-hand Z rotation.
     (
         roll * radians_to_degrees,
         pitch * radians_to_degrees,
-        yaw * radians_to_degrees,
+        -yaw * radians_to_degrees,
     )
+}
+
+pub(crate) fn ypr_to_quaternion(
+    roll_deg: f64,
+    pitch_deg: f64,
+    yaw_deg: f64,
+) -> UnitQuaternion<f64> {
+    UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -yaw_deg.to_radians())
+        * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), pitch_deg.to_radians())
+        * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), roll_deg.to_radians())
 }
 
 #[derive(Debug, Clone, PartialEq)]
