@@ -288,12 +288,16 @@ pub(crate) async fn journal_exceeds_limits(
 pub struct SafeTEAAutonomyModeSummary {
     pub num_approved_commands: u128,
     pub num_rejected_commands: u128,
+    #[serde(default)]
+    pub num_simulations_completed: u128,
     pub last_approved_command_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafeTEASummary {
     pub num_telemetry_received: u128,
+    #[serde(default)]
+    pub num_gatekeeper_simulations_completed: u128,
     pub autonomy_mode_summary: HashMap<AutonomyModeId, SafeTEAAutonomyModeSummary>,
     pub last_telemetry_time: Option<String>,
 }
@@ -565,6 +569,7 @@ impl SafeTEA {
             &runtime_paths.summary,
             SafeTEASummary {
                 num_telemetry_received: 0,
+                num_gatekeeper_simulations_completed: 0,
                 autonomy_mode_summary: HashMap::new(),
                 last_telemetry_time: None,
             },
@@ -1013,7 +1018,15 @@ impl SafeTEA {
                 maybe_gk = self.gatekeeper_output_rx.recv() => {
                     if let Some(gk_out) = maybe_gk {
                         match gk_out {
-                            GatekeeperAdapterOutput::Approve { request_id, details } => {
+                            GatekeeperAdapterOutput::Approve {
+                                request_id,
+                                details,
+                                simulation_count,
+                            } => {
+                                self.summary.num_gatekeeper_simulations_completed = self
+                                    .summary
+                                    .num_gatekeeper_simulations_completed
+                                    .saturating_add(u128::from(simulation_count));
                                 let Some(batch) = self.pending_gatekeeper_batches.remove(&request_id) else {
                                     info!("ignoring gatekeeper approval for unknown request_id={request_id}");
                                     continue;
@@ -1047,6 +1060,7 @@ impl SafeTEA {
                                                 .or_insert(SafeTEAAutonomyModeSummary {
                                                     num_approved_commands: 0,
                                                     num_rejected_commands: 0,
+                                                    num_simulations_completed: 0,
                                                     last_approved_command_time: None,
                                                 });
                                             summary.num_approved_commands += 1;
@@ -1067,7 +1081,15 @@ impl SafeTEA {
 
                                 self.request_gatekeeper_for_pending_batch().await;
                             }
-                            GatekeeperAdapterOutput::Reject { request_id, reason } => {
+                            GatekeeperAdapterOutput::Reject {
+                                request_id,
+                                reason,
+                                simulation_count,
+                            } => {
+                                self.summary.num_gatekeeper_simulations_completed = self
+                                    .summary
+                                    .num_gatekeeper_simulations_completed
+                                    .saturating_add(u128::from(simulation_count));
                                 let Some(batch) = self.pending_gatekeeper_batches.remove(&request_id) else {
                                     info!("ignoring gatekeeper rejection for unknown request_id={request_id}");
                                     continue;
@@ -1104,6 +1126,7 @@ impl SafeTEA {
                                                 .or_insert(SafeTEAAutonomyModeSummary {
                                                     num_approved_commands: 0,
                                                     num_rejected_commands: 0,
+                                                    num_simulations_completed: 0,
                                                     last_approved_command_time: None,
                                                 });
                                             summary.num_rejected_commands += 1;
@@ -1215,6 +1238,7 @@ impl SafeTEA {
                                         .or_insert(SafeTEAAutonomyModeSummary {
                                             num_approved_commands: 0,
                                             num_rejected_commands: 0,
+                                            num_simulations_completed: 0,
                                             last_approved_command_time: None,
                                         });
                                     summary.num_rejected_commands += 1;
@@ -1237,6 +1261,19 @@ impl SafeTEA {
 
                             self.next_seq += 1;
                             self.logical_ts += 1;
+                        }
+                        AutonomyModeOutput::SimulationCompleted { count } => {
+                            let summary = self.summary.autonomy_mode_summary.entry(pid).or_insert(
+                                SafeTEAAutonomyModeSummary {
+                                    num_approved_commands: 0,
+                                    num_rejected_commands: 0,
+                                    num_simulations_completed: 0,
+                                    last_approved_command_time: None,
+                                },
+                            );
+                            summary.num_simulations_completed = summary
+                                .num_simulations_completed
+                                .saturating_add(u128::from(count));
                         }
                         AutonomyModeOutput::Command(env) => {
                             self.flight.set_last_planned_autonomy_mode(env.from);

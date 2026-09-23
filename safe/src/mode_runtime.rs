@@ -110,6 +110,11 @@ impl ModeRuntime {
         })
         .await
     }
+
+    pub async fn simulation_completed(&mut self, count: u64) -> Result<()> {
+        self.send_output(AutonomyModeOutput::SimulationCompleted { count })
+            .await
+    }
 }
 
 #[async_trait]

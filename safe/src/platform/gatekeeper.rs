@@ -19,8 +19,16 @@ pub enum GatekeeperAdapterInput {
 
 #[derive(Debug, Clone)]
 pub enum GatekeeperAdapterOutput {
-    Approve { request_id: u64, details: String },
-    Reject { request_id: u64, reason: String },
+    Approve {
+        request_id: u64,
+        details: String,
+        simulation_count: u64,
+    },
+    Reject {
+        request_id: u64,
+        reason: String,
+        simulation_count: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +63,18 @@ enum GatekeeperWireInput {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum GatekeeperWireOutput {
-    Approve { request_id: u64, details: String },
-    Reject { request_id: u64, reason: String },
+    Approve {
+        request_id: u64,
+        details: String,
+        #[serde(default)]
+        simulation_count: u64,
+    },
+    Reject {
+        request_id: u64,
+        reason: String,
+        #[serde(default)]
+        simulation_count: u64,
+    },
 }
 
 pub fn spawn_gatekeeper_adapter(
@@ -79,6 +97,7 @@ pub fn spawn_gatekeeper_adapter(
                             .send(GatekeeperAdapterOutput::Approve {
                                 request_id,
                                 details: "gatekeeper disabled".to_string(),
+                                simulation_count: 0,
                             })
                             .await;
                     }
@@ -159,11 +178,13 @@ async fn external_gatekeeper_adapter(
                 Ok(GatekeeperWireOutput::Approve {
                     request_id,
                     details,
+                    simulation_count,
                 }) => {
                     if out_tx_reader
                         .send(GatekeeperAdapterOutput::Approve {
                             request_id,
                             details,
+                            simulation_count,
                         })
                         .await
                         .is_err()
@@ -171,9 +192,17 @@ async fn external_gatekeeper_adapter(
                         break;
                     }
                 }
-                Ok(GatekeeperWireOutput::Reject { request_id, reason }) => {
+                Ok(GatekeeperWireOutput::Reject {
+                    request_id,
+                    reason,
+                    simulation_count,
+                }) => {
                     if out_tx_reader
-                        .send(GatekeeperAdapterOutput::Reject { request_id, reason })
+                        .send(GatekeeperAdapterOutput::Reject {
+                            request_id,
+                            reason,
+                            simulation_count,
+                        })
                         .await
                         .is_err()
                     {

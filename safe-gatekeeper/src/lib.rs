@@ -329,7 +329,7 @@ impl Gatekeeper {
 
     /// Runs the exact adapter state first, then evaluates randomized scalar
     /// perturbations independently of the required nominal result.
-    async fn run_analysis(&self, input: SimulationInputResponse) -> anyhow::Result<String> {
+    async fn run_analysis(&self, input: SimulationInputResponse) -> anyhow::Result<(String, u64)> {
         if !self.config.sim_duration_days.is_finite() || self.config.sim_duration_days <= 0.0 {
             anyhow::bail!(
                 "gatekeeper sim_duration_days must be finite and > 0, got {}",
@@ -366,13 +366,14 @@ impl Gatekeeper {
             .run_simulation(input.start_time_mjd, input.patches.clone())
             .await
             .context("nominal simulation failed")?;
+        let mut simulation_count = 1;
         let nominal_details = match self.evaluate(&nominal_result)? {
             CheckOutcome::Passed(details) => details,
             CheckOutcome::Failed(reason) => anyhow::bail!("Nominal simulation rejected: {reason}"),
         };
 
         let Some(config) = &self.config.monte_carlo else {
-            return Ok(nominal_details);
+            return Ok((nominal_details, simulation_count));
         };
         let cases = monte_carlo_cases.context("Monte Carlo cases were not generated")?;
 
@@ -389,6 +390,7 @@ impl Gatekeeper {
                 .run_simulation(input.start_time_mjd, case.patches)
                 .await
                 .with_context(|| format!("Monte Carlo case '{}' failed", case.id))?;
+            simulation_count += 1;
             match self
                 .evaluate(&result)
                 .with_context(|| format!("Monte Carlo case '{}' could not be evaluated", case.id))?
@@ -423,9 +425,12 @@ impl Gatekeeper {
             );
         }
 
-        Ok(format!(
-            "{nominal_details}; Monte Carlo passed {passed}/{} cases ({pass_fraction:.3}, required {:.3}, seed={})",
-            config.samples, config.minimum_pass_fraction, config.seed
+        Ok((
+            format!(
+                "{nominal_details}; Monte Carlo passed {passed}/{} cases ({pass_fraction:.3}, required {:.3}, seed={})",
+                config.samples, config.minimum_pass_fraction, config.seed
+            ),
+            simulation_count,
         ))
     }
 
@@ -450,6 +455,7 @@ impl Gatekeeper {
                             .send(GatekeeperOutput::Reject {
                                 request_id,
                                 reason: "No telemetry available yet".to_string(),
+                                simulation_count: 0,
                             })
                             .await;
                         continue;
@@ -474,26 +480,30 @@ impl Gatekeeper {
                     let out = match request {
                         Ok(request) => match self.build_simulation_input(&request).await {
                             Ok(input) => match self.run_analysis(input).await {
-                                Ok(details) => GatekeeperOutput::Approve {
+                                Ok((details, simulation_count)) => GatekeeperOutput::Approve {
                                     request_id,
                                     details: format!(
                                         "{details}; batch_size={}",
                                         candidate_command_ids.len()
                                     ),
+                                    simulation_count,
                                 },
                                 Err(error) => GatekeeperOutput::Reject {
                                     request_id,
                                     reason: format!("Simulation rejected: {error:#}"),
+                                    simulation_count: 0,
                                 },
                             },
                             Err(error) => GatekeeperOutput::Reject {
                                 request_id,
                                 reason: format!("Simulation error: {error:#}"),
+                                simulation_count: 0,
                             },
                         },
                         Err(error) => GatekeeperOutput::Reject {
                             request_id,
                             reason: format!("Simulation input error: {error:#}"),
+                            simulation_count: 0,
                         },
                     };
 
@@ -584,9 +594,34 @@ mod tests {
         let output = out_rx.recv().await.unwrap();
         assert!(matches!(
             output,
-            GatekeeperOutput::Reject { request_id: 7, reason }
+            GatekeeperOutput::Reject {
+                request_id: 7,
+                reason,
+                simulation_count: 0,
+            }
                 if reason == "No telemetry available yet"
         ));
+    }
+
+    #[tokio::test]
+    async fn analysis_rejects_before_running_eds_when_validation_fails() {
+        let gatekeeper = Gatekeeper::new(GatekeeperConfig {
+            sim_duration_days: 0.0,
+            ..GatekeeperConfig::default()
+        });
+        let input = SimulationInputResponse {
+            start_time_mjd: 60000.0,
+            patches: Vec::new(),
+        };
+
+        let result = gatekeeper.run_analysis(input).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("sim_duration_days")
+        );
     }
 
     #[test]

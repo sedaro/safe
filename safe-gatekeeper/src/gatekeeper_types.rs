@@ -195,8 +195,16 @@ pub enum GatekeeperInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GatekeeperOutput {
-    Approve { request_id: u64, details: String },
-    Reject { request_id: u64, reason: String },
+    Approve {
+        request_id: u64,
+        details: String,
+        simulation_count: u64,
+    },
+    Reject {
+        request_id: u64,
+        reason: String,
+        simulation_count: u64,
+    },
 }
 
 /// One self-contained simulation scenario sent to the mission-specific input

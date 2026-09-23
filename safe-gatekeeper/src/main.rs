@@ -20,8 +20,16 @@ enum WireInput {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireOutput {
-    Approve { request_id: u64, details: String },
-    Reject { request_id: u64, reason: String },
+    Approve {
+        request_id: u64,
+        details: String,
+        simulation_count: u64,
+    },
+    Reject {
+        request_id: u64,
+        reason: String,
+        simulation_count: u64,
+    },
 }
 
 #[tokio::main]
@@ -71,11 +79,27 @@ async fn main() -> anyhow::Result<()> {
             maybe_out = out_rx.recv() => {
                 let Some(out) = maybe_out else { break; };
                 let wire = match out {
-                    GatekeeperOutput::Approve { request_id, details } => {
-                        WireOutput::Approve { request_id, details }
+                    GatekeeperOutput::Approve {
+                        request_id,
+                        details,
+                        simulation_count,
+                    } => {
+                        WireOutput::Approve {
+                            request_id,
+                            details,
+                            simulation_count,
+                        }
                     }
-                    GatekeeperOutput::Reject { request_id, reason } => {
-                        WireOutput::Reject { request_id, reason }
+                    GatekeeperOutput::Reject {
+                        request_id,
+                        reason,
+                        simulation_count,
+                    } => {
+                        WireOutput::Reject {
+                            request_id,
+                            reason,
+                            simulation_count,
+                        }
                     }
                 };
                 stdout.write_all(serde_json::to_string(&wire)?.as_bytes()).await?;
