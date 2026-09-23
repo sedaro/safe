@@ -37,6 +37,9 @@ const MAX_FORECAST_RISKS: usize = 2;
 const MAX_FORECAST_RISK_CHARS: usize = 100;
 const MAX_SELECTION_REASON_CHARS: usize = 200;
 const CONTEXT_TOOL_OUTPUT_TOKENS: u32 = 128;
+const TEXTUAL_ASSESSMENT_RATIONALE_CHARS: usize = 200;
+const TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS: usize = 100;
+const TEXTUAL_SELECTION_REASON_CHARS: usize = 120;
 
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
@@ -872,10 +875,34 @@ async fn textual_chat(
         .pointer("/function/name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("textual JSON operation is missing a name"))?;
-    let response_schema = tool
+    let mut response_schema = tool
         .pointer("/function/parameters")
         .cloned()
         .ok_or_else(|| anyhow!("textual JSON operation is missing a parameter schema"))?;
+    let output_guide = match name {
+        "complete_thermal_assessment" => {
+            let properties = response_schema
+                .pointer_mut("/properties")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| anyhow!("assessment operation is missing object properties"))?;
+            properties["rationale"]["maxLength"] = json!(TEXTUAL_ASSESSMENT_RATIONALE_CHARS);
+            properties["uncertainty"]["maxLength"] = json!(TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS);
+            properties.remove("forecast_risks");
+            format!(
+                "Emit required keys in this exact order: outcome, disposition, candidate_ids, evidence_ids, rationale, uncertainty. Use exact enum and ID values from the schema. Keep rationale at most {TEXTUAL_ASSESSMENT_RATIONALE_CHARS} characters and uncertainty at most {TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS} characters. Omit optional fields."
+            )
+        }
+        "select_recovery_action" => {
+            let reason = response_schema
+                .pointer_mut("/properties/reason/maxLength")
+                .ok_or_else(|| anyhow!("selection operation is missing reason constraints"))?;
+            *reason = json!(TEXTUAL_SELECTION_REASON_CHARS);
+            format!(
+                "Emit required keys in this exact order: assessment_id, anomaly_id, action_id, reason. Use exact ID values from the schema and keep reason at most {TEXTUAL_SELECTION_REASON_CHARS} characters."
+            )
+        }
+        _ => "Emit every required field before any optional field.".to_string(),
+    };
     let input = messages
         .iter()
         .map(|message| message.content.as_str())
@@ -883,7 +910,7 @@ async fn textual_chat(
         .join("\n");
     let schema = serde_json::to_string(&response_schema)?;
     let prompt = format!(
-        "Perform operation `{name}`. Reply with exactly one compact JSON object containing only its arguments. Do not repeat or summarize the input. Do not include markdown or explanatory text.\nArgument JSON Schema: {schema}\nInput: {input}\nJSON:"
+        "Perform operation `{name}`. Reply with exactly one compact JSON object containing only its arguments. Do not repeat or summarize the input. Do not include markdown or explanatory text. The complete response must fit within {max_output_tokens} tokens. {output_guide}\nArgument JSON Schema: {schema}\nInput: {input}\nJSON:"
     );
 
     let completion = adapter
@@ -1589,14 +1616,32 @@ mod tests {
         let prompt = &requests[0].prompt;
         assert!(prompt.starts_with("Perform operation `complete_thermal_assessment`"));
         assert!(prompt.contains("Do not repeat or summarize the input"));
+        assert!(prompt.contains("complete response must fit within 256 tokens"));
+        assert!(prompt.contains(
+            "Emit required keys in this exact order: outcome, disposition, candidate_ids, evidence_ids, rationale, uncertainty"
+        ));
         assert!(prompt.contains("Argument JSON Schema: {\"additionalProperties\":false"));
         assert!(prompt.contains("\"required\":[\"outcome\",\"disposition\""));
+        assert!(!prompt.contains("forecast_risks"));
         assert!(prompt.contains("Input: assess now\nJSON:"));
         assert!(
             prompt.find("Argument JSON Schema:").unwrap() < prompt.find("Input:").unwrap(),
             "the output contract should precede untrusted input"
         );
         assert_eq!(requests[0].response_schema["type"], "object");
+        assert_eq!(
+            requests[0].response_schema["properties"]["rationale"]["maxLength"],
+            TEXTUAL_ASSESSMENT_RATIONALE_CHARS
+        );
+        assert_eq!(
+            requests[0].response_schema["properties"]["uncertainty"]["maxLength"],
+            TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS
+        );
+        assert!(
+            requests[0].response_schema["properties"]
+                .get("forecast_risks")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1626,6 +1671,14 @@ mod tests {
         assert_eq!(
             response.message.tool_calls[0].arguments["action_id"],
             "point_nadir"
+        );
+        let requests = adapter.requests.lock().unwrap();
+        assert!(requests[0].prompt.contains(
+            "Emit required keys in this exact order: assessment_id, anomaly_id, action_id, reason"
+        ));
+        assert_eq!(
+            requests[0].response_schema["properties"]["reason"]["maxLength"],
+            TEXTUAL_SELECTION_REASON_CHARS
         );
     }
 
