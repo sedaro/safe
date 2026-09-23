@@ -205,11 +205,13 @@ not support native tool calls:
 }
 ```
 
-In this mode the adapter uses its normal constrained-completion endpoint. Each
-planner phase requests strict JSON arguments for its one available operation,
-then feeds the parsed result through the same host-owned assessment, selection,
-simulation, staleness, and board-conflict validation as a native tool call.
-Malformed, truncated, ambiguous, or oversized textual responses fail closed.
+In this mode the adapter uses its normal completion endpoint with JSON-object
+output (`response_format.type=json_object` for OpenAI-compatible servers and
+`format=json` for Ollama). Each planner phase requests strict JSON arguments for
+its one available operation, then feeds the parsed result through the same
+host-owned assessment, selection, simulation, staleness, and board-conflict
+validation as a native tool call. Malformed, truncated, ambiguous, or oversized
+textual responses fail closed.
 
 The `safe-llm-adapter` crate exposes `LlmAdapter`, `LlmAdapterFactory`, and
 `AdapterRegistry` for mission-specific Rust adapters. Custom adapters must be

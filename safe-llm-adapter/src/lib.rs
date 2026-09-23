@@ -99,6 +99,13 @@ pub trait LlmAdapter: Send + Sync {
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError>;
 
+    async fn complete_json_object(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<Completion, AdapterError> {
+        self.complete(request).await
+    }
+
     async fn tool_chat(
         &self,
         _request: ToolChatRequest,
@@ -203,18 +210,22 @@ struct OllamaAdapter {
     endpoint: Endpoint,
 }
 
-#[async_trait]
-impl LlmAdapter for OllamaAdapter {
-    fn kind(&self) -> &'static str {
-        "ollama"
-    }
-
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
+impl OllamaAdapter {
+    async fn complete_with_format(
+        &self,
+        request: CompletionRequest,
+        use_json_schema: bool,
+    ) -> Result<Completion, AdapterError> {
+        let format = if use_json_schema {
+            request.response_schema
+        } else {
+            json!("json")
+        };
         let body = json!({
             "model": request.model,
             "prompt": request.prompt,
             "stream": false,
-            "format": request.response_schema,
+            "format": format,
             "options": {
                 "temperature": request.temperature,
                 "num_predict": request.max_output_tokens,
@@ -240,6 +251,24 @@ impl LlmAdapter for OllamaAdapter {
                 None => CompletionFinishReason::Other,
             },
         })
+    }
+}
+
+#[async_trait]
+impl LlmAdapter for OllamaAdapter {
+    fn kind(&self) -> &'static str {
+        "ollama"
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
+        self.complete_with_format(request, true).await
+    }
+
+    async fn complete_json_object(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<Completion, AdapterError> {
+        self.complete_with_format(request, false).await
     }
 
     async fn tool_chat(
@@ -403,26 +432,30 @@ struct OpenAiCompatibleAdapter {
     api_key: Option<String>,
 }
 
-#[async_trait]
-impl LlmAdapter for OpenAiCompatibleAdapter {
-    fn kind(&self) -> &'static str {
-        "openai_compatible"
-    }
-
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
-        let body = json!({
-            "model": request.model,
-            "messages": [{"role": "user", "content": request.prompt}],
-            "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
-            "response_format": {
+impl OpenAiCompatibleAdapter {
+    async fn complete_with_format(
+        &self,
+        request: CompletionRequest,
+        use_json_schema: bool,
+    ) -> Result<Completion, AdapterError> {
+        let response_format = if use_json_schema {
+            json!({
                 "type": "json_schema",
                 "json_schema": {
                     "name": "anomaly_recovery_decision",
                     "strict": true,
                     "schema": request.response_schema,
                 },
-            },
+            })
+        } else {
+            json!({"type": "json_object"})
+        };
+        let body = json!({
+            "model": request.model,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "temperature": request.temperature,
+            "max_tokens": request.max_output_tokens,
+            "response_format": response_format,
         });
         let body_text = post_json_with_auth(
             &self.endpoint,
@@ -459,6 +492,24 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                 _ => CompletionFinishReason::Other,
             },
         })
+    }
+}
+
+#[async_trait]
+impl LlmAdapter for OpenAiCompatibleAdapter {
+    fn kind(&self) -> &'static str {
+        "openai_compatible"
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion, AdapterError> {
+        self.complete_with_format(request, true).await
+    }
+
+    async fn complete_json_object(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<Completion, AdapterError> {
+        self.complete_with_format(request, false).await
     }
 
     async fn tool_chat(
@@ -896,6 +947,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ollama_adapter_requests_plain_json_without_schema_enforcement() {
+        let response = json!({
+            "response": "{\"action_id\":\"point_nadir\"}",
+            "done": true
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "ollama".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .unwrap();
+        adapter
+            .complete_json_object(completion_request())
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.contains("\"format\":\"json\""));
+        assert!(!request.contains("\"required\":[\"action_id\"]"));
+    }
+
+    #[tokio::test]
     async fn openai_compatible_adapter_translates_a_constrained_completion() {
         let response = json!({
             "choices": [{
@@ -922,6 +996,31 @@ mod tests {
         assert_eq!(completion.finish_reason, CompletionFinishReason::Complete);
         assert!(request.contains("\"response_format\""));
         assert!(request.contains("\"max_tokens\":64"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_adapter_requests_json_object_without_json_schema() {
+        let response = json!({
+            "choices": [{
+                "message": {"content": "{\"action_id\":\"point_nadir\"}"},
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (endpoint, server) = mock_json_server(response).await;
+        let adapter = AdapterRegistry::with_builtin_adapters()
+            .build(&AdapterSelection {
+                kind: "openai_compatible".to_string(),
+                config: json!({"endpoint": endpoint}),
+            })
+            .unwrap();
+        adapter
+            .complete_json_object(completion_request())
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.contains("\"response_format\":{\"type\":\"json_object\"}"));
+        assert!(!request.contains("\"json_schema\""));
     }
 
     #[tokio::test]
