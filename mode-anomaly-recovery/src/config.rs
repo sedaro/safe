@@ -18,6 +18,7 @@ pub(crate) enum AllowedAction {
     PointSunYaw,
     PointNadir,
     ThrusterOff,
+    Shutdown,
     CaptureImage,
     Noop,
 }
@@ -28,6 +29,7 @@ impl AllowedAction {
             Self::PointSunYaw => "point_sun_yaw",
             Self::PointNadir => "point_nadir",
             Self::ThrusterOff => "thruster_off",
+            Self::Shutdown => "shutdown",
             Self::CaptureImage => "capture_image",
             Self::Noop => "noop",
         }
@@ -36,7 +38,7 @@ impl AllowedAction {
     pub(crate) fn is_recommendable(self) -> bool {
         matches!(
             self,
-            Self::PointSunYaw | Self::PointNadir | Self::ThrusterOff
+            Self::PointSunYaw | Self::PointNadir | Self::ThrusterOff | Self::Shutdown
         )
     }
 }
@@ -296,6 +298,8 @@ pub(crate) struct SimulationScenario {
     #[serde(default)]
     pub(crate) command_schedule_binding: Option<String>,
     #[serde(default)]
+    pub(crate) compute_power_binding: Option<String>,
+    #[serde(default)]
     pub(crate) state_bindings: Vec<SimulationStateBinding>,
     #[serde(default)]
     pub(crate) constraints: Vec<SimulationConstraint>,
@@ -322,6 +326,20 @@ pub(crate) struct SimulationConfig {
     #[serde(default)]
     pub(crate) initialization: Option<crate::eds_inputs::SimulationInitialization>,
     pub(crate) scenarios: Vec<SimulationScenario>,
+}
+
+impl SimulationScenario {
+    pub(crate) fn has_action_binding(&self) -> bool {
+        match self.modeled_action {
+            Some(AllowedAction::Shutdown) => {
+                self.compute_power_binding.is_some() && self.command_schedule_binding.is_none()
+            }
+            Some(_) => {
+                self.command_schedule_binding.is_some() && self.compute_power_binding.is_none()
+            }
+            None => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -762,21 +780,39 @@ impl AnomalyRecoveryModeConfig {
                         Some(SimulationScenarioRole::Baseline) => {
                             if scenario.modeled_action.is_some()
                                 || scenario.command_schedule_binding.is_some()
+                                || scenario.compute_power_binding.is_some()
                             {
                                 bail!("baseline cannot specify a recovery command");
                             }
                         }
                         Some(SimulationScenarioRole::Recovery) => {
-                            let binding = initialization.command_schedules.iter().find(|s| {
-                                Some(s.id.as_str()) == scenario.command_schedule_binding.as_deref()
-                            });
-                            if !scenario.modeled_action.is_some_and(|action| {
-                                scenario.allowed_actions.contains(&action)
-                                    && binding.is_some_and(|b| b.action_modes.contains_key(&action))
-                            }) {
-                                bail!(
-                                    "recovery scenario has no matching executable command schedule"
-                                );
+                            if scenario.modeled_action == Some(AllowedAction::Shutdown) {
+                                if !scenario.has_action_binding()
+                                    || !scenario.allowed_actions.contains(&AllowedAction::Shutdown)
+                                    || !initialization.compute_power_bindings.iter().any(|b| {
+                                        Some(b.id.as_str())
+                                            == scenario.compute_power_binding.as_deref()
+                                    })
+                                    || scenario.thermal
+                                {
+                                    bail!(
+                                        "shutdown requires an executable power-only compute binding"
+                                    );
+                                }
+                            } else {
+                                let binding = initialization.command_schedules.iter().find(|s| {
+                                    Some(s.id.as_str())
+                                        == scenario.command_schedule_binding.as_deref()
+                                });
+                                if !scenario.modeled_action.is_some_and(|action| {
+                                    scenario.allowed_actions.contains(&action)
+                                        && binding
+                                            .is_some_and(|b| b.action_modes.contains_key(&action))
+                                }) {
+                                    bail!(
+                                        "recovery scenario has no matching executable command schedule"
+                                    );
+                                }
                             }
                         }
                         None => bail!("initialized scenarios require an explicit role"),
@@ -905,10 +941,10 @@ impl AnomalyRecoveryModeConfig {
                 if scenario.role == Some(SimulationScenarioRole::Recovery)
                     && (scenario.modeled_action.is_none()
                         || scenario.baseline_scenario_id.is_none()
-                        || scenario.command_schedule_binding.is_none())
+                        || !scenario.has_action_binding())
                 {
                     bail!(
-                        "recovery scenario '{}' needs modeled_action, baseline_scenario_id, and command_schedule_binding",
+                        "recovery scenario '{}' needs modeled_action, baseline_scenario_id, and an action-specific binding",
                         scenario.id
                     );
                 }
@@ -982,6 +1018,27 @@ impl AnomalyRecoveryModeConfig {
                             "initialized recovery must share baseline state, horizon and rule applicability"
                         );
                     }
+                }
+            }
+        }
+
+        for rule in self.nominal_profiles.iter().flat_map(|p| &p.rules) {
+            if rule.eligible_actions.contains(&AllowedAction::Shutdown) {
+                let simulation = self
+                    .simulation
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("shutdown requires simulation"))?;
+                if simulation.initialization.is_none()
+                    || !simulation.scenarios.iter().any(|s| {
+                        s.role == Some(SimulationScenarioRole::Recovery)
+                            && s.modeled_action == Some(AllowedAction::Shutdown)
+                            && s.applicable_rule_ids.contains(&rule.id)
+                    })
+                {
+                    bail!(
+                        "rule '{}': shutdown requires initialized compute-on/shutdown scenarios",
+                        rule.id
+                    );
                 }
             }
         }

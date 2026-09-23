@@ -145,7 +145,10 @@ pub(crate) struct AnomalyRecoveryMode {
     pub(crate) planning_generation: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) planning_cancel: Option<CancellationToken>,
-    pub(crate) planning_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    pub(crate) planning_task:
+        Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::actions::ShutdownIntent>>>>,
+    pub(crate) shutdown_intent: Option<crate::actions::ShutdownIntent>,
+    pub(crate) shutdown_controller: crate::actions::ShutdownController,
 }
 
 impl AnomalyRecoveryMode {
@@ -168,6 +171,8 @@ impl AnomalyRecoveryMode {
             active: Arc::new(AtomicBool::new(false)),
             planning_cancel: None,
             planning_task: None,
+            shutdown_intent: None,
+            shutdown_controller: Default::default(),
         }
     }
 }

@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::actions::ShutdownIntent;
 use anyhow::{Result, anyhow, bail};
 use safe::mode_runtime::ModeOutputTx;
 use safe::protocol::{AutonomyModeId, Command, CommandEnvelope, TimedCommand};
@@ -40,7 +41,6 @@ pub(crate) struct PlanningRequest {
     pub(crate) generations: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
-    pub(crate) output: ModeOutputTx,
     pub(crate) adapter: Arc<dyn LlmAdapter>,
     pub(crate) telemetry_version: u64,
     pub(crate) board_version: u64,
@@ -113,7 +113,34 @@ impl ScenarioRunner for SedaroScenarioRunner {
     }
 }
 
-pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
+enum PlanningOutcome {
+    Complete,
+    Command(CommandEnvelope),
+    Shutdown(ShutdownIntent),
+}
+
+pub(crate) async fn run(
+    request: PlanningRequest,
+    output: ModeOutputTx,
+) -> Result<Option<ShutdownIntent>> {
+    let runner = Arc::new(SedaroScenarioRunner {
+        config: request.config.clone(),
+        telemetry: request.telemetry.clone(),
+    });
+    match plan(request, runner).await? {
+        PlanningOutcome::Complete => Ok(None),
+        PlanningOutcome::Command(command) => {
+            output.command(command).await?;
+            Ok(None)
+        }
+        PlanningOutcome::Shutdown(intent) => Ok(Some(intent)),
+    }
+}
+
+async fn plan(
+    request: PlanningRequest,
+    runner: Arc<dyn ScenarioRunner>,
+) -> Result<PlanningOutcome> {
     let started = Instant::now();
     let planning_limit = Duration::from_millis(request.config.planner.total_timeout_ms);
     let mut ledger = initial_evidence(&request);
@@ -122,7 +149,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
     let mut assessment: Option<ThermalAssessment> = None;
     for turn in 1..=request.config.planner.max_turns {
         if cancelled(&request) {
-            return Ok(());
+            return Ok(PlanningOutcome::Complete);
         }
         if started.elapsed() >= planning_limit {
             bail!("planning time budget exhausted");
@@ -136,7 +163,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         let available_tools = tool_names(&phase_tools);
         let max_output_tokens = output_budget(&request.config, &phase_tools);
         let response = tokio::select! {
-            _ = request.cancel.cancelled() => return Ok(()),
+            _ = request.cancel.cancelled() => return Ok(PlanningOutcome::Complete),
             result = chat(&request, messages.clone(), phase_tools) => result?,
         };
         if response.finish_reason == CompletionFinishReason::Length {
@@ -338,7 +365,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 if completed.outcome != AssessmentOutcome::ThermalAnomaly
                     || completed.disposition != RecoveryDisposition::EvaluateRecovery
                 {
-                    return Ok(());
+                    return Ok(PlanningOutcome::Complete);
                 }
                 assessment = Some(completed);
                 messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
@@ -417,19 +444,18 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     // it does not project existing command-board plans into EDS.
                     require_empty_simulation_board(&snapshot)?;
                 }
-                let paired = run_and_validate(
-                    Arc::new(SedaroScenarioRunner {
-                        config: request.config.clone(),
-                        telemetry: request.telemetry.clone(),
-                    }),
+                let paired = tokio::select! {
+                    _ = request.cancel.cancelled() => return Ok(PlanningOutcome::Complete),
+                    result = tokio::time::timeout(planning_limit.saturating_sub(started.elapsed()), run_and_validate(
+                    runner.clone(),
                     baseline,
                     recovery,
                     &simulation.viability,
                     action,
                     request.generation,
                     recovery.duration_days,
-                )
-                .await?;
+                )) => result.map_err(|_| anyhow!("planning time budget exhausted during simulation"))??,
+                };
                 if !paired.thermal_benefit_verified {
                     info!(
                         "power-only recovery viability passed; thermal benefit remains unverified"
@@ -443,21 +469,29 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 {
                     bail!("simulation result is stale");
                 }
-                if board_conflicts_or_duplicates(&current, action)? {
+                if action != AllowedAction::Shutdown
+                    && board_conflicts_or_duplicates(&current, action)?
+                {
                     bail!("recovery action duplicates or conflicts with current command board");
                 }
                 if cancelled(&request) {
-                    return Ok(());
+                    return Ok(PlanningOutcome::Complete);
                 }
-                request
-                    .output
-                    .command(CommandEnvelope {
-                        from: request.mode_id,
-                        cmd: TimedCommand::Now(command(action)?),
-                    })
-                    .await?;
-                info!(decision_trace = request.config.observability.decision_trace, stage = "final_validation", turn, anomaly_id = %candidate.anomaly_id, action_id = action.as_str(), elapsed_ms = started.elapsed().as_millis() as u64, "anomaly recovery validated and submitted command board proposal");
-                return Ok(());
+                if action == AllowedAction::Shutdown {
+                    return Ok(PlanningOutcome::Shutdown(ShutdownIntent {
+                        assessment_id: assessment.episode_id.clone(),
+                        anomaly_id: candidate.anomaly_id.clone(),
+                        generation: request.generation,
+                        telemetry_version: request.telemetry_version,
+                        board_version: request.board_version,
+                        simulation: paired,
+                    }));
+                }
+                info!(decision_trace = request.config.observability.decision_trace, stage = "final_validation", turn, anomaly_id = %candidate.anomaly_id, action_id = action.as_str(), elapsed_ms = started.elapsed().as_millis() as u64, "anomaly recovery validated command board proposal");
+                return Ok(PlanningOutcome::Command(CommandEnvelope {
+                    from: request.mode_id,
+                    cmd: TimedCommand::Now(command(action)?),
+                }));
             }
             _ => bail!("model requested an unknown operation"),
         }
@@ -1340,6 +1374,237 @@ mod tests {
 
     use super::*;
     use safe_llm_adapter::{AdapterError, Completion};
+
+    struct ShutdownAdapter {
+        outcome: &'static str,
+        action: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAdapter for ShutdownAdapter {
+        fn kind(&self) -> &'static str {
+            "shutdown-test"
+        }
+        async fn complete(&self, _request: CompletionRequest) -> Result<Completion, AdapterError> {
+            unreachable!("native tools only")
+        }
+        async fn tool_chat(
+            &self,
+            request: ToolChatRequest,
+        ) -> Result<ToolChatCompletion, AdapterError> {
+            let name = request.tools[0]["function"]["name"].as_str().unwrap();
+            let arguments = match name {
+                "complete_thermal_assessment" => json!({
+                    "outcome": self.outcome,
+                    "disposition": if self.outcome == "thermal_anomaly" { "evaluate_recovery" } else { "monitor" },
+                    "candidate_ids": ["example-hot"], "evidence_ids": ["telemetry-1-1", "board-1-2"],
+                    "rationale": "Compute temperature is above its configured limit.",
+                    "uncertainty": "Cooling has not been simulated."
+                }),
+                "select_recovery_action" => json!({
+                    "assessment_id": "example-hot-1", "anomaly_id": "example-hot",
+                    "action_id": self.action, "reason": "Reduce compute-generated heat."
+                }),
+                _ => panic!("unexpected tool: {name}"),
+            };
+            Ok(ToolChatCompletion {
+                message: ToolChatMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        name: name.into(),
+                        arguments,
+                    }],
+                },
+                finish_reason: CompletionFinishReason::Complete,
+                diagnostic: None,
+            })
+        }
+    }
+
+    struct ShutdownRunner {
+        calls: Mutex<Vec<String>>,
+        behavior: &'static str,
+        context: LiveContext,
+    }
+
+    #[async_trait::async_trait]
+    impl ScenarioRunner for ShutdownRunner {
+        async fn run(&self, request: ScenarioRunRequest) -> Result<ScenarioRun> {
+            self.calls.lock().unwrap().push(request.scenario_id.clone());
+            if self.behavior == "error" {
+                bail!("EDS failed");
+            }
+            if self.behavior == "hang" {
+                std::future::pending::<()>().await;
+            }
+            let recovery = request.scenario_id == "compute_shutdown";
+            if recovery && self.behavior == "stale" {
+                self.context.update_board(Default::default());
+            }
+            let soc = if recovery && self.behavior == "low_soc" {
+                0.1
+            } else {
+                0.8
+            };
+            Ok(ScenarioRun {
+                scenario_id: request.scenario_id,
+                evidence_revision: request.evidence_revision,
+                horizon_days: request.horizon_days,
+                success: self.behavior != "failed",
+                timed_out: self.behavior == "timeout",
+                metrics: if self.behavior == "missing_metrics" {
+                    HashMap::new()
+                } else {
+                    ["final_state_of_charge", "minimum_state_of_charge"]
+                        .into_iter()
+                        .map(|id| {
+                            (
+                                id.into(),
+                                UnitMetric {
+                                    value: soc,
+                                    units: "fraction".into(),
+                                },
+                            )
+                        })
+                        .collect()
+                },
+            })
+        }
+    }
+
+    fn shutdown_request() -> PlanningRequest {
+        let mut config: AnomalyRecoveryModeConfig =
+            serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap();
+        config.planner.limits.max_prompt_chars = 6000;
+        config.validate().unwrap();
+        let telemetry = TelemetrySample {
+            source: Some("example".into()),
+            ts_mono: 2,
+            payload: json!({"telemetry": {"temperature_c": 70.0, "time_mjd_utc": 61290.0, "state_of_charge": 0.8}}),
+        };
+        let live_context = LiveContext::default();
+        live_context.update_telemetry(telemetry.clone(), 8);
+        live_context.update_board(Default::default());
+        PlanningRequest {
+            config,
+            candidates: vec![AnomalyCandidate {
+                profile_id: "example".into(),
+                rule_id: "hot".into(),
+                anomaly_id: "example-hot".into(),
+                source: "example".into(),
+                ts_mono: 2,
+                path: "telemetry.temperature_c".into(),
+                observed: json!(70.0),
+                expectation: "at most 60".into(),
+                severity: crate::config::AnomalySeverity::High,
+                eligible_actions: vec![AllowedAction::Shutdown],
+            }],
+            telemetry,
+            live_context,
+            mode_id: AutonomyModeId(uuid::Uuid::nil()),
+            generation: 1,
+            generations: Arc::new(AtomicU64::new(1)),
+            active: Arc::new(AtomicBool::new(true)),
+            cancel: CancellationToken::new(),
+            adapter: Arc::new(ShutdownAdapter {
+                outcome: "thermal_anomaly",
+                action: "shutdown",
+            }),
+            telemetry_version: 1,
+            board_version: 1,
+        }
+    }
+
+    fn shutdown_runner(request: &PlanningRequest, behavior: &'static str) -> Arc<ShutdownRunner> {
+        Arc::new(ShutdownRunner {
+            calls: Mutex::new(vec![]),
+            behavior,
+            context: request.live_context.clone(),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_assessment_runs_both_scenarios_and_returns_local_intent() {
+        let request = shutdown_request();
+        let runner = shutdown_runner(&request, "ok");
+        let PlanningOutcome::Shutdown(intent) = plan(request, runner.clone()).await.unwrap() else {
+            panic!("expected local shutdown, not a board command");
+        };
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            ["compute_on", "compute_shutdown"]
+        );
+        assert_eq!(intent.anomaly_id, "example-hot");
+        assert!(!intent.simulation.thermal_benefit_verified);
+        assert_eq!(
+            intent.simulation.recovery.metrics["final_state_of_charge"].value,
+            0.8
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_blocked_by_failed_or_stale_simulation() {
+        for behavior in [
+            "error",
+            "failed",
+            "timeout",
+            "missing_metrics",
+            "low_soc",
+            "stale",
+            "hang",
+        ] {
+            let mut request = shutdown_request();
+            if behavior == "hang" {
+                request.config.planner.total_timeout_ms = 20;
+            }
+            let runner = shutdown_runner(&request, behavior);
+            assert!(plan(request, runner).await.is_err(), "{behavior}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_eligible_action_and_anomaly_assessment() {
+        for outcome in ["no_thermal_anomaly", "inconclusive"] {
+            let mut request = shutdown_request();
+            request.adapter = Arc::new(ShutdownAdapter {
+                outcome,
+                action: "shutdown",
+            });
+            let runner = shutdown_runner(&request, "ok");
+            assert!(matches!(
+                plan(request, runner.clone()).await.unwrap(),
+                PlanningOutcome::Complete
+            ));
+            assert!(runner.calls.lock().unwrap().is_empty());
+        }
+        let mut request = shutdown_request();
+        request.candidates[0].eligible_actions.clear();
+        let runner = shutdown_runner(&request, "ok");
+        assert!(plan(request, runner.clone()).await.is_err());
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_simulation_does_not_return_shutdown_intent() {
+        let request = shutdown_request();
+        let cancel = request.cancel.clone();
+        let runner = shutdown_runner(&request, "hang");
+        let observed = runner.clone();
+        let task = tokio::spawn(plan(request, runner));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            PlanningOutcome::Complete
+        ));
+    }
 
     struct TextCompletionAdapter {
         requests: Mutex<Vec<CompletionRequest>>,
