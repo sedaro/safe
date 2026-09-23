@@ -323,6 +323,8 @@ pub(crate) struct SimulationConfig {
 pub(crate) struct LlmConfig {
     pub(crate) adapter: AdapterSelection,
     pub(crate) model: String,
+    #[serde(default = "default_enable_tool_calls")]
+    pub(crate) enable_tool_calls: bool,
     #[serde(default = "default_request_timeout_ms")]
     pub(crate) request_timeout_ms: u64,
     #[serde(default = "default_response_temperature")]
@@ -377,6 +379,7 @@ impl Default for LlmConfig {
                 config: json!({"endpoint": "http://127.0.0.1:11434/api/generate"}),
             },
             model: default_model(),
+            enable_tool_calls: default_enable_tool_calls(),
             request_timeout_ms: default_request_timeout_ms(),
             response_temperature: default_response_temperature(),
             max_output_tokens: default_max_output_tokens(),
@@ -699,6 +702,10 @@ fn default_request_timeout_ms() -> u64 {
     20_000
 }
 
+fn default_enable_tool_calls() -> bool {
+    true
+}
+
 fn default_max_prompt_chars() -> usize {
     1_600
 }
@@ -788,12 +795,22 @@ mod tests {
     #[test]
     fn default_tool_call_budget_reserves_context_for_structured_native_calls() {
         let llm = &valid_config().llm;
+        assert!(llm.enable_tool_calls);
         assert_eq!(llm.max_output_tokens, 256);
         assert_eq!(llm.context_window_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
         assert_eq!(
             llm.context_safety_margin_tokens,
             DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
         );
+    }
+
+    #[test]
+    fn tool_calls_can_be_disabled_for_textual_json_completions() {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["llm"]["enable_tool_calls"] = serde_json::json!(false);
+        let config: AnomalyRecoveryModeConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.llm.enable_tool_calls);
+        config.validate().expect("textual mode should validate");
     }
 
     #[test]
