@@ -466,6 +466,14 @@ fn trace_text(input: &str, max_chars: usize) -> String {
 impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     fn set_config(&mut self, config: AnomalyRecoveryModeConfig) -> Result<()> {
         config.validate()?;
+        if let Some(recovery) = config.recovery.clone() {
+            self.stop_planning();
+            self.adapter = None;
+            self.recovery_runtime = Some(crate::recovery_runtime::RecoveryRuntime::new(recovery));
+            self.config = config;
+            return Ok(());
+        }
+        self.recovery_runtime = None;
         let adapter = self
             .adapter_registry
             .build(&config.llm.adapter)
@@ -496,6 +504,12 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     }
 
     async fn on_activate(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
+        if let Some(recovery) = &mut self.recovery_runtime {
+            recovery.activate();
+            return recovery
+                .process(runtime, &self.config, &self.adapter_registry, None, false)
+                .await;
+        }
         self.active
             .store(true, std::sync::atomic::Ordering::Release);
         if let Err(err) = self.plan_current_candidates(runtime).await {
@@ -528,6 +542,24 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             ts_mono: telemetry.ts_mono,
             payload: telemetry.payload,
         };
+        if self.recovery_runtime.is_some() {
+            if self.config.advisory.enabled && !self.config.nominal_profiles.is_empty() {
+                self.evaluate_static_profile(&sample);
+            }
+            let warning = !self.current_candidates.is_empty();
+            return self
+                .recovery_runtime
+                .as_mut()
+                .unwrap()
+                .process(
+                    runtime,
+                    &self.config,
+                    &self.adapter_registry,
+                    Some(&sample),
+                    warning,
+                )
+                .await;
+        }
         self.reap_finished_plan().await;
         if runtime.is_active() && self.defer_telemetry_while_planning(sample.clone()) {
             return Ok(());
@@ -544,6 +576,10 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         runtime: &mut ModeRuntime,
         board: AutonomyModeBoardState,
     ) -> Result<()> {
+        if let Some(recovery) = &mut self.recovery_runtime {
+            recovery.note_board(&board);
+            return Ok(());
+        }
         self.has_board_snapshot = true;
         self.live_context.update_board(board.clone());
         self.latest_board_snapshot = board;
@@ -565,6 +601,11 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     }
 
     async fn on_tick(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
+        if let Some(recovery) = &mut self.recovery_runtime {
+            return recovery
+                .process(runtime, &self.config, &self.adapter_registry, None, false)
+                .await;
+        }
         self.reap_finished_plan().await;
         self.execute_pending_shutdown(runtime.working_directory())
             .await;
@@ -582,6 +623,9 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     }
 
     async fn on_shutdown(&mut self, _runtime: &mut ModeRuntime) -> Result<()> {
+        if let Some(recovery) = &mut self.recovery_runtime {
+            recovery.cancel_advisor();
+        }
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
         self.stop_planning();

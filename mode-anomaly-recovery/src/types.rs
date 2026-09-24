@@ -129,6 +129,7 @@ pub(crate) struct RuleState {
 }
 
 pub(crate) struct AnomalyRecoveryMode {
+    pub(crate) recovery_runtime: Option<crate::recovery_runtime::RecoveryRuntime>,
     pub(crate) config: AnomalyRecoveryModeConfig,
     pub(crate) adapter_registry: AdapterRegistry,
     pub(crate) adapter: Option<Arc<dyn LlmAdapter>>,
@@ -154,6 +155,7 @@ pub(crate) struct AnomalyRecoveryMode {
 impl AnomalyRecoveryMode {
     pub(crate) fn new(adapter_registry: AdapterRegistry) -> Self {
         Self {
+            recovery_runtime: None,
             config: AnomalyRecoveryModeConfig::default(),
             adapter_registry,
             adapter: None,

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use safe_llm_adapter::AdapterSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -650,7 +650,12 @@ impl Default for ObservabilityConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AnomalyRecoveryModeConfig {
     pub(crate) schema_version: u32,
+    #[serde(default)]
     pub(crate) llm: LlmConfig,
+    #[serde(default)]
+    pub(crate) recovery: Option<crate::recovery::RecoveryConfig>,
+    #[serde(default)]
+    pub(crate) advisory: crate::advisor::AdvisoryConfig,
     #[serde(default = "default_shutdown_command")]
     pub(crate) shutdown_command: Vec<String>,
     #[serde(default)]
@@ -676,10 +681,24 @@ impl AnomalyRecoveryModeConfig {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             bail!("schema_version must be {CONFIG_SCHEMA_VERSION}");
         }
-        if self.nominal_profiles.is_empty() {
+        if self.nominal_profiles.is_empty() && self.recovery.is_none() {
             bail!("anomaly recovery requires at least one nominal profile");
         }
-        self.llm.validate()?;
+        if self.recovery.is_none() || self.advisory.enabled {
+            self.llm.validate()?;
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.validate()?;
+            self.advisory.validate()?;
+            ensure!(
+                self.action_catalog.is_empty(),
+                "deterministic recovery advisor is assessment-only; action_catalog must be empty"
+            );
+            ensure!(
+                self.simulation.is_none(),
+                "deterministic recovery does not run simulations"
+            );
+        }
         if self
             .shutdown_command
             .first()
@@ -1075,6 +1094,8 @@ impl Default for AnomalyRecoveryModeConfig {
     fn default() -> Self {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
+            recovery: None,
+            advisory: Default::default(),
             llm: LlmConfig::default(),
             shutdown_command: default_shutdown_command(),
             planner: PlannerConfig::default(),

@@ -1,8 +1,11 @@
 mod actions;
+mod advisor;
 mod config;
 mod eds_inputs;
 mod evidence;
 mod planner;
+mod recovery;
+mod recovery_runtime;
 mod runtime;
 mod simulation;
 mod types;

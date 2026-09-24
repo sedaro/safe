@@ -1,5 +1,10 @@
 # Thermal Anomaly Recovery Implementation Plan
 
+For the deterministic shutdown/cooldown procedure and optional advisory LLM,
+see [deterministic recovery](./deterministic-recovery.md). That procedure lives
+entirely in the anomaly mode and yields through the existing `NOOP`/activation
+contract. This document describes the separate assessment-driven workflow.
+
 Implement the [thermal assessment story](./thermal-anomaly-recovery-story.md)
 as six ordered, reviewable milestones. The first usable milestone is an
 assessment-only mode that combines telemetry and board evidence and can finish

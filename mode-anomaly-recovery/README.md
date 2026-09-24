@@ -1,5 +1,17 @@
 # Anomaly Recovery
 
+## Deterministic reboot and cooldown
+
+The mode supports a deterministic recovery procedure selected by
+`mode_config.recovery`: critical low power or high temperature → one durable
+shutdown attempt → reboot-persistent 100-minute minimum wait → fresh recovery
+threshold checks → `NOOP` handoff using existing SAFE activation rules.
+
+See [deterministic recovery](./deterministic-recovery.md) for the configuration,
+mode-local state machine, routing example, optional LLM advisor, and FlatSat
+verification steps. The procedure runs without an LLM or EDS. The assessment
+workflow below remains available when `recovery` is omitted.
+
 ## Thermal Assessment User Story
 
 The intended thermal-recovery workflow uses an LLM to assess telemetry,
