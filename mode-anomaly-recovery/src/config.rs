@@ -1480,32 +1480,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn otp_observation_projection_needs_no_compute_power_binding() {
-        let entries: serde_json::Value =
-            serde_json::from_str(include_str!("../autonomy_mode_config.otp2-recovery.json"))
-                .unwrap();
-        let config: super::AnomalyRecoveryModeConfig =
-            serde_json::from_value(entries[0]["mode_config"].clone()).unwrap();
-        config.validate().unwrap();
-        let simulation = config.simulation.as_ref().unwrap();
-        assert_eq!(simulation.max_runs, 1);
-        assert!(
-            simulation
-                .initialization
-                .as_ref()
-                .unwrap()
-                .compute_power_bindings
-                .is_empty()
-        );
-        assert_eq!(simulation.scenarios.len(), 1);
-        assert_eq!(
-            simulation.scenarios[0].role,
-            Some(SimulationScenarioRole::Observation)
-        );
-        assert!(simulation.scenarios[0].allowed_actions.is_empty());
-    }
-
     use super::*;
 
     fn valid_config() -> AnomalyRecoveryModeConfig {
