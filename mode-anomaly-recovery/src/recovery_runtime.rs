@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::actions::{LinuxShutdown, ShutdownExecutor};
 use crate::config::AnomalyRecoveryModeConfig;
 use crate::recovery::{Decision, RecoveryController, durable_write};
-use crate::types::TelemetrySample;
+use crate::types::{AnomalyCandidate, TelemetrySample};
 
 pub(crate) struct RecoveryRuntime {
     pub controller: RecoveryController,
@@ -23,7 +23,7 @@ pub(crate) struct RecoveryRuntime {
     clock: Option<(f64, Instant)>,
     observed_after: Option<f64>,
     history: VecDeque<Value>,
-    advisor_task: Option<tokio::task::JoinHandle<Result<crate::advisor::Assessment>>>,
+    advisor_task: Option<tokio::task::JoinHandle<Result<crate::advisor::AdvisoryReport>>>,
     last_advisor: Option<Instant>,
     assessed_episode: Option<String>,
     advisor_paused: bool,
@@ -31,6 +31,9 @@ pub(crate) struct RecoveryRuntime {
     service_attempt: Option<Instant>,
     service_error: Option<String>,
     board_context: Value,
+    board: Option<safe::protocol::AutonomyModeBoardState>,
+    telemetry: Option<TelemetrySample>,
+    candidates: Vec<AnomalyCandidate>,
 }
 
 impl RecoveryRuntime {
@@ -52,15 +55,35 @@ impl RecoveryRuntime {
             service_attempt: None,
             service_error: None,
             board_context: Value::Null,
+            board: None,
+            telemetry: None,
+            candidates: vec![],
         }
     }
 
     pub fn note_board(&mut self, board: &safe::protocol::AutonomyModeBoardState) {
         let mut commands: Vec<_> = board.proposals.iter().collect();
         commands.sort_by(|a, b| a.0.0.cmp(&b.0.0));
-        self.board_context = json!({"proposed_count":board.proposals.len(),"approved_count":board.approved.len(),
+        let context = json!({"proposed_count":board.proposals.len(),"approved_count":board.approved.len(),
             "published_count":board.source_of_truth.len(),"sample":commands.into_iter().take(16).collect::<Vec<_>>(),
             "omitted_count":board.proposals.len().saturating_sub(16),"meaning":"command intent, not execution acknowledgement"});
+        let effects = crate::advisory_simulation::board_has_effects(board);
+        if self
+            .board
+            .as_ref()
+            .map(crate::advisory_simulation::board_has_effects)
+            != Some(effects)
+            || (effects && context != self.board_context)
+        {
+            self.cancel_advisor();
+        }
+        self.board = Some(board.clone());
+        self.board_context = context;
+    }
+
+    pub fn note_candidates(&mut self, candidates: &[AnomalyCandidate]) {
+        self.warning_pending = !candidates.is_empty();
+        self.candidates = candidates.to_vec();
     }
 
     pub fn activate(&mut self) {
@@ -70,6 +93,7 @@ impl RecoveryRuntime {
     pub fn cancel_advisor(&mut self) {
         if let Some(task) = self.advisor_task.take() {
             task.abort();
+            self.assessed_episode = None;
         }
     }
 
@@ -79,7 +103,6 @@ impl RecoveryRuntime {
         config: &AnomalyRecoveryModeConfig,
         registry: &AdapterRegistry,
         sample: Option<&TelemetrySample>,
-        warning: bool,
     ) -> Result<()> {
         let instant = Instant::now();
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
@@ -94,6 +117,15 @@ impl RecoveryRuntime {
         let observed_after = *self.observed_after.get_or_insert(now);
         self.controller.load(runtime.working_directory());
         if let Some(sample) = sample {
+            let expected_source = config
+                .simulation
+                .as_ref()
+                .and_then(|sim| sim.initialization.as_ref())
+                .map(|init| init.source.as_str())
+                .unwrap_or(&self.controller.config.power.source);
+            if sample.source.as_deref() == Some(expected_source) {
+                self.telemetry = Some(sample.clone());
+            }
             self.controller.observe(sample, now);
             // No buffered pre-start readings may qualify startup or recovery.
             for state in &mut self.controller.measurements {
@@ -104,9 +136,10 @@ impl RecoveryRuntime {
                     state.recovered_since = None;
                 }
             }
-            self.warning_pending = warning;
+            let measurements: Vec<_> = std::iter::once(&self.controller.config.power).chain(&self.controller.config.thermals)
+                .zip(&self.controller.measurements).map(|(binding, state)| json!({"id":binding.id,"value":state.value,"units":binding.units,"at":state.measured_at,"valid":state.valid})).collect();
             self.history
-                .push_back(json!({"observed_at":now,"measurements":self.controller.measurements}));
+                .push_back(json!({"observed_at":now,"measurements":measurements}));
             while self.history.len() > config.advisory.history_samples {
                 self.history.pop_front();
             }
@@ -195,7 +228,7 @@ impl RecoveryRuntime {
             let status = json!({"active":runtime.is_active(),"waiting":held,"detail":self.detail,"noop_sent":self.noop_sent,
                 "episode":self.controller.episode,"measurements":self.controller.measurements,
                 "clock_valid":self.controller.clock_valid,"advisory_enabled":config.advisory.enabled,
-                "inference_requests_paused":held,"advisor_service_paused":self.advisor_paused,"advisor_service_error":self.service_error,
+                "inference_requests_paused":held,"advisor_service_paused":self.advisor_paused && !config.advisory.pause_command.is_empty(),"advisor_service_error":self.service_error,
                 "remaining_secs":self.controller.episode.as_ref().map(|e| (e.resume_after-now).max(0.0))});
             if let Err(error) =
                 durable_write(runtime.working_directory(), "recovery-status.json", &status)
@@ -209,7 +242,7 @@ impl RecoveryRuntime {
 
     async fn run_advisor(
         &mut self,
-        runtime: &ModeRuntime,
+        runtime: &mut ModeRuntime,
         config: &AnomalyRecoveryModeConfig,
         registry: &AdapterRegistry,
         now: Instant,
@@ -247,14 +280,30 @@ impl RecoveryRuntime {
         {
             let task = self.advisor_task.take().unwrap();
             match task.await {
-                Ok(Ok(assessment)) => {
-                    info!(assessment = ?assessment, "recovery advisory assessment completed");
+                Ok(Ok(report)) => {
+                    info!(report = ?report, "recovery advisory assessment completed");
+                    let completed_runs = report
+                        .simulation
+                        .runs
+                        .iter()
+                        .filter(|run| run.result.as_ref().is_some_and(|result| result.success))
+                        .count();
+                    if completed_runs > 0 {
+                        if let Err(error) =
+                            runtime.simulation_completed(completed_runs as u64).await
+                        {
+                            warn!(%error, "cannot report advisory simulation count");
+                        }
+                    }
                     if let Err(error) = durable_write(
                         runtime.working_directory(),
                         "advisory-assessment.json",
-                        &json!({"episode_id":self.assessed_episode,"assessment":assessment}),
+                        &json!({"episode_id":self.assessed_episode,"report":report}),
                     ) {
                         warn!(%error, "cannot persist advisory assessment");
+                    }
+                    if report.assessment.is_none() {
+                        self.assessed_episode = None;
                     }
                 }
                 result => warn!(?result, "recovery advisory assessment failed"),
@@ -279,12 +328,25 @@ impl RecoveryRuntime {
         match registry.build(&config.llm.adapter) {
             Ok(adapter) => {
                 self.assessed_episode = completed;
+                let episode = self.controller.episode.as_ref().map(|episode| json!({"id":episode.id,"reasons":episode.reasons,"attempted_at":episode.attempted_at,
+                    "resume_after":episode.resume_after,"completed_at":episode.completed_at,"shutdown_outcome":episode.shutdown_outcome}));
+                let candidates: Vec<_> = self.candidates.iter().map(|candidate| json!({"id":candidate.rule_id,"path":candidate.path,"observed":candidate.observed,"expectation":candidate.expectation})).collect();
                 let evidence = json!({"kind":if post_recovery {"post_recovery"} else {"noncritical_investigation"},
-                    "episode":self.controller.episode,"policy":self.controller.config,"recent_measurements":self.history,"command_board":self.board_context});
-                self.advisor_task = Some(tokio::spawn(crate::advisor::assess(
+                    "episode":episode,"candidates":candidates,"recent_measurements":self.history,"command_board":self.board_context});
+                self.advisor_task = Some(tokio::spawn(crate::advisor::run(
                     Arc::from(adapter),
-                    config.llm.clone(),
-                    evidence,
+                    crate::advisor::AdvisoryRequest {
+                        config: config.clone(),
+                        evidence,
+                        telemetry: self.telemetry.clone(),
+                        board: self.board.clone(),
+                        candidate_ids: self
+                            .candidates
+                            .iter()
+                            .map(|candidate| candidate.rule_id.clone())
+                            .collect(),
+                        post_recovery,
+                    },
                 )));
             }
             Err(error) => warn!(%error, "optional recovery advisor unavailable"),

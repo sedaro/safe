@@ -507,7 +507,7 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
         if let Some(recovery) = &mut self.recovery_runtime {
             recovery.activate();
             return recovery
-                .process(runtime, &self.config, &self.adapter_registry, None, false)
+                .process(runtime, &self.config, &self.adapter_registry, None)
                 .await;
         }
         self.active
@@ -543,21 +543,23 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
             payload: telemetry.payload,
         };
         if self.recovery_runtime.is_some() {
-            if self.config.advisory.enabled && !self.config.nominal_profiles.is_empty() {
+            if self.config.advisory.enabled
+                && sample
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| self.config.profile_for_source(source).is_some())
+            {
                 self.evaluate_static_profile(&sample);
+                self.recovery_runtime
+                    .as_mut()
+                    .unwrap()
+                    .note_candidates(&self.current_candidates);
             }
-            let warning = !self.current_candidates.is_empty();
             return self
                 .recovery_runtime
                 .as_mut()
                 .unwrap()
-                .process(
-                    runtime,
-                    &self.config,
-                    &self.adapter_registry,
-                    Some(&sample),
-                    warning,
-                )
+                .process(runtime, &self.config, &self.adapter_registry, Some(&sample))
                 .await;
         }
         self.reap_finished_plan().await;
@@ -603,7 +605,7 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     async fn on_tick(&mut self, runtime: &mut ModeRuntime) -> Result<()> {
         if let Some(recovery) = &mut self.recovery_runtime {
             return recovery
-                .process(runtime, &self.config, &self.adapter_registry, None, false)
+                .process(runtime, &self.config, &self.adapter_registry, None)
                 .await;
         }
         self.reap_finished_plan().await;

@@ -1,5 +1,6 @@
 mod actions;
 mod advisor;
+mod advisory_simulation;
 mod config;
 mod eds_inputs;
 mod evidence;

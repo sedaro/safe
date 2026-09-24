@@ -70,9 +70,9 @@ struct CompleteAssessmentArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadContextArguments {}
-struct SedaroScenarioRunner {
-    config: AnomalyRecoveryModeConfig,
-    telemetry: TelemetrySample,
+pub(crate) struct SedaroScenarioRunner {
+    pub(crate) config: AnomalyRecoveryModeConfig,
+    pub(crate) telemetry: TelemetrySample,
 }
 
 #[async_trait::async_trait]
