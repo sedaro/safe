@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::actions::ShutdownIntent;
 use anyhow::{Result, anyhow, bail};
 use safe::mode_runtime::ModeOutputTx;
 use safe::protocol::{AutonomyModeId, Command, CommandEnvelope, TimedCommand};
@@ -13,7 +14,7 @@ use safe_llm_adapter::{
     ToolChatMessage, ToolChatRequest,
 };
 use safe_sim::{CancellationToken, EdsPatch, SedaroSimulator, SimulationResult};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -29,18 +30,6 @@ use crate::types::{
     ThermalAssessment,
 };
 
-const MAX_TURNS: u8 = 6;
-const MAX_TOOL_CONTENT_CHARS: usize = 2_000;
-const MAX_ASSESSMENT_RATIONALE_CHARS: usize = 400;
-const MAX_ASSESSMENT_UNCERTAINTY_CHARS: usize = 160;
-const MAX_FORECAST_RISKS: usize = 2;
-const MAX_FORECAST_RISK_CHARS: usize = 100;
-const MAX_SELECTION_REASON_CHARS: usize = 200;
-const CONTEXT_TOOL_OUTPUT_TOKENS: u32 = 128;
-const TEXTUAL_ASSESSMENT_RATIONALE_CHARS: usize = 200;
-const TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS: usize = 100;
-const TEXTUAL_SELECTION_REASON_CHARS: usize = 120;
-
 #[derive(Clone)]
 pub(crate) struct PlanningRequest {
     pub(crate) config: AnomalyRecoveryModeConfig,
@@ -52,17 +41,9 @@ pub(crate) struct PlanningRequest {
     pub(crate) generations: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
-    pub(crate) output: ModeOutputTx,
     pub(crate) adapter: Arc<dyn LlmAdapter>,
     pub(crate) telemetry_version: u64,
     pub(crate) board_version: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunArguments {
-    scenario_id: String,
-    #[serde(default)]
-    parameters: HashMap<String, f64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,18 +70,9 @@ struct CompleteAssessmentArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadContextArguments {}
-#[derive(Serialize)]
-struct ToolResult {
-    status: &'static str,
-    scenario_id: String,
-    run_id: u8,
-    metrics: HashMap<String, f64>,
-    error: Option<String>,
-}
-
-struct SedaroScenarioRunner {
-    config: AnomalyRecoveryModeConfig,
-    telemetry: TelemetrySample,
+pub(crate) struct SedaroScenarioRunner {
+    pub(crate) config: AnomalyRecoveryModeConfig,
+    pub(crate) telemetry: TelemetrySample,
 }
 
 #[async_trait::async_trait]
@@ -141,42 +113,62 @@ impl ScenarioRunner for SedaroScenarioRunner {
     }
 }
 
-pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
+enum PlanningOutcome {
+    Complete,
+    Command(CommandEnvelope),
+    Shutdown(ShutdownIntent),
+}
+
+pub(crate) async fn run(
+    request: PlanningRequest,
+    output: ModeOutputTx,
+) -> Result<Option<ShutdownIntent>> {
+    let runner = Arc::new(SedaroScenarioRunner {
+        config: request.config.clone(),
+        telemetry: request.telemetry.clone(),
+    });
+    match plan(request, runner).await? {
+        PlanningOutcome::Complete => Ok(None),
+        PlanningOutcome::Command(command) => {
+            output.command(command).await?;
+            Ok(None)
+        }
+        PlanningOutcome::Shutdown(intent) => Ok(Some(intent)),
+    }
+}
+
+async fn plan(
+    request: PlanningRequest,
+    runner: Arc<dyn ScenarioRunner>,
+) -> Result<PlanningOutcome> {
     let started = Instant::now();
-    let planning_limit = Duration::from_millis(
-        request
-            .config
-            .llm
-            .request_timeout_ms
-            .saturating_mul(MAX_TURNS as u64),
-    );
-    let scenarios = applicable_scenarios(&request.config, &request.candidates);
+    let planning_limit = Duration::from_millis(request.config.planner.total_timeout_ms);
     let mut ledger = initial_evidence(&request);
     let mut messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
-    let mut runs = 0u8;
+    let mut repairs = 0u8;
     let mut assessment: Option<ThermalAssessment> = None;
-    for turn in 1..=MAX_TURNS {
+    for turn in 1..=request.config.planner.max_turns {
         if cancelled(&request) {
-            return Ok(());
+            return Ok(PlanningOutcome::Complete);
         }
         if started.elapsed() >= planning_limit {
             bail!("planning time budget exhausted");
         }
         let phase_tools = phase_tools(
             &request.candidates,
-            &scenarios,
-            runs,
             &ledger,
             assessment.as_ref(),
+            &request.config,
         );
         let available_tools = tool_names(&phase_tools);
-        let max_output_tokens = output_budget(&phase_tools, request.config.llm.max_output_tokens);
+        let max_output_tokens = output_budget(&request.config, &phase_tools);
         let response = tokio::select! {
-            _ = request.cancel.cancelled() => return Ok(()),
+            _ = request.cancel.cancelled() => return Ok(PlanningOutcome::Complete),
             result = chat(&request, messages.clone(), phase_tools) => result?,
         };
         if response.finish_reason == CompletionFinishReason::Length {
             let detail = truncation_detail(
+                request.config.planner.max_turns,
                 turn,
                 &available_tools,
                 request.adapter.kind(),
@@ -184,10 +176,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 max_output_tokens,
             );
             let available_tools = available_tools.join(",");
-            if request.config.decision_trace {
+            if request.config.observability.decision_trace {
                 warn!(
                     turn,
-                    assistant_content = %sanitize(&response.message.content),
+                    assistant_content = %sanitize(&response.message.content, request.config.observability.diagnostic_max_chars),
                     parsed_tool_call_count = response.message.tool_calls.len(),
                     provider_attempts = ?response.diagnostic,
                     "anomaly recovery truncated planner diagnostic"
@@ -195,7 +187,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             }
             warn!(
                 turn,
-                max_turns = MAX_TURNS,
+                max_turns = request.config.planner.max_turns,
                 available_tools,
                 adapter = request.adapter.kind(),
                 model = %request.config.llm.model,
@@ -206,20 +198,20 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 "planner response stopped at token limit; {detail}; use a compatible model with sufficient context"
             );
         }
-        validate_response_size(&response.message, request.config.max_response_chars)?;
+        validate_response_size(&request.config, &response.message)?;
         let calls = response.message.tool_calls.clone();
-        if request.config.decision_trace {
+        if request.config.observability.decision_trace {
             info!(
                 decision_trace = true,
                 stage = "tool_call_message",
                 turn,
                 finish_reason = ?response.finish_reason,
-                assistant_content = %sanitize(&response.message.content),
+                assistant_content = %sanitize(&response.message.content, request.config.observability.diagnostic_max_chars),
                 "anomaly recovery parsed tool-call assistant message"
             );
         }
         info!(
-            decision_trace = request.config.decision_trace,
+            decision_trace = request.config.observability.decision_trace,
             stage = "tool_calls",
             turn,
             tool_call_count = calls.len(),
@@ -243,7 +235,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     "get_latest_telemetry" => {
                         parse_read_context_arguments(call, "get_latest_telemetry")?;
                         let snapshot = request.live_context.snapshot();
-                        let _result = latest_telemetry_result(&request.live_context)?;
+                        let _result = latest_telemetry_result(
+                            &request.live_context,
+                            request.config.planner.limits.tool_result_max_chars,
+                        )?;
                         let status = if snapshot.telemetry.is_some() {
                             "ok"
                         } else {
@@ -259,7 +254,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     "get_command_board_state" => {
                         parse_read_context_arguments(call, "get_command_board_state")?;
                         let snapshot = request.live_context.snapshot();
-                        let _result = command_board_result(&request.live_context)?;
+                        let _result = command_board_result(
+                            &request.live_context,
+                            request.config.planner.limits.tool_result_max_chars,
+                        )?;
                         let status = if snapshot.board.is_some() {
                             "ok"
                         } else {
@@ -280,6 +278,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
         }
         if calls.is_empty() {
             let detail = truncation_detail(
+                request.config.planner.max_turns,
                 turn,
                 &available_tools,
                 request.adapter.kind(),
@@ -294,6 +293,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             bail!("textual JSON operation missing; {detail}");
         }
         if calls.len() != 1 {
+            repairs = repairs.saturating_add(1);
+            if repairs > request.config.planner.repair_attempts {
+                bail!("planner repair budget exhausted");
+            }
             // Do not reinterpret content as a tool request. Give tool-capable
             // models one bounded repair opportunity per remaining turn.
             // A malformed call is not executed, so do not replay its native
@@ -305,7 +308,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             });
             messages.push(ToolChatMessage {
                 role: "user".into(),
-                content: "Use the only available tool now to complete the requested task with the supplied values.".into(),
+                content: request.config.prompts.multiple_calls_repair.clone(),
                 tool_calls: Vec::new(),
             });
             continue;
@@ -315,7 +318,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             "get_latest_telemetry" => {
                 parse_read_context_arguments(call, "get_latest_telemetry")?;
                 let snapshot = request.live_context.snapshot();
-                let _result = latest_telemetry_result(&request.live_context)?;
+                let _result = latest_telemetry_result(
+                    &request.live_context,
+                    request.config.planner.limits.tool_result_max_chars,
+                )?;
                 let status = if snapshot.telemetry.is_some() {
                     "ok"
                 } else {
@@ -332,7 +338,10 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
             "get_command_board_state" => {
                 parse_read_context_arguments(call, "get_command_board_state")?;
                 let snapshot = request.live_context.snapshot();
-                let _result = command_board_result(&request.live_context)?;
+                let _result = command_board_result(
+                    &request.live_context,
+                    request.config.planner.limits.tool_result_max_chars,
+                )?;
                 let status = if snapshot.board.is_some() {
                     "ok"
                 } else {
@@ -346,47 +355,6 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 );
                 messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
             }
-            "run_eds_simulation" => {
-                if runs >= request.config.simulation.as_ref().map_or(0, |s| s.max_runs) {
-                    bail!("simulation run budget exhausted");
-                }
-                let args: RunArguments = serde_json::from_value(call.arguments.clone())
-                    .map_err(|e| anyhow!("invalid run_eds_simulation arguments: {e}"))?;
-                let scenario = scenarios
-                    .iter()
-                    .find(|s| s.id == args.scenario_id)
-                    .ok_or_else(|| anyhow!("scenario is not applicable to frozen candidates"))?;
-                runs += 1;
-                let started_run = Instant::now();
-                let result = tokio::select! {
-                    _ = request.cancel.cancelled() => return Ok(()),
-                    result = execute_scenario(&request.config, scenario, &request.telemetry, &args.parameters, runs) => result,
-                };
-                let tool_result = match result {
-                    Ok(metrics) => ToolResult {
-                        status: "ok",
-                        scenario_id: scenario.id.clone(),
-                        run_id: runs,
-                        metrics,
-                        error: None,
-                    },
-                    Err(error) => ToolResult {
-                        status: "error",
-                        scenario_id: scenario.id.clone(),
-                        run_id: runs,
-                        metrics: HashMap::new(),
-                        error: Some(sanitize(&error.to_string())),
-                    },
-                };
-                ledger.record(
-                    "simulation",
-                    runs as u64,
-                    tool_result.status,
-                    serde_json::to_value(&tool_result)?,
-                );
-                info!(decision_trace = request.config.decision_trace, stage = "simulation_result", turn, runs, elapsed_ms = started_run.elapsed().as_millis() as u64, scenario = %scenario.id, status = tool_result.status, "anomaly recovery simulation tool completed");
-                messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
-            }
             "complete_thermal_assessment" => {
                 let args: CompleteAssessmentArguments =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| {
@@ -397,7 +365,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 if completed.outcome != AssessmentOutcome::ThermalAnomaly
                     || completed.disposition != RecoveryDisposition::EvaluateRecovery
                 {
-                    return Ok(());
+                    return Ok(PlanningOutcome::Complete);
                 }
                 assessment = Some(completed);
                 messages = fresh_selection_messages(context_prompt(&request, &ledger)?);
@@ -409,35 +377,47 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 let args: SelectArguments = match serde_json::from_value(call.arguments.clone()) {
                     Ok(args) => args,
                     Err(error) => {
+                        repairs = repairs.saturating_add(1);
+                        if repairs > request.config.planner.repair_attempts {
+                            bail!("planner repair budget exhausted");
+                        }
                         messages = fresh_selection_messages(format!(
-                            "{} Selection validation failed: invalid arguments: {error}. Retry select_recovery_action with a non-empty reason and exact IDs.",
-                            context_prompt(&request, &ledger)?
+                            "{} Selection validation failed: invalid arguments: {error}. {}",
+                            context_prompt(&request, &ledger)?,
+                            request.config.prompts.selection_repair
                         ));
                         continue;
                     }
                 };
                 if args.assessment_id != assessment.episode_id {
+                    repairs = repairs.saturating_add(1);
+                    if repairs > request.config.planner.repair_attempts {
+                        bail!("planner repair budget exhausted");
+                    }
                     messages = fresh_selection_messages(format!(
-                        "{} Selection validation failed: assessment_id must be exactly '{}'. Retry select_recovery_action.",
+                        "{} Selection validation failed: assessment_id must be exactly '{}'. {}",
                         context_prompt(&request, &ledger)?,
-                        assessment.episode_id
+                        assessment.episode_id,
+                        request.config.prompts.selection_repair
                     ));
                     continue;
                 }
-                let (candidate, action) = match evaluate(
-                    &request.config,
-                    &request.candidates,
-                    &args,
-                ) {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        messages = fresh_selection_messages(format!(
-                            "{} Selection validation failed: {error}. Retry select_recovery_action with a non-empty reason and exact configured IDs.",
-                            context_prompt(&request, &ledger)?
-                        ));
-                        continue;
-                    }
-                };
+                let (candidate, action) =
+                    match evaluate(&request.config, &request.candidates, &args) {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            repairs = repairs.saturating_add(1);
+                            if repairs > request.config.planner.repair_attempts {
+                                bail!("planner repair budget exhausted");
+                            }
+                            messages = fresh_selection_messages(format!(
+                                "{} Selection validation failed: {error}. {}",
+                                context_prompt(&request, &ledger)?,
+                                request.config.prompts.selection_repair
+                            ));
+                            continue;
+                        }
+                    };
                 let simulation = request.config.simulation.as_ref().ok_or_else(|| {
                     anyhow!("recovery requires an action-specific simulation contract")
                 })?;
@@ -459,18 +439,23 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                     .find(|scenario| scenario.id == baseline_id)
                     .ok_or_else(|| anyhow!("recovery baseline scenario is not configured"))?;
                 let snapshot = request.live_context.snapshot();
-                let paired = run_and_validate(
-                    Arc::new(SedaroScenarioRunner {
-                        config: request.config.clone(),
-                        telemetry: request.telemetry.clone(),
-                    }),
+                if simulation.initialization.is_some() {
+                    // This initialization contract clears the bundled schedules;
+                    // it does not project existing command-board plans into EDS.
+                    require_empty_simulation_board(&snapshot)?;
+                }
+                let paired = tokio::select! {
+                    _ = request.cancel.cancelled() => return Ok(PlanningOutcome::Complete),
+                    result = tokio::time::timeout(planning_limit.saturating_sub(started.elapsed()), run_and_validate(
+                    runner.clone(),
                     baseline,
                     recovery,
+                    &simulation.viability,
                     action,
                     request.generation,
                     recovery.duration_days,
-                )
-                .await?;
+                )) => result.map_err(|_| anyhow!("planning time budget exhausted during simulation"))??,
+                };
                 if !paired.thermal_benefit_verified {
                     info!(
                         "power-only recovery viability passed; thermal benefit remains unverified"
@@ -484,21 +469,29 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
                 {
                     bail!("simulation result is stale");
                 }
-                if board_conflicts_or_duplicates(&current, action)? {
+                if action != AllowedAction::Shutdown
+                    && board_conflicts_or_duplicates(&current, action)?
+                {
                     bail!("recovery action duplicates or conflicts with current command board");
                 }
                 if cancelled(&request) {
-                    return Ok(());
+                    return Ok(PlanningOutcome::Complete);
                 }
-                request
-                    .output
-                    .command(CommandEnvelope {
-                        from: request.mode_id,
-                        cmd: TimedCommand::Now(command(action)?),
-                    })
-                    .await?;
-                info!(decision_trace = request.config.decision_trace, stage = "final_validation", turn, runs, anomaly_id = %candidate.anomaly_id, action_id = action.as_str(), elapsed_ms = started.elapsed().as_millis() as u64, "anomaly recovery validated and submitted command board proposal");
-                return Ok(());
+                if action == AllowedAction::Shutdown {
+                    return Ok(PlanningOutcome::Shutdown(ShutdownIntent {
+                        assessment_id: assessment.episode_id.clone(),
+                        anomaly_id: candidate.anomaly_id.clone(),
+                        generation: request.generation,
+                        telemetry_version: request.telemetry_version,
+                        board_version: request.board_version,
+                        simulation: paired,
+                    }));
+                }
+                info!(decision_trace = request.config.observability.decision_trace, stage = "final_validation", turn, anomaly_id = %candidate.anomaly_id, action_id = action.as_str(), elapsed_ms = started.elapsed().as_millis() as u64, "anomaly recovery validated command board proposal");
+                return Ok(PlanningOutcome::Command(CommandEnvelope {
+                    from: request.mode_id,
+                    cmd: TimedCommand::Now(command(action)?),
+                }));
             }
             _ => bail!("model requested an unknown operation"),
         }
@@ -508,7 +501,7 @@ pub(crate) async fn run(request: PlanningRequest) -> Result<()> {
 
 fn initial_evidence(request: &PlanningRequest) -> EvidenceLedger {
     let snapshot = request.live_context.snapshot();
-    let mut ledger = EvidenceLedger::default();
+    let mut ledger = EvidenceLedger::new(request.config.evidence.max_items);
     ledger.record(
         "telemetry",
         snapshot.telemetry_version,
@@ -538,55 +531,39 @@ fn cancelled(request: &PlanningRequest) -> bool {
         || request.generations.load(Ordering::Acquire) != request.generation
 }
 
-fn applicable_scenarios<'a>(
-    config: &'a AnomalyRecoveryModeConfig,
-    candidates: &[AnomalyCandidate],
-) -> Vec<&'a SimulationScenario> {
-    config
-        .simulation
-        .as_ref()
-        .map(|sim| {
-            sim.scenarios
-                .iter()
-                .filter(|scenario| {
-                    candidates.iter().any(|candidate| {
-                        scenario.applicable_rule_ids.contains(&candidate.rule_id)
-                            && candidate
-                                .eligible_actions
-                                .iter()
-                                .any(|a| scenario.allowed_actions.contains(a))
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn validate_assessment(
     request: &PlanningRequest,
     ledger: &EvidenceLedger,
     args: CompleteAssessmentArguments,
 ) -> Result<ThermalAssessment> {
     if args.rationale.trim().is_empty()
-        || args.rationale.chars().count() > MAX_ASSESSMENT_RATIONALE_CHARS
+        || args.rationale.chars().count()
+            > request.config.planner.limits.assessment_rationale_max_chars
     {
         bail!("assessment rationale is invalid");
     }
     if args.uncertainty.trim().is_empty()
-        || args.uncertainty.chars().count() > MAX_ASSESSMENT_UNCERTAINTY_CHARS
+        || args.uncertainty.chars().count()
+            > request
+                .config
+                .planner
+                .limits
+                .assessment_uncertainty_max_chars
     {
         bail!("assessment uncertainty is invalid");
     }
-    if args.forecast_risks.len() > MAX_FORECAST_RISKS
-        || args
-            .forecast_risks
-            .iter()
-            .any(|risk| risk.trim().is_empty() || risk.chars().count() > MAX_FORECAST_RISK_CHARS)
+    if args.forecast_risks.len() > request.config.planner.limits.forecast_risk_max_items
+        || args.forecast_risks.iter().any(|risk| {
+            risk.trim().is_empty()
+                || risk.chars().count() > request.config.planner.limits.forecast_risk_max_chars
+        })
     {
         bail!("assessment forecast risks are invalid");
     }
-    if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
-        bail!("assessment requires telemetry and command-board tool attempts");
+    if (request.config.evidence.require_telemetry && !ledger.has_kind("telemetry"))
+        || (request.config.evidence.require_board && !ledger.has_kind("board"))
+    {
+        bail!("assessment is missing configured required evidence");
     }
     if args.evidence_ids.is_empty() || !ledger.contains_all(&args.evidence_ids) {
         bail!("assessment cites evidence that is unavailable from this investigation");
@@ -612,10 +589,8 @@ fn validate_assessment(
         ) => {}
     }
     if args.outcome == AssessmentOutcome::NoThermalAnomaly
-        && ledger
-            .prompt_value()
-            .to_string()
-            .contains("\"status\":\"unavailable\"")
+        && ((request.config.evidence.require_telemetry && ledger.kind_is_unavailable("telemetry"))
+            || (request.config.evidence.require_board && ledger.kind_is_unavailable("board")))
     {
         bail!("unavailable required evidence cannot establish no_thermal_anomaly");
     }
@@ -641,7 +616,10 @@ fn validate_assessment(
 
 fn context_prompt(request: &PlanningRequest, ledger: &EvidenceLedger) -> Result<String> {
     let text = format!(
-        "Build an evidence-backed assessment or select an eligible action when available. Use only supplied values and never invent IDs. Evidence: {} Candidates: {} Actions: {}",
+        "{} {} {} Use only supplied values and never invent IDs. Evidence: {} Candidates: {} Actions: {}",
+        request.config.prompts.planner_instructions,
+        request.config.prompts.assessment_instructions,
+        request.config.prompts.selection_instructions,
         serde_json::to_string(&ledger.prompt_value())?,
         serde_json::to_string(&compact_candidates(request))?,
         serde_json::to_string(&compact_actions(request))?
@@ -665,6 +643,7 @@ fn compact_candidates(request: &PlanningRequest) -> Value {
             .map(|candidate| json!({
                 "id": candidate.anomaly_id,
                 "source": candidate.source,
+                "path": candidate.path,
                 "observed": candidate.observed,
                 "expectation": candidate.expectation,
                 "severity": candidate.severity,
@@ -683,59 +662,43 @@ fn compact_actions(request: &PlanningRequest) -> Value {
             .map(|action| json!({
                 "id": action.id,
                 "description": action.description,
+                "preconditions": action.preconditions,
             }))
             .collect::<Vec<_>>()
     )
 }
 
 fn bounded_prompt(request: &PlanningRequest, text: String) -> Result<String> {
-    if text.chars().count() > request.config.max_prompt_chars {
+    if text.chars().count() > request.config.planner.limits.max_prompt_chars {
         bail!("tool prompt exceeds max_prompt_chars");
     }
     Ok(text)
 }
 
-fn simulation_tool(scenarios: &[&SimulationScenario]) -> Value {
-    let scenario_ids = scenarios
-        .iter()
-        .map(|scenario| &scenario.id)
-        .collect::<Vec<_>>();
-    let mut parameter_properties = serde_json::Map::new();
-    for parameter in scenarios.iter().flat_map(|scenario| &scenario.parameters) {
-        parameter_properties.entry(parameter.id.clone()).or_insert_with(|| {
-            json!({
-                "type": "number",
-                "description": format!("Optional value from {} through {}", parameter.min, parameter.max)
-            })
-        });
-    }
-    json!({"type":"function","function":{"name":"run_eds_simulation","description":"Run one applicable allow-listed local EDS scenario","parameters":{"type":"object","required":["scenario_id"],"properties":{"scenario_id":{"type":"string","description":"Exact ID of the scenario to run","enum":scenario_ids},"parameters":{"type":"object","description":"Optional named numeric scenario parameters within their described bounds","properties":parameter_properties}}}}})
-}
-
 fn phase_tools(
     candidates: &[AnomalyCandidate],
-    _scenarios: &[&SimulationScenario],
-    _runs: u8,
     ledger: &EvidenceLedger,
     assessment: Option<&ThermalAssessment>,
+    config: &AnomalyRecoveryModeConfig,
 ) -> Vec<Value> {
     let mut tools = Vec::new();
     if !ledger.has_kind("telemetry") {
-        tools.push(latest_telemetry_tool());
+        tools.push(latest_telemetry_tool(config));
     }
     if !ledger.has_kind("board") {
-        tools.push(command_board_tool());
+        tools.push(command_board_tool(config));
     }
     if !ledger.has_kind("telemetry") || !ledger.has_kind("board") {
         return tools;
     }
     if assessment.is_some() {
         tools.push(select_tool(
+            config,
             candidates,
             assessment.map(|assessment| assessment.episode_id.as_str()),
         ));
     } else {
-        tools.push(assessment_tool(candidates, ledger));
+        tools.push(assessment_tool(config, candidates, ledger));
     }
     tools
 }
@@ -749,6 +712,7 @@ fn tool_names(tools: &[Value]) -> Vec<String> {
 }
 
 fn truncation_detail(
+    max_turns: u8,
     turn: u8,
     available_tools: &[String],
     adapter: &str,
@@ -756,26 +720,31 @@ fn truncation_detail(
     max_output_tokens: u32,
 ) -> String {
     format!(
-        "turn={turn}/{MAX_TURNS} available_tools=[{}] adapter={adapter} model={model} max_output_tokens={max_output_tokens}",
+        "turn={turn}/{max_turns} available_tools=[{}] adapter={adapter} model={model} max_output_tokens={max_output_tokens}",
         available_tools.join(",")
     )
 }
 
-fn assessment_tool(candidates: &[AnomalyCandidate], ledger: &EvidenceLedger) -> Value {
-    json!({"type":"function","function":{"name":"complete_thermal_assessment","description":"Complete the evidence-backed thermal assessment; this may finish without a recovery command","parameters":{"type":"object","additionalProperties":false,"required":["outcome","disposition","candidate_ids","evidence_ids","rationale","uncertainty"],"properties":{"outcome":{"type":"string","enum":["thermal_anomaly","no_thermal_anomaly","inconclusive"]},"disposition":{"type":"string","enum":["monitor","operator_review","evaluate_recovery"]},"candidate_ids":{"type":"array","items":{"type":"string","enum":candidates.iter().map(|c| c.anomaly_id.as_str()).collect::<Vec<_>>() }},"evidence_ids":{"type":"array","items":{"type":"string","enum":ledger.ids()}},"rationale":{"type":"string","maxLength":MAX_ASSESSMENT_RATIONALE_CHARS},"uncertainty":{"type":"string","maxLength":MAX_ASSESSMENT_UNCERTAINTY_CHARS},"forecast_risks":{"type":"array","maxItems":MAX_FORECAST_RISKS,"items":{"type":"string","maxLength":MAX_FORECAST_RISK_CHARS}}}}}})
+fn assessment_tool(
+    config: &AnomalyRecoveryModeConfig,
+    candidates: &[AnomalyCandidate],
+    ledger: &EvidenceLedger,
+) -> Value {
+    let limits = &config.planner.limits;
+    json!({"type":"function","function":{"name":"complete_thermal_assessment","description":config.prompts.assessment_tool_description,"parameters":{"type":"object","additionalProperties":false,"required":["outcome","disposition","candidate_ids","evidence_ids","rationale","uncertainty"],"properties":{"outcome":{"type":"string","enum":["thermal_anomaly","no_thermal_anomaly","inconclusive"]},"disposition":{"type":"string","enum":["monitor","operator_review","evaluate_recovery"]},"candidate_ids":{"type":"array","items":{"type":"string","enum":candidates.iter().map(|c| c.anomaly_id.as_str()).collect::<Vec<_>>() }},"evidence_ids":{"type":"array","items":{"type":"string","enum":ledger.ids()}},"rationale":{"type":"string","maxLength":limits.assessment_rationale_max_chars},"uncertainty":{"type":"string","maxLength":limits.assessment_uncertainty_max_chars},"forecast_risks":{"type":"array","maxItems":limits.forecast_risk_max_items,"items":{"type":"string","maxLength":limits.forecast_risk_max_chars}}}}}})
 }
 
-fn latest_telemetry_tool() -> Value {
+fn latest_telemetry_tool(config: &AnomalyRecoveryModeConfig) -> Value {
     read_context_tool(
         "get_latest_telemetry",
-        "Get the latest telemetry snapshot received from SAFE",
+        &config.prompts.telemetry_tool_description,
     )
 }
 
-fn command_board_tool() -> Value {
+fn command_board_tool(config: &AnomalyRecoveryModeConfig) -> Value {
     read_context_tool(
         "get_command_board_state",
-        "Get the current command board snapshot received from SAFE",
+        &config.prompts.board_tool_description,
     )
 }
 
@@ -783,7 +752,11 @@ fn read_context_tool(name: &str, description: &str) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","additionalProperties":false}}})
 }
 
-fn select_tool(candidates: &[AnomalyCandidate], assessment_id: Option<&str>) -> Value {
+fn select_tool(
+    config: &AnomalyRecoveryModeConfig,
+    candidates: &[AnomalyCandidate],
+    assessment_id: Option<&str>,
+) -> Value {
     let mut anomaly_ids = Vec::new();
     let mut action_ids = Vec::new();
     for candidate in candidates {
@@ -801,7 +774,7 @@ fn select_tool(candidates: &[AnomalyCandidate], assessment_id: Option<&str>) -> 
         || json!({"type": "string"}),
         |id| json!({"type": "string", "enum": [id]}),
     );
-    json!({"type":"function","function":{"name":"select_recovery_action","description":"Choose one eligible recovery action only after a thermal anomaly assessment requests recovery evaluation","parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection","maxLength":MAX_SELECTION_REASON_CHARS}}}}})
+    json!({"type":"function","function":{"name":"select_recovery_action","description":config.prompts.selection_tool_description,"parameters":{"type":"object","required":["assessment_id","anomaly_id","action_id","reason"],"properties":{"assessment_id":assessment_schema,"anomaly_id":{"type":"string","description":"Exact anomaly_id from the candidate list","enum":anomaly_ids},"action_id":{"type":"string","description":"Exact eligible action ID for the selected anomaly","enum":action_ids},"reason":{"type":"string","description":"Brief rationale for this selection","maxLength":config.planner.limits.selection_reason_max_chars}}}}})
 }
 
 async fn chat(
@@ -809,7 +782,7 @@ async fn chat(
     messages: Vec<ToolChatMessage>,
     tools: Vec<Value>,
 ) -> Result<ToolChatCompletion> {
-    let max_output_tokens = output_budget(&tools, request.config.llm.max_output_tokens);
+    let max_output_tokens = output_budget(&request.config, &tools);
     let estimated_input_tokens = estimate_request_tokens(&messages, &tools)?;
     let estimated_total_tokens = estimated_input_tokens
         .saturating_add(max_output_tokens)
@@ -832,6 +805,38 @@ async fn chat(
 }
 
 async fn dispatch_chat(
+    config: &AnomalyRecoveryModeConfig,
+    adapter: &dyn LlmAdapter,
+    messages: Vec<ToolChatMessage>,
+    tools: Vec<Value>,
+    max_output_tokens: u32,
+) -> Result<ToolChatCompletion> {
+    let mut last_error = None;
+    for attempt in 1..=config.planner.provider_attempts {
+        match dispatch_chat_once(
+            config,
+            adapter,
+            messages.clone(),
+            tools.clone(),
+            max_output_tokens,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < config.planner.provider_attempts => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(
+                    config.planner.provider_retry_backoff_ms,
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("provider attempt budget exhausted")))
+}
+
+async fn dispatch_chat_once(
     config: &AnomalyRecoveryModeConfig,
     adapter: &dyn LlmAdapter,
     messages: Vec<ToolChatMessage>,
@@ -885,23 +890,31 @@ async fn textual_chat(
                 .pointer_mut("/properties")
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| anyhow!("assessment operation is missing object properties"))?;
-            properties["rationale"]["maxLength"] = json!(TEXTUAL_ASSESSMENT_RATIONALE_CHARS);
-            properties["uncertainty"]["maxLength"] = json!(TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS);
+            let rationale_limit = config.planner.limits.textual_assessment_rationale_max_chars;
+            let uncertainty_limit = config
+                .planner
+                .limits
+                .textual_assessment_uncertainty_max_chars;
+            properties["rationale"]["maxLength"] = json!(rationale_limit);
+            properties["uncertainty"]["maxLength"] = json!(uncertainty_limit);
             properties.remove("forecast_risks");
             format!(
-                "Emit required keys in this exact order: outcome, disposition, candidate_ids, evidence_ids, rationale, uncertainty. Use exact enum and ID values from the schema. Keep rationale at most {TEXTUAL_ASSESSMENT_RATIONALE_CHARS} characters and uncertainty at most {TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS} characters. Omit optional fields."
+                "{} Keep rationale at most {rationale_limit} characters and uncertainty at most {uncertainty_limit} characters.",
+                config.prompts.textual_assessment_guide
             )
         }
         "select_recovery_action" => {
             let reason = response_schema
                 .pointer_mut("/properties/reason/maxLength")
                 .ok_or_else(|| anyhow!("selection operation is missing reason constraints"))?;
-            *reason = json!(TEXTUAL_SELECTION_REASON_CHARS);
+            let reason_limit = config.planner.limits.textual_selection_reason_max_chars;
+            *reason = json!(reason_limit);
             format!(
-                "Emit required keys in this exact order: assessment_id, anomaly_id, action_id, reason. Use exact ID values from the schema and keep reason at most {TEXTUAL_SELECTION_REASON_CHARS} characters."
+                "{} Keep reason at most {reason_limit} characters.",
+                config.prompts.textual_selection_guide
             )
         }
-        _ => "Emit every required field before any optional field.".to_string(),
+        _ => config.prompts.textual_generic_guide.clone(),
     };
     let input = messages
         .iter()
@@ -910,7 +923,8 @@ async fn textual_chat(
         .join("\n");
     let schema = serde_json::to_string(&response_schema)?;
     let prompt = format!(
-        "Perform operation `{name}`. Reply with exactly one compact JSON object containing only its arguments. Do not repeat or summarize the input. Do not include markdown or explanatory text. The complete response must fit within {max_output_tokens} tokens. {output_guide}\nArgument JSON Schema: {schema}\nInput: {input}\nJSON:"
+        "Perform operation `{name}`. {} The complete response must fit within {max_output_tokens} tokens. {output_guide}\nArgument JSON Schema: {schema}\nInput: {input}\nJSON:",
+        config.prompts.textual_transport_instructions
     );
 
     let completion = adapter
@@ -944,29 +958,41 @@ async fn textual_chat(
     })
 }
 
-fn validate_response_size(message: &ToolChatMessage, max_response_chars: usize) -> Result<()> {
+fn validate_response_size(
+    config: &AnomalyRecoveryModeConfig,
+    message: &ToolChatMessage,
+) -> Result<()> {
     let response_chars = message.content.chars().count()
         + message
             .tool_calls
             .iter()
             .map(|call| call.name.chars().count() + call.arguments.to_string().chars().count())
             .sum::<usize>();
-    if response_chars > max_response_chars.saturating_mul(8) {
+    if response_chars
+        > config
+            .planner
+            .limits
+            .max_response_chars
+            .saturating_mul(config.planner.limits.response_size_multiplier)
+    {
         bail!("planner response exceeded bounded limit");
     }
     Ok(())
 }
 
-fn output_budget(tools: &[Value], configured_budget: u32) -> u32 {
+fn output_budget(config: &AnomalyRecoveryModeConfig, tools: &[Value]) -> u32 {
     if tools.iter().all(|tool| {
         matches!(
             tool.pointer("/function/name").and_then(Value::as_str),
             Some("get_latest_telemetry" | "get_command_board_state")
         )
     }) {
-        configured_budget.min(CONTEXT_TOOL_OUTPUT_TOKENS)
+        config
+            .llm
+            .max_output_tokens
+            .min(config.planner.limits.context_tool_output_tokens)
     } else {
-        configured_budget
+        config.llm.max_output_tokens
     }
 }
 
@@ -993,7 +1019,7 @@ fn parse_read_context_arguments(call: &safe_llm_adapter::ToolCall, name: &str) -
         .map_err(|error| anyhow!("invalid {name} arguments: {error}"))
 }
 
-fn latest_telemetry_result(context: &LiveContext) -> Result<String> {
+fn latest_telemetry_result(context: &LiveContext, max_chars: usize) -> Result<String> {
     let snapshot = context.snapshot();
     let value = match snapshot.telemetry {
         Some(telemetry) => json!({
@@ -1007,10 +1033,10 @@ fn latest_telemetry_result(context: &LiveContext) -> Result<String> {
             "error": "SAFE has not provided telemetry to this mode",
         }),
     };
-    bounded_context_json(value)
+    bounded_context_json(value, max_chars)
 }
 
-fn command_board_result(context: &LiveContext) -> Result<String> {
+fn command_board_result(context: &LiveContext, max_chars: usize) -> Result<String> {
     let snapshot = context.snapshot();
     let value = match snapshot.board {
         Some(board) => json!({
@@ -1024,7 +1050,7 @@ fn command_board_result(context: &LiveContext) -> Result<String> {
             "error": "SAFE has not provided a command board snapshot to this mode",
         }),
     };
-    bounded_context_json(value)
+    bounded_context_json(value, max_chars)
 }
 
 fn board_summary(snapshot: &crate::types::LiveContextSnapshot) -> Value {
@@ -1034,15 +1060,15 @@ fn board_summary(snapshot: &crate::types::LiveContextSnapshot) -> Value {
     })
 }
 
-fn bounded_context_json(value: Value) -> Result<String> {
+fn bounded_context_json(value: Value, max_chars: usize) -> Result<String> {
     let text = serde_json::to_string(&value)?;
-    if text.chars().count() <= MAX_TOOL_CONTENT_CHARS {
+    if text.chars().count() <= max_chars {
         return Ok(text);
     }
     Ok(serde_json::to_string(&json!({
         "status": "error",
         "error": "context result exceeds tool content limit",
-        "limit_chars": MAX_TOOL_CONTENT_CHARS,
+        "limit_chars": max_chars,
     }))?)
 }
 
@@ -1053,38 +1079,67 @@ async fn execute_scenario(
     parameters: &HashMap<String, f64>,
     _run_id: u8,
 ) -> Result<HashMap<String, f64>> {
+    let result = collect_scenario(config, scenario, telemetry, parameters).await?;
+    extract_metrics(scenario, &result)
+}
+
+pub(crate) async fn collect_scenario(
+    config: &AnomalyRecoveryModeConfig,
+    scenario: &SimulationScenario,
+    telemetry: &TelemetrySample,
+    parameters: &HashMap<String, f64>,
+) -> Result<SimulationResult> {
     let patches = build_patches(scenario, telemetry, parameters)?;
     let sim = config
         .simulation
         .as_ref()
         .ok_or_else(|| anyhow!("simulation is not configured"))?;
-    let simulator = SedaroSimulator::new(&sim.eds_path)
+    let prepared = crate::eds_inputs::prepare_inputs(sim, scenario, telemetry, patches)?;
+    let mut simulator = SedaroSimulator::new(&sim.eds_path)
         .timeout(Duration::from_millis(sim.run_timeout_ms))
-        .patch_multi(patches);
+        .patch_multi(prepared.patches);
+    if let Some(epoch) = prepared.epoch_mjd {
+        simulator = simulator.at_epoch(epoch);
+    }
     let result = simulator
         .run_collect(scenario.duration_days)
         .await
-        .map_err(|e| anyhow!("local EDS run failed: {}", sanitize(&e.to_string())))?;
-    if config.decision_trace {
-        log_simulation_outputs(scenario, &result);
+        .map_err(|e| {
+            anyhow!(
+                "local EDS run failed: {}",
+                sanitize(&e.to_string(), config.observability.diagnostic_max_chars)
+            )
+        })?;
+    if config.observability.decision_trace {
+        log_simulation_outputs(config, scenario, &result);
     }
-    extract_metrics(scenario, &result)
+    Ok(result)
 }
 
-fn log_simulation_outputs(scenario: &SimulationScenario, result: &SimulationResult) {
+fn log_simulation_outputs(
+    config: &AnomalyRecoveryModeConfig,
+    scenario: &SimulationScenario,
+    result: &SimulationResult,
+) {
     let mut files = result
         .frames_by_file
         .iter()
         .map(|(name, frames)| {
             let fields = frames
                 .first()
-                .map(|frame| frame.field_names().into_iter().take(32).collect::<Vec<_>>())
+                .map(|frame| {
+                    frame
+                        .field_names()
+                        .into_iter()
+                        .take(config.observability.simulation_trace_max_fields)
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             (name.as_str(), frames.len(), fields)
         })
         .collect::<Vec<_>>();
     files.sort_unstable_by_key(|(name, _, _)| *name);
-    files.truncate(16);
+    files.truncate(config.observability.simulation_trace_max_files);
     info!(
         decision_trace = true,
         stage = "simulation_outputs",
@@ -1110,7 +1165,13 @@ fn log_simulation_outputs(scenario: &SimulationScenario, result: &SimulationResu
             |(name, frames)| {
                 let fields = frames
                     .first()
-                    .map(|frame| frame.field_names().into_iter().take(32).collect::<Vec<_>>())
+                    .map(|frame| {
+                        frame
+                            .field_names()
+                            .into_iter()
+                            .take(config.observability.simulation_trace_max_fields)
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default();
                 (Some(name.as_str()), frames.len(), fields)
             },
@@ -1221,7 +1282,9 @@ fn evaluate<'a>(
     candidates: &'a [AnomalyCandidate],
     args: &SelectArguments,
 ) -> Result<(&'a AnomalyCandidate, AllowedAction)> {
-    if args.reason.trim().is_empty() || args.reason.chars().count() > MAX_SELECTION_REASON_CHARS {
+    if args.reason.trim().is_empty()
+        || args.reason.chars().count() > config.planner.limits.selection_reason_max_chars
+    {
         bail!("final reason is invalid");
     }
     let candidate = candidates
@@ -1245,6 +1308,20 @@ fn evaluate<'a>(
         bail!("final action is not configured");
     }
     Ok((candidate, action))
+}
+
+fn require_empty_simulation_board(snapshot: &crate::types::LiveContextSnapshot) -> Result<()> {
+    let board = snapshot
+        .board
+        .as_ref()
+        .ok_or_else(|| anyhow!("simulation requires a current command board"))?;
+    if !board.proposals.is_empty()
+        || !board.source_of_truth.is_empty()
+        || !board.approved.is_empty()
+    {
+        bail!("initialized recovery simulation cannot omit existing command-board plans");
+    }
+    Ok(())
 }
 
 fn board_conflicts_or_duplicates(
@@ -1283,27 +1360,270 @@ fn command(action: AllowedAction) -> Result<Command> {
         _ => bail!("unsupported recovery action"),
     }
 }
-fn bounded_json(result: &ToolResult) -> Result<String> {
-    let text = serde_json::to_string(result)?;
-    if text.chars().count() > MAX_TOOL_CONTENT_CHARS {
-        bail!("bounded simulation result exceeded tool content limit");
-    }
-    Ok(text)
-}
-fn sanitize(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(240).collect()
+fn sanitize(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use super::*;
     use safe_llm_adapter::{AdapterError, Completion};
 
+    struct ShutdownAdapter {
+        outcome: &'static str,
+        action: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAdapter for ShutdownAdapter {
+        fn kind(&self) -> &'static str {
+            "shutdown-test"
+        }
+        async fn complete(&self, _request: CompletionRequest) -> Result<Completion, AdapterError> {
+            unreachable!("native tools only")
+        }
+        async fn tool_chat(
+            &self,
+            request: ToolChatRequest,
+        ) -> Result<ToolChatCompletion, AdapterError> {
+            let name = request.tools[0]["function"]["name"].as_str().unwrap();
+            let arguments = match name {
+                "complete_thermal_assessment" => json!({
+                    "outcome": self.outcome,
+                    "disposition": if self.outcome == "thermal_anomaly" { "evaluate_recovery" } else { "monitor" },
+                    "candidate_ids": ["example-hot"], "evidence_ids": ["telemetry-1-1", "board-1-2"],
+                    "rationale": "Compute temperature is above its configured limit.",
+                    "uncertainty": "Cooling has not been simulated."
+                }),
+                "select_recovery_action" => json!({
+                    "assessment_id": "example-hot-1", "anomaly_id": "example-hot",
+                    "action_id": self.action, "reason": "Reduce compute-generated heat."
+                }),
+                _ => panic!("unexpected tool: {name}"),
+            };
+            Ok(ToolChatCompletion {
+                message: ToolChatMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        name: name.into(),
+                        arguments,
+                    }],
+                },
+                finish_reason: CompletionFinishReason::Complete,
+                diagnostic: None,
+            })
+        }
+    }
+
+    struct ShutdownRunner {
+        calls: Mutex<Vec<String>>,
+        behavior: &'static str,
+        context: LiveContext,
+    }
+
+    #[async_trait::async_trait]
+    impl ScenarioRunner for ShutdownRunner {
+        async fn run(&self, request: ScenarioRunRequest) -> Result<ScenarioRun> {
+            self.calls.lock().unwrap().push(request.scenario_id.clone());
+            if self.behavior == "error" {
+                bail!("EDS failed");
+            }
+            if self.behavior == "hang" {
+                std::future::pending::<()>().await;
+            }
+            let recovery = request.scenario_id == "compute_shutdown";
+            if recovery && self.behavior == "stale" {
+                self.context.update_board(Default::default());
+            }
+            let soc = if recovery && self.behavior == "low_soc" {
+                0.1
+            } else {
+                0.8
+            };
+            Ok(ScenarioRun {
+                scenario_id: request.scenario_id,
+                evidence_revision: request.evidence_revision,
+                horizon_days: request.horizon_days,
+                success: self.behavior != "failed",
+                timed_out: self.behavior == "timeout",
+                metrics: if self.behavior == "missing_metrics" {
+                    HashMap::new()
+                } else {
+                    ["final_state_of_charge", "minimum_state_of_charge"]
+                        .into_iter()
+                        .map(|id| {
+                            (
+                                id.into(),
+                                UnitMetric {
+                                    value: soc,
+                                    units: "fraction".into(),
+                                },
+                            )
+                        })
+                        .collect()
+                },
+            })
+        }
+    }
+
+    fn shutdown_request() -> PlanningRequest {
+        let mut config: AnomalyRecoveryModeConfig =
+            serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap();
+        config.planner.limits.max_prompt_chars = 6000;
+        config.validate().unwrap();
+        let telemetry = TelemetrySample {
+            source: Some("example".into()),
+            ts_mono: 2,
+            payload: json!({"telemetry": {"temperature_c": 70.0, "time_mjd_utc": 61290.0, "state_of_charge": 0.8}}),
+        };
+        let live_context = LiveContext::default();
+        live_context.update_telemetry(telemetry.clone(), 8);
+        live_context.update_board(Default::default());
+        PlanningRequest {
+            config,
+            candidates: vec![AnomalyCandidate {
+                profile_id: "example".into(),
+                rule_id: "hot".into(),
+                anomaly_id: "example-hot".into(),
+                source: "example".into(),
+                ts_mono: 2,
+                path: "telemetry.temperature_c".into(),
+                observed: json!(70.0),
+                expectation: "at most 60".into(),
+                severity: crate::config::AnomalySeverity::High,
+                eligible_actions: vec![AllowedAction::Shutdown],
+            }],
+            telemetry,
+            live_context,
+            mode_id: AutonomyModeId(uuid::Uuid::nil()),
+            generation: 1,
+            generations: Arc::new(AtomicU64::new(1)),
+            active: Arc::new(AtomicBool::new(true)),
+            cancel: CancellationToken::new(),
+            adapter: Arc::new(ShutdownAdapter {
+                outcome: "thermal_anomaly",
+                action: "shutdown",
+            }),
+            telemetry_version: 1,
+            board_version: 1,
+        }
+    }
+
+    fn shutdown_runner(request: &PlanningRequest, behavior: &'static str) -> Arc<ShutdownRunner> {
+        Arc::new(ShutdownRunner {
+            calls: Mutex::new(vec![]),
+            behavior,
+            context: request.live_context.clone(),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_assessment_runs_both_scenarios_and_returns_local_intent() {
+        let request = shutdown_request();
+        let runner = shutdown_runner(&request, "ok");
+        let PlanningOutcome::Shutdown(intent) = plan(request, runner.clone()).await.unwrap() else {
+            panic!("expected local shutdown, not a board command");
+        };
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            ["compute_on", "compute_shutdown"]
+        );
+        assert_eq!(intent.anomaly_id, "example-hot");
+        assert!(!intent.simulation.thermal_benefit_verified);
+        assert_eq!(
+            intent.simulation.recovery.metrics["final_state_of_charge"].value,
+            0.8
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_blocked_by_failed_or_stale_simulation() {
+        for behavior in [
+            "error",
+            "failed",
+            "timeout",
+            "missing_metrics",
+            "low_soc",
+            "stale",
+            "hang",
+        ] {
+            let mut request = shutdown_request();
+            if behavior == "hang" {
+                request.config.planner.total_timeout_ms = 20;
+            }
+            let runner = shutdown_runner(&request, behavior);
+            assert!(plan(request, runner).await.is_err(), "{behavior}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_eligible_action_and_anomaly_assessment() {
+        for outcome in ["no_thermal_anomaly", "inconclusive"] {
+            let mut request = shutdown_request();
+            request.adapter = Arc::new(ShutdownAdapter {
+                outcome,
+                action: "shutdown",
+            });
+            let runner = shutdown_runner(&request, "ok");
+            assert!(matches!(
+                plan(request, runner.clone()).await.unwrap(),
+                PlanningOutcome::Complete
+            ));
+            assert!(runner.calls.lock().unwrap().is_empty());
+        }
+        let mut request = shutdown_request();
+        request.candidates[0].eligible_actions.clear();
+        let runner = shutdown_runner(&request, "ok");
+        assert!(plan(request, runner.clone()).await.is_err());
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_simulation_does_not_return_shutdown_intent() {
+        let request = shutdown_request();
+        let cancel = request.cancel.clone();
+        let runner = shutdown_runner(&request, "hang");
+        let observed = runner.clone();
+        let task = tokio::spawn(plan(request, runner));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            PlanningOutcome::Complete
+        ));
+    }
+
     struct TextCompletionAdapter {
         requests: Mutex<Vec<CompletionRequest>>,
         completion: Completion,
+    }
+
+    struct FlakyTextAdapter {
+        outcomes: Mutex<VecDeque<Result<Completion, AdapterError>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAdapter for FlakyTextAdapter {
+        fn kind(&self) -> &'static str {
+            "flaky-text-test"
+        }
+
+        async fn complete(&self, _request: CompletionRequest) -> Result<Completion, AdapterError> {
+            self.outcomes.lock().unwrap().pop_front().unwrap()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1385,25 +1705,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_use_named_properties_and_allowed_values() {
-        let scenario = scenario();
-        let simulation = simulation_tool(&[&scenario]);
-        assert_eq!(simulation["function"]["name"], "run_eds_simulation");
-        assert_eq!(
-            simulation["function"]["parameters"]["properties"]["scenario_id"]["enum"][0],
-            "thermal"
-        );
-        assert_eq!(
-            simulation["function"]["parameters"]["properties"]["parameters"]["properties"]["gain"]
-                ["type"],
-            "number"
-        );
-        assert!(
-            simulation["function"]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-
-        let selection = select_tool(&[candidate()], None);
+        let mut config = config();
+        config.prompts.selection_tool_description = "Mission selection wording".into();
+        let selection = select_tool(&config, &[candidate()], None);
         assert_eq!(
             selection["function"]["parameters"]["properties"]["anomaly_id"]["enum"][0],
             "profile-r"
@@ -1411,6 +1715,10 @@ mod tests {
         assert_eq!(
             selection["function"]["parameters"]["properties"]["action_id"]["enum"][0],
             "point_nadir"
+        );
+        assert_eq!(
+            selection["function"]["description"],
+            "Mission selection wording"
         );
         assert_eq!(
             selection["function"]["parameters"]["required"],
@@ -1423,67 +1731,75 @@ mod tests {
         );
         assert_eq!(
             selection["function"]["parameters"]["properties"]["reason"]["maxLength"],
-            MAX_SELECTION_REASON_CHARS
+            config.planner.limits.selection_reason_max_chars
         );
 
         let mut ledger = EvidenceLedger::default();
         ledger.record("telemetry", 1, "ok", json!({}));
         ledger.record("board", 1, "ok", json!({}));
-        let assessment = assessment_tool(&[candidate()], &ledger);
+        let assessment = assessment_tool(&config, &[candidate()], &ledger);
         let properties = &assessment["function"]["parameters"]["properties"];
         assert_eq!(
             properties["rationale"]["maxLength"],
-            MAX_ASSESSMENT_RATIONALE_CHARS
+            config.planner.limits.assessment_rationale_max_chars
         );
         assert_eq!(
             properties["uncertainty"]["maxLength"],
-            MAX_ASSESSMENT_UNCERTAINTY_CHARS
+            config.planner.limits.assessment_uncertainty_max_chars
         );
-        assert_eq!(properties["forecast_risks"]["maxItems"], MAX_FORECAST_RISKS);
+        assert_eq!(
+            properties["forecast_risks"]["maxItems"],
+            config.planner.limits.forecast_risk_max_items
+        );
         assert_eq!(
             properties["forecast_risks"]["items"]["maxLength"],
-            MAX_FORECAST_RISK_CHARS
+            config.planner.limits.forecast_risk_max_chars
         );
 
-        let telemetry = latest_telemetry_tool();
+        let telemetry = latest_telemetry_tool(&config);
         assert_eq!(telemetry["function"]["name"], "get_latest_telemetry");
         assert_eq!(
             telemetry["function"]["parameters"]["additionalProperties"],
             false
         );
-        let board = command_board_tool();
+        let board = command_board_tool(&config);
         assert_eq!(board["function"]["name"], "get_command_board_state");
     }
 
     #[test]
     fn context_tools_return_latest_bounded_snapshots() {
         let context = LiveContext::default();
-        let unavailable = latest_telemetry_result(&context).unwrap();
+        let unavailable = latest_telemetry_result(&context, 2_000).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&unavailable).unwrap()["status"],
             "unavailable"
         );
 
-        context.update_telemetry(telemetry());
+        context.update_telemetry(telemetry(), 8);
         context.update_board(safe::protocol::AutonomyModeBoardState::default());
         let latest =
-            serde_json::from_str::<Value>(&latest_telemetry_result(&context).unwrap()).unwrap();
+            serde_json::from_str::<Value>(&latest_telemetry_result(&context, 2_000).unwrap())
+                .unwrap();
         assert_eq!(latest["status"], "ok");
         assert_eq!(latest["version"], 1);
         assert_eq!(latest["telemetry"]["ts_mono"], 1);
 
         let board =
-            serde_json::from_str::<Value>(&command_board_result(&context).unwrap()).unwrap();
+            serde_json::from_str::<Value>(&command_board_result(&context, 2_000).unwrap()).unwrap();
         assert_eq!(board["status"], "ok");
         assert_eq!(board["version"], 1);
 
-        context.update_telemetry(TelemetrySample {
-            source: None,
-            ts_mono: 2,
-            payload: json!({"data": "x".repeat(MAX_TOOL_CONTENT_CHARS)}),
-        });
+        context.update_telemetry(
+            TelemetrySample {
+                source: None,
+                ts_mono: 2,
+                payload: json!({"data": "x".repeat(2_000)}),
+            },
+            8,
+        );
         let oversized =
-            serde_json::from_str::<Value>(&latest_telemetry_result(&context).unwrap()).unwrap();
+            serde_json::from_str::<Value>(&latest_telemetry_result(&context, 2_000).unwrap())
+                .unwrap();
         assert_eq!(oversized["status"], "error");
     }
 
@@ -1500,11 +1816,11 @@ mod tests {
         };
         assert!(parse_read_context_arguments(&invalid, "get_latest_telemetry").is_err());
 
-        let scenario = scenario();
+        let config = config();
         let mut ledger = EvidenceLedger::default();
         ledger.record("telemetry", 1, "ok", json!({}));
         ledger.record("board", 1, "ok", json!({}));
-        let before_selection = phase_tools(&[candidate()], &[&scenario], 0, &ledger, None);
+        let before_selection = phase_tools(&[candidate()], &ledger, None, &config);
         assert_eq!(
             tool_names(&before_selection),
             vec!["complete_thermal_assessment"]
@@ -1519,7 +1835,7 @@ mod tests {
                 .iter()
                 .any(|tool| tool["function"]["name"] == "select_recovery_action")
         );
-        let after_assessment = phase_tools(&[candidate()], &[&scenario], 1, &ledger, None);
+        let after_assessment = phase_tools(&[candidate()], &ledger, None, &config);
         assert!(
             after_assessment
                 .iter()
@@ -1531,6 +1847,7 @@ mod tests {
     fn truncation_diagnostics_identify_turn_and_available_tools() {
         assert_eq!(
             truncation_detail(
+                6,
                 2,
                 &[
                     "get_latest_telemetry".to_string(),
@@ -1555,14 +1872,22 @@ mod tests {
 
     #[test]
     fn context_tools_use_a_small_output_budget() {
+        let config = config();
         assert_eq!(
-            output_budget(&[latest_telemetry_tool(), command_board_tool()], 256),
-            CONTEXT_TOOL_OUTPUT_TOKENS
+            output_budget(
+                &config,
+                &[latest_telemetry_tool(&config), command_board_tool(&config)]
+            ),
+            config.planner.limits.context_tool_output_tokens
         );
         assert_eq!(
             output_budget(
-                &[assessment_tool(&[candidate()], &EvidenceLedger::default())],
-                256
+                &config,
+                &[assessment_tool(
+                    &config,
+                    &[candidate()],
+                    &EvidenceLedger::default()
+                )],
             ),
             256
         );
@@ -1571,8 +1896,10 @@ mod tests {
     #[test]
     fn request_token_estimate_counts_messages_and_tools() {
         let messages = fresh_selection_messages("inspect context".into());
+        let config = config();
         let without_tools = estimate_request_tokens(&messages, &[]).unwrap();
-        let with_tools = estimate_request_tokens(&messages, &[latest_telemetry_tool()]).unwrap();
+        let with_tools =
+            estimate_request_tokens(&messages, &[latest_telemetry_tool(&config)]).unwrap();
         assert!(without_tools > 0);
         assert!(with_tools > without_tools);
     }
@@ -1581,6 +1908,8 @@ mod tests {
     async fn textual_mode_uses_completion_and_normalizes_json_as_the_available_operation() {
         let mut mode_config = config();
         mode_config.llm.enable_tool_calls = false;
+        mode_config.prompts.textual_transport_instructions =
+            "MISSION JSON TRANSPORT INSTRUCTIONS".into();
         let adapter = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
@@ -1596,7 +1925,7 @@ mod tests {
             &mode_config,
             &adapter,
             fresh_selection_messages("assess now".into()),
-            vec![assessment_tool(&[candidate()], &ledger)],
+            vec![assessment_tool(&mode_config, &[candidate()], &ledger)],
             256,
         )
         .await
@@ -1615,7 +1944,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let prompt = &requests[0].prompt;
         assert!(prompt.starts_with("Perform operation `complete_thermal_assessment`"));
-        assert!(prompt.contains("Do not repeat or summarize the input"));
+        assert!(prompt.contains("MISSION JSON TRANSPORT INSTRUCTIONS"));
         assert!(prompt.contains("complete response must fit within 256 tokens"));
         assert!(prompt.contains(
             "Emit required keys in this exact order: outcome, disposition, candidate_ids, evidence_ids, rationale, uncertainty"
@@ -1631,11 +1960,17 @@ mod tests {
         assert_eq!(requests[0].response_schema["type"], "object");
         assert_eq!(
             requests[0].response_schema["properties"]["rationale"]["maxLength"],
-            TEXTUAL_ASSESSMENT_RATIONALE_CHARS
+            mode_config
+                .planner
+                .limits
+                .textual_assessment_rationale_max_chars
         );
         assert_eq!(
             requests[0].response_schema["properties"]["uncertainty"]["maxLength"],
-            TEXTUAL_ASSESSMENT_UNCERTAINTY_CHARS
+            mode_config
+                .planner
+                .limits
+                .textual_assessment_uncertainty_max_chars
         );
         assert!(
             requests[0].response_schema["properties"]
@@ -1645,7 +1980,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_provider_attempts_retry_transient_failures() {
+        let mut mode_config = config();
+        mode_config.llm.enable_tool_calls = false;
+        mode_config.planner.provider_attempts = 2;
+        mode_config.planner.provider_retry_backoff_ms = 0;
+        let adapter = FlakyTextAdapter {
+            outcomes: Mutex::new(VecDeque::from([
+                Err(AdapterError::Timeout),
+                Ok(Completion {
+                    text: r#"{"outcome":"inconclusive","disposition":"monitor","candidate_ids":[],"evidence_ids":[],"rationale":"Retry succeeded.","uncertainty":"Evidence remains limited."}"#.into(),
+                    finish_reason: CompletionFinishReason::Complete,
+                }),
+            ])),
+        };
+        let response = dispatch_chat(
+            &mode_config,
+            &adapter,
+            fresh_selection_messages("assess now".into()),
+            vec![assessment_tool(
+                &mode_config,
+                &[candidate()],
+                &EvidenceLedger::default(),
+            )],
+            256,
+        )
+        .await
+        .expect("second configured provider attempt should succeed");
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert!(adapter.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn textual_mode_normalizes_recovery_selection() {
+        let mode_config = config();
         let adapter = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
@@ -1654,10 +2022,14 @@ mod tests {
             },
         };
         let response = textual_chat(
-            &config(),
+            &mode_config,
             &adapter,
             fresh_selection_messages("select now".into()),
-            vec![select_tool(&[candidate()], Some("assessment-1"))],
+            vec![select_tool(
+                &mode_config,
+                &[candidate()],
+                Some("assessment-1"),
+            )],
             256,
         )
         .await
@@ -1678,27 +2050,31 @@ mod tests {
         ));
         assert_eq!(
             requests[0].response_schema["properties"]["reason"]["maxLength"],
-            TEXTUAL_SELECTION_REASON_CHARS
+            mode_config
+                .planner
+                .limits
+                .textual_selection_reason_max_chars
         );
     }
 
     #[tokio::test]
     async fn textual_assessment_can_exceed_the_legacy_completion_limit() {
         let mode_config = config();
+        let limits = &mode_config.planner.limits;
         let text = json!({
             "outcome": "inconclusive",
             "disposition": "monitor",
             "candidate_ids": ["profile-r"],
             "evidence_ids": ["telemetry:1", "board:1"],
-            "rationale": "r".repeat(MAX_ASSESSMENT_RATIONALE_CHARS),
-            "uncertainty": "u".repeat(MAX_ASSESSMENT_UNCERTAINTY_CHARS),
+            "rationale": "r".repeat(limits.assessment_rationale_max_chars),
+            "uncertainty": "u".repeat(limits.assessment_uncertainty_max_chars),
             "forecast_risks": [
-                "a".repeat(MAX_FORECAST_RISK_CHARS),
-                "b".repeat(MAX_FORECAST_RISK_CHARS)
+                "a".repeat(limits.forecast_risk_max_chars),
+                "b".repeat(limits.forecast_risk_max_chars)
             ]
         })
         .to_string();
-        assert!(text.chars().count() > mode_config.max_response_chars);
+        assert!(text.chars().count() > limits.max_response_chars);
         let adapter = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
@@ -1711,19 +2087,23 @@ mod tests {
             &mode_config,
             &adapter,
             fresh_selection_messages("assess now".into()),
-            vec![assessment_tool(&[candidate()], &EvidenceLedger::default())],
+            vec![assessment_tool(
+                &mode_config,
+                &[candidate()],
+                &EvidenceLedger::default(),
+            )],
             256,
         )
         .await
         .expect("bounded assessment fields may exceed the legacy completion limit");
-        validate_response_size(&response.message, mode_config.max_response_chars)
+        validate_response_size(&mode_config, &response.message)
             .expect("assessment should remain within the structured planner bound");
     }
 
     #[tokio::test]
     async fn textual_mode_rejects_ambiguous_and_malformed_responses() {
         let mut mode_config = config();
-        let operation = assessment_tool(&[candidate()], &EvidenceLedger::default());
+        let operation = assessment_tool(&mode_config, &[candidate()], &EvidenceLedger::default());
         let messages = fresh_selection_messages("assess now".into());
         let malformed = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
@@ -1767,7 +2147,7 @@ mod tests {
             .contains("exactly one available operation")
         );
 
-        mode_config.max_response_chars = 4;
+        mode_config.planner.limits.max_response_chars = 4;
         let oversized = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
@@ -1779,7 +2159,7 @@ mod tests {
             .await
             .expect("textual transport should use the shared planner response bound");
         assert!(
-            validate_response_size(&response.message, mode_config.max_response_chars)
+            validate_response_size(&mode_config, &response.message)
                 .unwrap_err()
                 .to_string()
                 .contains("bounded limit")
@@ -1788,6 +2168,7 @@ mod tests {
 
     #[tokio::test]
     async fn textual_mode_preserves_truncation_without_parsing_partial_json() {
+        let mode_config = config();
         let adapter = TextCompletionAdapter {
             requests: Mutex::new(Vec::new()),
             completion: Completion {
@@ -1796,16 +2177,54 @@ mod tests {
             },
         };
         let response = textual_chat(
-            &config(),
+            &mode_config,
             &adapter,
             fresh_selection_messages("assess now".into()),
-            vec![assessment_tool(&[candidate()], &EvidenceLedger::default())],
+            vec![assessment_tool(
+                &mode_config,
+                &[candidate()],
+                &EvidenceLedger::default(),
+            )],
             256,
         )
         .await
         .unwrap();
         assert_eq!(response.finish_reason, CompletionFinishReason::Length);
         assert!(response.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn standalone_simulation_requires_an_empty_known_command_board() {
+        let mut snapshot = crate::types::LiveContextSnapshot::default();
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board = Some(safe::protocol::AutonomyModeBoardState::default());
+        assert!(require_empty_simulation_board(&snapshot).is_ok());
+        let id = safe::protocol::BoardCmdId("existing".into());
+        snapshot
+            .board
+            .as_mut()
+            .unwrap()
+            .source_of_truth
+            .push(id.clone());
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board.as_mut().unwrap().source_of_truth.clear();
+        snapshot
+            .board
+            .as_mut()
+            .unwrap()
+            .approved
+            .insert(id.clone(), vec![]);
+        assert!(require_empty_simulation_board(&snapshot).is_err());
+        snapshot.board.as_mut().unwrap().approved.clear();
+        snapshot.board.as_mut().unwrap().proposals.insert(
+            id,
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                TimedCommand::Now(Command::CaptureImage),
+                1,
+            ),
+        );
+        assert!(require_empty_simulation_board(&snapshot).is_err());
     }
 
     #[test]

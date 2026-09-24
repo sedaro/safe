@@ -109,6 +109,16 @@ the host command dispatch integration is incomplete. A CLI status of
 `dispatched` means SAFE accepted the request and queued its internal event; it
 does not prove host execution.
 
+The anomaly-recovery mode also supports a mode-local `shutdown` action. After
+its own compute-on/shutdown power simulations pass, the mode invokes
+its configured `shutdown_command` (default `/sbin/shutdown -h now`) directly.
+This action does not enter the command board,
+gatekeeper or egress adapters; its durable attempt/results record is
+`state/modes/<mode-uuid>/shutdown-attempt.jsonl`. See the
+[shutdown recovery configuration](../../mode-anomaly-recovery/README.md#local-shutdown-recovery)
+for Linux launch permissions, namespace settings, simulation bindings and retry
+semantics.
+
 ## Operational Status
 
 `state/status.json` contains a snapshot with:

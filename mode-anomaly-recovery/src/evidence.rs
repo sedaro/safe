@@ -5,8 +5,6 @@ use serde_json::{Value, json};
 
 use crate::types::LiveContextSnapshot;
 
-pub(crate) const MAX_EVIDENCE_ITEMS: usize = 16;
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EvidenceItem {
     pub(crate) id: String,
@@ -16,12 +14,20 @@ pub(crate) struct EvidenceItem {
     pub(crate) summary: Value,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct EvidenceLedger {
     items: Vec<EvidenceItem>,
+    max_items: usize,
 }
 
 impl EvidenceLedger {
+    pub(crate) fn new(max_items: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            max_items,
+        }
+    }
+
     pub(crate) fn record(
         &mut self,
         kind: &'static str,
@@ -30,7 +36,7 @@ impl EvidenceLedger {
         summary: Value,
     ) -> String {
         let id = format!("{kind}-{version}-{}", self.items.len() + 1);
-        if self.items.len() == MAX_EVIDENCE_ITEMS {
+        if self.items.len() == self.max_items {
             self.items.remove(0);
         }
         self.items.push(EvidenceItem {
@@ -56,8 +62,20 @@ impl EvidenceLedger {
         self.items.iter().any(|item| item.kind == kind)
     }
 
+    pub(crate) fn kind_is_unavailable(&self, kind: &str) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.kind == kind && item.status == "unavailable")
+    }
+
     pub(crate) fn prompt_value(&self) -> Value {
         json!(self.items)
+    }
+}
+
+impl Default for EvidenceLedger {
+    fn default() -> Self {
+        Self::new(16)
     }
 }
 
@@ -108,5 +126,15 @@ mod tests {
         let board = ledger.record("board", 2, "unavailable", json!({}));
         assert!(ledger.contains_all(&[telemetry, board]));
         assert!(ledger.has_kind("telemetry"));
+    }
+
+    #[test]
+    fn configured_capacity_evicts_oldest_evidence() {
+        let mut ledger = EvidenceLedger::new(2);
+        let oldest = ledger.record("telemetry", 1, "ok", json!({}));
+        let retained = ledger.record("board", 1, "ok", json!({}));
+        ledger.record("telemetry", 2, "ok", json!({}));
+        assert!(!ledger.contains_all(&[oldest]));
+        assert!(ledger.contains_all(&[retained]));
     }
 }
