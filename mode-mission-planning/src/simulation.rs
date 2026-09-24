@@ -1,16 +1,21 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use safe::protocol::TimedCommand;
 use safe::telemetry_frame::TelemetryFrame;
-use safe_sim::{EdsFrame, EdsPatch, MonteCarloStudy, SedaroSimulator, SimulationResult};
+use safe_sim::{EdsFrame, EdsPatch, SedaroSimulator, SimulationResult};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::config::{CheckAggregation, ComparisonOp, FieldCheck, MissionPlanningConfig};
+use crate::config::{
+    CheckAggregation, ComparisonOp, FieldCheck, MissionPlanningConfig, MonteCarloConfig,
+    MonteCarloOperation, MonteCarloVariation,
+};
 use crate::planning::PlanningSample;
 
 /// Wire-compatible with the gatekeeper input adapter contract without making
@@ -56,29 +61,17 @@ pub(crate) async fn validate_candidate_schedule(
     let Some(monte_carlo) = &config.monte_carlo else {
         return Ok(());
     };
-    reject_conflicting_monte_carlo_targets(&input.patches, monte_carlo)?;
     let simulator = SedaroSimulator::new(&config.eds_path)
         .at_epoch(input.start_time_mjd)
-        .patch_multi(input.patches)
         .timeout(Duration::from_secs(config.simulation_timeout_secs));
-    let mut study = MonteCarloStudy::new(
-        simulator.clone(),
-        config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY,
-    )
-    .samples(monte_carlo.samples)
-    .seed(monte_carlo.seed);
-    for parameter in &monte_carlo.parameters {
-        study = study.parameter(parameter.clone());
-    }
     let mut passed = 0;
     let mut failures = Vec::new();
     // Run cases one at a time so their decoded EDS outputs are released before
     // the next sample. Retaining a complete study can exhaust a flight host.
-    for case in study.generate_cases()? {
-        let id = case.id;
+    for (id, patches) in generate_monte_carlo_cases(monte_carlo, &input.patches)? {
         let result = simulator
             .clone()
-            .patch_multi(case.patches)
+            .patch_multi(patches)
             .run_collect(config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY)
             .await;
         match result {
@@ -102,24 +95,126 @@ pub(crate) async fn validate_candidate_schedule(
     Ok(())
 }
 
-fn reject_conflicting_monte_carlo_targets(
+fn generate_monte_carlo_cases(
+    config: &MonteCarloConfig,
     baseline_patches: &[EdsPatch],
-    monte_carlo: &crate::config::MonteCarloConfig,
-) -> Result<()> {
-    let baseline_targets = baseline_patches
-        .iter()
-        .map(|patch| (&patch.agent_id, &patch.engine, &patch.field))
-        .collect::<HashSet<_>>();
-    for parameter in &monte_carlo.parameters {
-        let target = &parameter.target;
-        if baseline_targets.contains(&(&target.agent_id, &target.engine, &target.field)) {
+) -> Result<Vec<(String, Vec<EdsPatch>)>> {
+    let mut indices = HashMap::new();
+    for (index, patch) in baseline_patches.iter().enumerate() {
+        let key = patch_key(patch);
+        if indices.insert(key.clone(), index).is_some() {
+            bail!("simulation input adapter returned duplicate patch target '{key}'");
+        }
+    }
+    let mut names = HashSet::new();
+    let mut targets = HashSet::new();
+    for variation in &config.variations {
+        if variation.name.trim().is_empty() || !names.insert(variation.name.as_str()) {
+            bail!("Monte Carlo variations must have unique non-empty names");
+        }
+        if !targets.insert(patch_key_target(&variation.target)) {
+            bail!("Monte Carlo variations must have unique targets");
+        }
+        if let Some(bounds) = variation.bounds
+            && matches!((bounds.min, bounds.max), (Some(min), Some(max)) if min > max)
+        {
             bail!(
-                "monte_carlo parameter '{}' targets an adapter patch; safe_sim::MonteCarloStudy cannot replace adapter-produced patches",
+                "Monte Carlo variation '{}' bounds require min <= max",
+                variation.name
+            );
+        }
+    }
+    for parameter in &config.parameters {
+        if parameter.name.trim().is_empty() || !names.insert(parameter.name.as_str()) {
+            bail!("Monte Carlo parameters must have unique non-empty names");
+        }
+        if !targets.insert(patch_key_target(&parameter.target)) {
+            bail!("Monte Carlo parameters and variations must have unique targets");
+        }
+        if indices.contains_key(&patch_key_target(&parameter.target)) {
+            bail!(
+                "Monte Carlo parameter '{}' targets an adapter patch; use a variation for baseline perturbations",
                 parameter.name
             );
         }
     }
-    Ok(())
+
+    let mut seed_rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let mut cases = Vec::with_capacity(config.samples);
+    for index in 0..config.samples {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed_rng.next_u64());
+        let mut patches = baseline_patches.to_vec();
+        for parameter in &config.parameters {
+            let value = parameter.distribution.sample(&mut rng)?;
+            if !value.is_finite() {
+                bail!(
+                    "Monte Carlo parameter '{}' generated a non-finite value",
+                    parameter.name
+                );
+            }
+            patches.push(parameter.target.patch_f64(value));
+        }
+        for variation in &config.variations {
+            let target = patch_key_target(&variation.target);
+            let baseline_index = indices.get(&target).copied();
+            let baseline = baseline_index
+                .map(|index| patches[index].value.parse::<f64>())
+                .transpose()
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid baseline for '{}': {error}", variation.name)
+                })?;
+            let value =
+                sample_variation(variation, baseline, config.max_resample_attempts, &mut rng)?;
+            if let Some(index) = baseline_index {
+                patches[index].value = value.to_string();
+            } else {
+                patches.push(variation.target.patch_f64(value));
+            }
+        }
+        cases.push((format!("sample-{index:04}"), patches));
+    }
+    Ok(cases)
+}
+
+fn sample_variation(
+    variation: &MonteCarloVariation,
+    baseline: Option<f64>,
+    attempts: usize,
+    rng: &mut ChaCha8Rng,
+) -> Result<f64> {
+    for _ in 0..attempts {
+        let sampled = variation.distribution.sample(rng)?;
+        let value = match variation.operation {
+            MonteCarloOperation::Replace => sampled,
+            MonteCarloOperation::Add => {
+                baseline.context("add operation requires a baseline")? + sampled
+            }
+            MonteCarloOperation::Multiply => {
+                baseline.context("multiply operation requires a baseline")? * sampled
+            }
+        };
+        if value.is_finite()
+            && variation.bounds.is_none_or(|bounds| {
+                bounds.min.is_none_or(|min| value >= min)
+                    && bounds.max.is_none_or(|max| value <= max)
+            })
+        {
+            return Ok(value);
+        }
+    }
+    bail!(
+        "Monte Carlo variation '{}' could not produce an in-bounds value after {} attempts",
+        variation.name,
+        attempts
+    )
+}
+
+fn patch_key(patch: &EdsPatch) -> String {
+    format!("{}/{}/{}", patch.agent_id, patch.engine, patch.field)
+}
+
+fn patch_key_target(target: &safe_sim::EdsPatchTarget) -> String {
+    format!("{}/{}/{}", target.agent_id, target.engine, target.field)
 }
 
 async fn run_patches(
