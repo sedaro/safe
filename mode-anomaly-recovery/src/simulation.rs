@@ -3,23 +3,21 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::config::AllowedAction;
-use crate::config::{ConstraintKind, SimulationScenario, SimulationScenarioRole};
-
-pub(crate) const FINAL_SOC: &str = "final_state_of_charge";
-pub(crate) const MIN_SOC: &str = "minimum_state_of_charge";
-pub(crate) const MAX_SOC_DEGRADATION: &str = "maximum_state_of_charge_degradation";
+use crate::config::{
+    ConstraintKind, SimulationScenario, SimulationScenarioRole, SimulationViabilityConfig,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScenarioRunRequest {
     pub(crate) scenario_id: String,
-    pub(crate) modeled_action: Option<AllowedAction>,
     pub(crate) evidence_revision: u64,
     pub(crate) horizon_days: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScenarioRun {
     pub(crate) scenario_id: String,
     pub(crate) success: bool,
@@ -29,7 +27,7 @@ pub(crate) struct ScenarioRun {
     pub(crate) metrics: HashMap<String, UnitMetric>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct UnitMetric {
     pub(crate) value: f64,
     pub(crate) units: String,
@@ -40,11 +38,11 @@ pub(crate) trait ScenarioRunner: Send + Sync {
     async fn run(&self, request: ScenarioRunRequest) -> Result<ScenarioRun>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct PairedSimulation {
+    pub(crate) thermal_benefit_verified: bool,
     pub(crate) baseline: ScenarioRun,
     pub(crate) recovery: ScenarioRun,
-    pub(crate) thermal_benefit_verified: bool,
 }
 
 /// Validate the action-specific contract after selection. This deliberately
@@ -53,6 +51,7 @@ pub(crate) async fn run_and_validate(
     runner: Arc<dyn ScenarioRunner>,
     baseline: &SimulationScenario,
     recovery: &SimulationScenario,
+    viability: &SimulationViabilityConfig,
     action: AllowedAction,
     evidence_revision: u64,
     horizon_days: f64,
@@ -60,7 +59,7 @@ pub(crate) async fn run_and_validate(
     if recovery.role != Some(SimulationScenarioRole::Recovery)
         || recovery.modeled_action != Some(action)
         || recovery.baseline_scenario_id.as_deref() != Some(baseline.id.as_str())
-        || recovery.command_schedule_binding.is_none()
+        || !recovery.has_action_binding()
     {
         bail!("selected action does not match the recovery scenario contract");
     }
@@ -72,9 +71,12 @@ pub(crate) async fn run_and_validate(
         bail!("baseline and recovery are not paired to the same frozen state and horizon");
     }
     for (metric_id, kind) in [
-        (FINAL_SOC, ConstraintKind::Minimum),
-        (MIN_SOC, ConstraintKind::Minimum),
-        (MAX_SOC_DEGRADATION, ConstraintKind::Maximum),
+        (viability.final_soc_metric.as_str(), ConstraintKind::Minimum),
+        (viability.min_soc_metric.as_str(), ConstraintKind::Minimum),
+        (
+            viability.max_soc_degradation_metric.as_str(),
+            ConstraintKind::Maximum,
+        ),
     ] {
         if !recovery
             .constraints
@@ -91,7 +93,6 @@ pub(crate) async fn run_and_validate(
     let baseline_run = runner
         .run(ScenarioRunRequest {
             scenario_id: baseline.id.clone(),
-            modeled_action: None,
             evidence_revision,
             horizon_days,
         })
@@ -99,7 +100,6 @@ pub(crate) async fn run_and_validate(
     let recovery_run = runner
         .run(ScenarioRunRequest {
             scenario_id: recovery.id.clone(),
-            modeled_action: Some(action),
             evidence_revision,
             horizon_days,
         })
@@ -107,23 +107,29 @@ pub(crate) async fn run_and_validate(
 
     validate_run(&baseline_run, &baseline.id, evidence_revision, horizon_days)?;
     validate_run(&recovery_run, &recovery.id, evidence_revision, horizon_days)?;
-    let baseline_final = required_metric(&baseline_run, FINAL_SOC)?;
-    let baseline_min = required_metric(&baseline_run, MIN_SOC)?;
-    let recovery_final = required_metric(&recovery_run, FINAL_SOC)?;
-    let recovery_min = required_metric(&recovery_run, MIN_SOC)?;
+    let baseline_final = required_metric(&baseline_run, &viability.final_soc_metric)?;
+    let baseline_min = required_metric(&baseline_run, &viability.min_soc_metric)?;
+    let recovery_final = required_metric(&recovery_run, &viability.final_soc_metric)?;
+    let recovery_min = required_metric(&recovery_run, &viability.min_soc_metric)?;
+    if [baseline_min, recovery_final, recovery_min]
+        .iter()
+        .any(|m| m.units != baseline_final.units)
+    {
+        bail!("paired SOC metrics must use the same units");
+    }
     let degradation = UnitMetric {
         value: (baseline_final.value - recovery_final.value)
             .max(baseline_min.value - recovery_min.value)
             .max(0.0),
         units: baseline_final.units.clone(),
     };
-    validate_constraints(recovery, &recovery_run, &degradation)?;
+    validate_constraints(recovery, &recovery_run, &degradation, viability)?;
     Ok(PairedSimulation {
         thermal_benefit_verified: recovery.thermal
             && recovery
                 .metrics
                 .iter()
-                .any(|metric| metric.quantity == "temperature"),
+                .any(|metric| metric.quantity == viability.temperature_quantity),
         baseline: baseline_run,
         recovery: recovery_run,
     })
@@ -157,9 +163,10 @@ fn validate_constraints(
     scenario: &SimulationScenario,
     run: &ScenarioRun,
     degradation: &UnitMetric,
+    viability: &SimulationViabilityConfig,
 ) -> Result<()> {
     for constraint in &scenario.constraints {
-        let metric = if constraint.metric_id == MAX_SOC_DEGRADATION {
+        let metric = if constraint.metric_id == viability.max_soc_degradation_metric {
             degradation
         } else {
             run.metrics.get(&constraint.metric_id).ok_or_else(|| {
@@ -192,6 +199,10 @@ mod tests {
     use crate::config::{SimulationConstraint, SimulationMetric};
     use std::sync::Mutex;
 
+    const FINAL_SOC: &str = "final_state_of_charge";
+    const MIN_SOC: &str = "minimum_state_of_charge";
+    const MAX_SOC_DEGRADATION: &str = "maximum_state_of_charge_degradation";
+
     struct FakeRunner {
         runs: Mutex<Vec<Result<ScenarioRun, String>>>,
     }
@@ -220,6 +231,7 @@ mod tests {
             role: Some(role),
             command_schedule_binding: (role == SimulationScenarioRole::Recovery)
                 .then(|| "schedule".into()),
+            compute_power_binding: None,
             state_bindings: vec![],
             constraints: vec![
                 SimulationConstraint {
@@ -300,6 +312,7 @@ mod tests {
             }),
             &scenario("baseline", SimulationScenarioRole::Baseline),
             &scenario("recovery", SimulationScenarioRole::Recovery),
+            &SimulationViabilityConfig::default(),
             AllowedAction::PointNadir,
             7,
             1.0,
@@ -330,6 +343,7 @@ mod tests {
                     }),
                     &baseline,
                     &recovery,
+                    &SimulationViabilityConfig::default(),
                     AllowedAction::PointNadir,
                     7,
                     1.0
@@ -347,6 +361,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0
@@ -361,6 +376,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0
@@ -368,6 +384,33 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn inconsistent_soc_units_and_nonfinite_metrics_block() {
+        for units in ["percent", "fraction"] {
+            let mut baseline = run("baseline", 0.8);
+            let metric = baseline.metrics.get_mut(MIN_SOC).unwrap();
+            metric.units = units.into();
+            if units == "fraction" {
+                metric.value = f64::NAN;
+            }
+            assert!(
+                run_and_validate(
+                    Arc::new(FakeRunner {
+                        runs: Mutex::new(vec![Ok(baseline), Ok(run("recovery", 0.75))])
+                    }),
+                    &scenario("baseline", SimulationScenarioRole::Baseline),
+                    &scenario("recovery", SimulationScenarioRole::Recovery),
+                    &SimulationViabilityConfig::default(),
+                    AllowedAction::PointNadir,
+                    7,
+                    1.0,
+                )
+                .await
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -381,6 +424,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointSunYaw,
                 7,
                 1.0
@@ -397,6 +441,7 @@ mod tests {
                 }),
                 &baseline,
                 &recovery,
+                &SimulationViabilityConfig::default(),
                 AllowedAction::PointNadir,
                 7,
                 1.0

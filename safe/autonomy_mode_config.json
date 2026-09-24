@@ -12,6 +12,8 @@
     },
     "persist_work_dir": true,
     "mode_config": {
+      "schema_version": 1,
+      "shutdown_command": ["/sbin/shutdown", "-h", "now"],
       "llm": {
         "adapter": {
           "kind": "ollama",
@@ -21,17 +23,15 @@
         },
         "model": "mistral:7b",
         "max_output_tokens": 256,
-        "context_window_tokens": 2048,
+        "context_window_tokens": 16384,
         "context_safety_margin_tokens": 256
       },
+      "planner": {"limits": {"max_prompt_chars": 6000}},
+      "replanning": {"require_board_snapshot": true},
       "action_catalog": [
         {
-          "id": "point_sun_yaw",
-          "description": "Place the spacecraft in the approved sun-yaw recovery posture."
-        },
-        {
-          "id": "point_nadir",
-          "description": "Place the spacecraft in the approved nadir recovery posture."
+            "id": "shutdown",
+            "description": "Shut down the Linux processing unit to reduce compute-generated heat after passing power viability."
         }
       ],
 
@@ -48,8 +48,7 @@
               "min_consecutive_samples": 2,
               "severity": "high",
               "eligible_actions": [
-                "point_sun_yaw",
-                "point_nadir"
+                  "shutdown"
               ]
             }
           ]
@@ -57,58 +56,96 @@
       ],
 
       "simulation": {
-        "eds_path": "/Users/wdaughtridge/Downloads/bundle/eds",
+        "eds_path": "/path/to/eds/workspace",
         "max_runs": 2,
         "run_timeout_ms": 10000,
+        "initialization": {
+          "source": "example",
+          "epoch_path": "telemetry.time_mjd_utc",
+          "patches": [
+            {"agent_id": "spacecraft", "engine": "power", "field": "battery.soc", "type": "f64", "telemetry_path": "telemetry.state_of_charge"}
+          ],
+          "requirements": [
+            {"path": "telemetry.state_of_charge", "min": 0.0, "max": 1.0}
+          ],
+          "compute_power_bindings": [
+            {
+              "id": "example_compute_load",
+              "agent_id": "spacecraft",
+              "engine": "power",
+              "field": "compute.power",
+              "operating_power_w": 12.0,
+              "shutdown_power_w": 0.5
+            }
+          ]
+        },
         "scenarios": [
           {
-            "id": "thermal_recovery",
-            "description": "Evaluate approved thermal-recovery postures.",
+            "id": "thermal_baseline",
+            "description": "Synthetic example: evaluate the frozen state with compute operating.",
             "applicable_rule_ids": ["temperature_high"],
-            "allowed_actions": [
-              "point_sun_yaw",
-              "point_nadir"
-            ],
+            "allowed_actions": ["shutdown"],
+            "role": "baseline",
             "duration_days": 0.05,
-
-            "patches": [
-              {
-                "agent_id": "spacecraft",
-                "engine": "power",
-                "field": "root!.battery_temperature_c",
-                "type": "f64",
-                "telemetry_path": "telemetry.temperature_c"
-              },
-              {
-                "agent_id": "spacecraft",
-                "engine": "power",
-                "field": "root!.thermal_gain",
-                "type": "f64",
-                "value": 1.0
-              }
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
             ],
-
-            "parameters": [
-              {
-                "id": "thermal_gain",
-                "patch_index": 1,
-                "min": 0.8,
-                "max": 1.2
-              }
-            ],
-
             "metrics": [
               {
-                "id": "peak_temperature_c",
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
                 "target_file": "spacecraft.power.jsonl",
-                "field": "battery_temperature_c",
-                "aggregation": "max"
+                "field": "battery.soc",
+                "aggregation": "last"
               },
               {
-                "id": "final_temperature_c",
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
                 "target_file": "spacecraft.power.jsonl",
-                "field": "battery_temperature_c",
+                "field": "battery.soc",
+                "aggregation": "min"
+              }
+            ]
+          },
+          {
+            "id": "compute_shutdown_recovery",
+            "description": "Synthetic example: evaluate compute's residual shutdown power draw.",
+            "applicable_rule_ids": ["temperature_high"],
+            "allowed_actions": ["shutdown"],
+            "baseline_scenario_id": "thermal_baseline",
+            "modeled_action": "shutdown",
+            "role": "recovery",
+            "compute_power_binding": "example_compute_load",
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
+            ],
+            "constraints": [
+              {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.3, "units": "fraction"},
+              {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+              {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+            ],
+            "thermal": false,
+            "duration_days": 0.05,
+            "metrics": [
+              {
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
                 "aggregation": "last"
+              },
+              {
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
+                "aggregation": "min"
               }
             ]
           }

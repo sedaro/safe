@@ -4,6 +4,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicU64},
 };
+use std::time::Instant;
 
 use safe::protocol::AutonomyModeBoardState;
 use safe_llm_adapter::{AdapterRegistry, LlmAdapter};
@@ -41,7 +42,7 @@ impl LiveContext {
             .unwrap_or_else(|error| error.into_inner()) = LiveContextSnapshot::default();
     }
 
-    pub(crate) fn update_telemetry(&self, telemetry: TelemetrySample) {
+    pub(crate) fn update_telemetry(&self, telemetry: TelemetrySample, history_limit: usize) {
         let mut snapshot = self
             .snapshot
             .write()
@@ -53,7 +54,7 @@ impl LiveContext {
                 .is_none_or(|previous| previous.ts_mono < telemetry.ts_mono)
             {
                 history.push_back(telemetry.clone());
-                while history.len() > 8 {
+                while history.len() > history_limit {
                     history.pop_front();
                 }
             }
@@ -128,6 +129,7 @@ pub(crate) struct RuleState {
 }
 
 pub(crate) struct AnomalyRecoveryMode {
+    pub(crate) recovery_runtime: Option<crate::recovery_runtime::RecoveryRuntime>,
     pub(crate) config: AnomalyRecoveryModeConfig,
     pub(crate) adapter_registry: AdapterRegistry,
     pub(crate) adapter: Option<Arc<dyn LlmAdapter>>,
@@ -140,15 +142,20 @@ pub(crate) struct AnomalyRecoveryMode {
     pub(crate) has_board_snapshot: bool,
     pub(crate) last_plan_signature: Option<String>,
     pub(crate) warned_missing_board_snapshot: bool,
+    pub(crate) next_plan_retry: Option<Instant>,
     pub(crate) planning_generation: Arc<AtomicU64>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) planning_cancel: Option<CancellationToken>,
-    pub(crate) planning_task: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) planning_task:
+        Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::actions::ShutdownIntent>>>>,
+    pub(crate) shutdown_intent: Option<crate::actions::ShutdownIntent>,
+    pub(crate) shutdown_controller: crate::actions::ShutdownController,
 }
 
 impl AnomalyRecoveryMode {
     pub(crate) fn new(adapter_registry: AdapterRegistry) -> Self {
         Self {
+            recovery_runtime: None,
             config: AnomalyRecoveryModeConfig::default(),
             adapter_registry,
             adapter: None,
@@ -161,10 +168,13 @@ impl AnomalyRecoveryMode {
             has_board_snapshot: false,
             last_plan_signature: None,
             warned_missing_board_snapshot: false,
+            next_plan_retry: None,
             planning_generation: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(false)),
             planning_cancel: None,
             planning_task: None,
+            shutdown_intent: None,
+            shutdown_controller: Default::default(),
         }
     }
 }
