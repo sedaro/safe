@@ -45,6 +45,15 @@ impl EdsPatchTarget {
             &value.to_string(),
         )
     }
+
+    /// Renders a floating-point patch as an EDS float even when its value is integral.
+    pub fn patch_f64(&self, value: f64) -> EdsPatch {
+        let mut rendered = value.to_string();
+        if !rendered.contains(['.', 'e', 'E']) {
+            rendered.push_str(".0");
+        }
+        self.patch(rendered)
+    }
 }
 
 /// One named simulation case and the parameters that produced it.
@@ -404,7 +413,7 @@ impl MonteCarloStudy {
                     );
                 }
                 case.parameters.insert(parameter.name.clone(), value);
-                case.patches.push(parameter.target.patch(value));
+                case.patches.push(parameter.target.patch_f64(value));
             }
             cases.push(case);
         }
@@ -640,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn simulator_uses_and_cleans_unique_target_config() {
         let workspace = fake_eds(
-            "printf '%s\\n' \"$*\" >> invocations && for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\"; fi; previous=\"$arg\"; done",
+            "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/invocations\" && for arg in \"$@\"; do if [ \"$previous\" = \"--target-config\" ]; then mkdir -p \"$arg\"; fi; previous=\"$arg\"; done",
         );
         let first = simulator(&workspace);
         let second = first.clone();

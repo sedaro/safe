@@ -1,0 +1,111 @@
+[
+  {
+    "name": "AnomalyRecovery",
+    "priority": 0,
+    "enabled": true,
+    "bin_path": "mode_anomaly_recovery",
+    "args": [],
+    "sandbox_resources": { "cpu": 100.0, "memory": 536870912, "disk": 104857600 },
+    "persist_work_dir": true,
+    "activation": {
+      "Hysteretic": {
+        "enter": { "Term": { "Bool": { "Literal": true } } },
+        "exit": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "805cd8c7-008d-5c4c-80cf-7248b159eb1f" } } }
+          ]
+        }
+      }
+    },
+    "mode_config": {
+      "schema_version": 1,
+      "shutdown_command": ["/bin/true"],
+      "recovery": {
+        "trusted_system_utc": true,
+        "minimum_hold_secs": 6000,
+        "max_measurement_age_secs": 30,
+        "trigger_samples": 1,
+        "recovery_samples": 2,
+        "recovery_dwell_secs": 10,
+        "power": {
+          "id": "battery_soc", "source": "example", "path": "battery.soc",
+          "timestamp_path": "battery.measured_at_unix_secs",
+          "validity_path": "battery.valid", "valid_value": true,
+          "units": "fraction", "trigger": 0.15, "recover": 0.3
+        },
+        "thermals": [
+          { "id": "sensor_a_temperature", "source": "example", "path": "thermal.a.temperature_c", "timestamp_path": "thermal.a.measured_at_unix_secs", "validity_path": "thermal.a.valid", "valid_value": true, "units": "degC", "trigger": 80.0, "recover": 60.0 },
+          { "id": "sensor_b_temperature", "source": "example", "path": "thermal.b.temperature_c", "timestamp_path": "thermal.b.measured_at_unix_secs", "validity_path": "thermal.b.valid", "valid_value": true, "units": "degC", "trigger": 80.0, "recover": 60.0 },
+          { "id": "sensor_c_temperature", "source": "example", "path": "thermal.c.temperature_c", "timestamp_path": "thermal.c.measured_at_unix_secs", "validity_path": "thermal.c.valid", "valid_value": true, "units": "degC", "trigger": 80.0, "recover": 60.0 }
+        ]
+      },
+      "advisory": {
+        "enabled": true,
+        "local_inference": true,
+        "pause_command": [],
+        "resume_command": [],
+        "min_interval_secs": 300,
+        "history_samples": 4,
+        "instructions": "Synthetic assessment fixture. Temperatures are degrees Celsius and SOC is a fraction. Compare paired power metrics and disclose failed or skipped runs. Power-only simulation does not establish cooling. Recommend future operational adjustments; the deterministic controller owns shutdown and release."
+      },
+      "llm": {
+        "enable_tool_calls": false,
+        "adapter": { "kind": "ollama", "config": { "endpoint": "http://127.0.0.1:11434/api/generate" } },
+        "model": "test-model",
+        "response_temperature": 0.0,
+        "max_output_tokens": 256,
+        "context_window_tokens": 2048,
+        "context_safety_margin_tokens": 256,
+        "request_timeout_ms": 1000
+      },
+      "action_catalog": [],
+      "planner": { "limits": { "max_prompt_chars": 6000 } },
+      "nominal_profiles": [
+        { "id": "example-advisory", "source": "example", "rules": [
+          { "id": "temperature_high", "path": "thermal.a.temperature_c", "kind": "number_range", "max": 60.0, "severity": "high", "eligible_actions": [] }
+        ] }
+      ],
+      "simulation": {
+        "eds_path": "/path/to/eds/workspace",
+        "max_runs": 2,
+        "run_timeout_ms": 1000,
+        "initialization": {
+          "source": "example",
+          "epoch_path": "time_mjd_utc",
+          "requirements": [{ "path": "battery.soc", "min": 0.0, "max": 1.0 }],
+          "patches": [{ "agent_id": "spacecraft", "engine": "power", "field": "battery.soc", "type": "f64", "telemetry_path": "battery.soc" }],
+          "compute_power_bindings": [{ "id": "compute_load", "agent_id": "spacecraft", "engine": "power", "field": "compute.power", "operating_power_w": 12.0, "shutdown_power_w": 0.5 }]
+        },
+        "scenarios": [
+          {
+            "id": "compute_on", "description": "Synthetic compute-on baseline.",
+            "role": "baseline", "applicable_rule_ids": ["temperature_high"], "allowed_actions": ["shutdown"],
+            "duration_days": 0.001,
+            "state_bindings": [{ "id": "soc", "source": "example", "path": "battery.soc" }],
+            "metrics": [
+              { "id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last" },
+              { "id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min" }
+            ]
+          },
+          {
+            "id": "compute_shutdown", "description": "Synthetic compute-shutdown counterfactual.",
+            "role": "recovery", "applicable_rule_ids": ["temperature_high"], "allowed_actions": ["shutdown"],
+            "baseline_scenario_id": "compute_on", "modeled_action": "shutdown", "compute_power_binding": "compute_load",
+            "duration_days": 0.001, "thermal": false,
+            "state_bindings": [{ "id": "soc", "source": "example", "path": "battery.soc" }],
+            "constraints": [
+              { "metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.3, "units": "fraction" },
+              { "metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction" },
+              { "metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction" }
+            ],
+            "metrics": [
+              { "id": "final_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "last" },
+              { "id": "minimum_state_of_charge", "quantity": "state_of_charge", "units": "fraction", "target_file": "spacecraft.power.jsonl", "field": "battery.soc", "aggregation": "min" }
+            ]
+          }
+        ]
+      }
+    }
+  }
+]

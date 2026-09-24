@@ -8,13 +8,12 @@ use safe::protocol::{
 };
 use safe::telemetry_frame::TelemetryFrame;
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd, utc_mjd_to_gps};
-use safe_telemetry::model::Telemetry;
 use tracing::{debug, info, warn};
 
 use crate::config::CoorbitalEvasionModeConfig;
 use crate::types::{
-    CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget,
-    ScheduledPointing,
+    CoorbitalEvasionMode, CoorbitalEvasionPlan, PlanningOutcome, PointingTarget, ScheduledPointing,
+    quaternion_to_ypr, ypr_to_quaternion,
 };
 
 impl CoorbitalEvasionMode {
@@ -22,6 +21,29 @@ impl CoorbitalEvasionMode {
         self.last_replan_start
             .map(|last| last.elapsed() >= Duration::from_secs(self.config.min_replan_interval_secs))
             .unwrap_or(true)
+    }
+
+    fn pending_upstream_proposal_count(&self) -> usize {
+        let Some(upstream_mode_id) = self.config.wait_for_proposals_from_mode_id else {
+            return 0;
+        };
+        self.latest_board_snapshot
+            .proposals
+            .iter()
+            .filter(|(id, (from, _, _))| {
+                *from == upstream_mode_id
+                    && self
+                        .latest_board_snapshot
+                        .approved
+                        .get(*id)
+                        .is_none_or(Vec::is_empty)
+                    && self
+                        .latest_board_snapshot
+                        .rejected
+                        .get(*id)
+                        .is_none_or(Vec::is_empty)
+            })
+            .count()
     }
 
     fn board_command_active(&self, id: &BoardCmdId) -> bool {
@@ -36,6 +58,23 @@ impl CoorbitalEvasionMode {
             (Command::PointNadir, PointingTarget::Nadir) => true,
             (Command::PointQuaternion { x, y, z, w }, PointingTarget::Quaternion(target)) => {
                 let existing = UnitQuaternion::new_normalize(Quaternion::new(*w, *x, *y, *z));
+                let dot = existing
+                    .quaternion()
+                    .coords
+                    .dot(&target.quaternion().coords)
+                    .abs()
+                    .clamp(-1.0, 1.0);
+                2.0 * dot.acos() <= self.config.command_dedup_angle_rad
+            }
+            (
+                Command::PointYpr {
+                    roll_deg,
+                    pitch_deg,
+                    yaw_deg,
+                },
+                PointingTarget::Quaternion(target),
+            ) => {
+                let existing = ypr_to_quaternion(*roll_deg, *pitch_deg, *yaw_deg);
                 let dot = existing
                     .quaternion()
                     .coords
@@ -70,6 +109,7 @@ impl CoorbitalEvasionMode {
                 | Command::PointSunYaw
                 | Command::PointThruster
                 | Command::PointQuaternion { .. }
+                | Command::PointYpr { .. }
         )
     }
 
@@ -108,6 +148,10 @@ impl CoorbitalEvasionMode {
             let keep = if is_accepted {
                 Self::selected_target_at(plan, time_mjd)
                     .is_some_and(|target| self.command_matches_target(cmd, target))
+                    || plan
+                        .commands
+                        .iter()
+                        .any(|planned| self.scheduled_command_matches(timed_command, planned))
             } else {
                 plan.commands
                     .iter()
@@ -163,12 +207,11 @@ impl CoorbitalEvasionMode {
             let command = match &planned.target {
                 PointingTarget::Nadir => Command::PointNadir,
                 PointingTarget::Quaternion(quaternion) => {
-                    let q = quaternion.quaternion();
-                    Command::PointQuaternion {
-                        x: q.i,
-                        y: q.j,
-                        z: q.k,
-                        w: q.w,
+                    let (roll_deg, pitch_deg, yaw_deg) = quaternion_to_ypr(quaternion);
+                    Command::PointYpr {
+                        roll_deg,
+                        pitch_deg,
+                        yaw_deg,
                     }
                 }
             };
@@ -193,12 +236,16 @@ impl CoorbitalEvasionMode {
     async fn maybe_plan(
         &mut self,
         runtime: &mut ModeRuntime,
-        telemetry: &Telemetry,
+        telemetry: &TelemetryFrame,
     ) -> anyhow::Result<()> {
-        if self.config.threat_ids.is_empty() {
-            return Ok(());
-        }
-        let PlanningOutcome::Schedule(plan) = self.build_plan(telemetry).await? else {
+        let outcome = self.build_plan(telemetry).await?;
+        let simulation_count = match &outcome {
+            PlanningOutcome::NoBoardChange => 1,
+            PlanningOutcome::Schedule(_) => 2,
+        };
+        runtime.simulation_completed(simulation_count).await?;
+        let PlanningOutcome::Schedule(plan) = outcome else {
+            info!("coorbital-evasion baseline is clear; no pointing change required");
             return Ok(());
         };
         if plan.validation.score.exposure_secs > 0.0 {
@@ -228,26 +275,48 @@ impl CoorbitalEvasionMode {
         if self.config.eds_path.as_os_str().is_empty() {
             warn!("CoorbitalEvasion mode_config.eds_path is not configured; simulation disabled");
         }
+        if self.config.input_adapter_command.is_empty() {
+            warn!(
+                "CoorbitalEvasion mode_config.input_adapter_command is not configured; simulation disabled"
+            );
+        }
+        if self.config.agent_id.is_empty() {
+            warn!("CoorbitalEvasion mode_config.agent_id is empty");
+        }
         if self.config.field_of_view_id.is_empty() {
             warn!("CoorbitalEvasion mode_config.field_of_view_id is empty");
-        }
-        if self.config.threat_ids.is_empty() {
-            warn!(
-                "CoorbitalEvasion mode_config.threat_ids is empty; no threats will be evaluated"
-            );
         }
         self.warned_missing_config = true;
     }
 
-    async fn replan_if_ready(&mut self, runtime: &mut ModeRuntime, telemetry: &Telemetry) {
+    async fn replan_if_ready(&mut self, runtime: &mut ModeRuntime, telemetry: &TelemetryFrame) {
         if !self.can_replan_now() {
             return;
         }
-        self.last_replan_start = Some(Instant::now());
-        if let Err(error) = self.maybe_plan(runtime, telemetry).await {
-            warn!("coorbital-evasion planning failed: {error:#}");
+        let pending_upstream_proposals = self.pending_upstream_proposal_count();
+        if pending_upstream_proposals > 0 {
+            return;
+        }
+        match self.maybe_plan(runtime, telemetry).await {
+            Ok(()) => {
+                self.last_replan_start = Some(Instant::now());
+            }
+            Err(error) if telemetry_is_not_ready(&error) => {}
+            Err(error) => {
+                warn!("coorbital-evasion planning failed: {error:#}");
+                // A deterministic simulation/configuration failure cannot be
+                // repaired by the next telemetry frame. Pace retries instead.
+                self.last_replan_start = Some(Instant::now());
+            }
         }
     }
+}
+
+fn telemetry_is_not_ready(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("telemetry is missing ")
+        || message.contains("OTP-2 simulation input is missing derived ")
+        || message.contains("OTP-2 simulation input is missing battery voltage")
 }
 
 #[async_trait]
@@ -278,17 +347,10 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         frame: TelemetryFrame,
     ) -> anyhow::Result<()> {
-        let telemetry = match frame.decode_payload::<Telemetry>() {
-            Ok(telemetry) => telemetry,
-            Err(error) => {
-                warn!("coorbital-evasion received incompatible telemetry: {error}");
-                return Ok(());
-            }
-        };
-        self.latest_telemetry = Some(telemetry.clone());
+        self.latest_telemetry = Some(frame.clone());
         if runtime.is_active() && self.has_board_snapshot {
             self.warn_missing_config_once();
-            self.replan_if_ready(runtime, &telemetry).await;
+            self.replan_if_ready(runtime, &frame).await;
         }
         Ok(())
     }
@@ -298,11 +360,9 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
         runtime: &mut ModeRuntime,
         board: AutonomyModeBoardState,
     ) -> anyhow::Result<()> {
-        let first_snapshot = !self.has_board_snapshot;
         self.has_board_snapshot = true;
         self.latest_board_snapshot = board;
-        if first_snapshot
-            && runtime.is_active()
+        if runtime.is_active()
             && let Some(telemetry) = self.latest_telemetry.clone()
         {
             self.replan_if_ready(runtime, &telemetry).await;
@@ -313,6 +373,7 @@ impl ModeHandler<CoorbitalEvasionModeConfig> for CoorbitalEvasionMode {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use safe::protocol::{AutonomyModeBoardState, BoardCmdId};
     use safe::utils::utc_mjd_to_gps;
     use uuid::Uuid;
@@ -367,6 +428,19 @@ mod tests {
                 w: -1.0,
             },
             &target
+        ));
+    }
+
+    #[test]
+    fn ypr_command_matches_quaternion_target() {
+        let mode = CoorbitalEvasionMode::new();
+        assert!(mode.command_matches_target(
+            &Command::PointYpr {
+                roll_deg: 0.0,
+                pitch_deg: 0.0,
+                yaw_deg: 0.0,
+            },
+            &PointingTarget::Quaternion(UnitQuaternion::identity()),
         ));
     }
 
@@ -497,5 +571,87 @@ mod tests {
         let (_, propose) = mode.reconciliation_actions(own, &plan(vec![selected.clone()]));
 
         assert_eq!(propose, vec![selected]);
+    }
+
+    #[test]
+    fn waits_only_for_unresolved_proposals_from_configured_mode() {
+        let upstream = AutonomyModeId(Uuid::new_v4());
+        let other = AutonomyModeId(Uuid::new_v4());
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.wait_for_proposals_from_mode_id = Some(upstream);
+        let mut board = AutonomyModeBoardState::default();
+        add_board_command(
+            &mut board,
+            "upstream-pending",
+            upstream,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        add_board_command(
+            &mut board,
+            "other-pending",
+            other,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        mode.latest_board_snapshot = board;
+
+        assert_eq!(mode.pending_upstream_proposal_count(), 1);
+    }
+
+    #[test]
+    fn approved_or_rejected_upstream_proposals_do_not_block_planning() {
+        let upstream = AutonomyModeId(Uuid::new_v4());
+        let approver = AutonomyModeId(Uuid::new_v4());
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.wait_for_proposals_from_mode_id = Some(upstream);
+        let mut board = AutonomyModeBoardState::default();
+        add_board_command(
+            &mut board,
+            "approved",
+            upstream,
+            Command::PointNadir,
+            60_000.1,
+            false,
+        );
+        add_board_command(
+            &mut board,
+            "rejected",
+            upstream,
+            Command::PointNadir,
+            60_000.2,
+            false,
+        );
+        board.approved.insert(
+            BoardCmdId("approved".to_string()),
+            vec![(approver, "approved".to_string(), 0)],
+        );
+        board.rejected.insert(
+            BoardCmdId("rejected".to_string()),
+            vec![(approver, "rejected".to_string(), 0)],
+        );
+        mode.latest_board_snapshot = board;
+
+        assert_eq!(mode.pending_upstream_proposal_count(), 0);
+    }
+
+    #[test]
+    fn missing_derived_telemetry_is_transient() {
+        let error = anyhow!(
+            "simulation input adapter failed (code=Some(1)): Error: OTP-2 simulation input is missing derived ECI position"
+        );
+
+        assert!(telemetry_is_not_ready(&error));
+    }
+
+    #[test]
+    fn unrelated_adapter_failure_is_not_transient() {
+        let error = anyhow!(
+            "simulation input adapter failed (code=Some(1)): Error: invalid telemetry packet"
+        );
+
+        assert!(!telemetry_is_not_ready(&error));
     }
 }

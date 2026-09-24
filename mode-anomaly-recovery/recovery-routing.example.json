@@ -1,0 +1,58 @@
+[
+  {
+    "name": "AnomalyRecovery",
+    "priority": 0,
+    "persist_work_dir": true,
+    "activation": {
+      "Hysteretic": {
+        "enter": { "Term": { "Bool": { "Literal": true } } },
+        "exit": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "805cd8c7-008d-5c4c-80cf-7248b159eb1f" } } }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "MissionPlanning",
+    "priority": 1,
+    "activation": {
+      "Hysteretic": {
+        "enter": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "805cd8c7-008d-5c4c-80cf-7248b159eb1f" } } }
+          ]
+        },
+        "exit": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "bba31a53-dc8a-561c-8e44-639cb8007110" } } }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "CoorbitalEvasion",
+    "priority": 1,
+    "activation": {
+      "Hysteretic": {
+        "enter": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "bba31a53-dc8a-561c-8e44-639cb8007110" } } }
+          ]
+        },
+        "exit": {
+          "Equal": [
+            { "Term": { "String": { "LastPlannedAutonomyModeRef": "last_planned" } } },
+            { "Term": { "String": { "Literal": "58b5b5a4-e6aa-50ee-a69c-d41082f5d8bb" } } }
+          ]
+        }
+      }
+    }
+  }
+]

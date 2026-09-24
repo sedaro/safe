@@ -12,46 +12,261 @@
     },
     "persist_work_dir": true,
     "mode_config": {
+      "schema_version": 1,
+      "shutdown_command": ["/sbin/shutdown", "-h", "now"],
+      "llm": {
+        "adapter": {
+          "kind": "ollama",
+          "config": {
+            "endpoint": "http://127.0.0.1:11434/api/generate"
+          }
+        },
+        "model": "mistral:7b",
+        "max_output_tokens": 256,
+        "context_window_tokens": 16384,
+        "context_safety_margin_tokens": 256
+      },
+      "planner": {"limits": {"max_prompt_chars": 6000}},
+      "replanning": {"require_board_snapshot": true},
       "action_catalog": [
         {
-          "id": "point_nadir",
-          "description": "DEMO ONLY: point nadir after a configured thermal, rail, or wheel-speed anomaly.",
-          "preconditions": ["Demo configuration only; not flight-approved."]
-        },
-        {
-          "id": "point_sun_yaw",
-          "description": "DEMO ONLY: point toward the sun after a configured power, GPS, or mode anomaly.",
-          "preconditions": ["Demo configuration only; not flight-approved."]
+            "id": "shutdown",
+            "description": "Shut down the Linux processing unit to reduce compute-generated heat after passing power viability."
         }
       ],
+
       "nominal_profiles": [
         {
-          "id": "demo-v1",
+          "id": "thermal-v1",
           "source": "example",
           "rules": [
             {
-              "id": "battery_temperature_out_of_nominal",
-              "path": "telemetry.batt_c",
+              "id": "temperature_high",
+              "path": "telemetry.temperature_c",
               "kind": "number_range",
-              "min": 20.0,
-              "max": 60.0,
-              "min_consecutive_samples": 10,
+              "max": 45.0,
+              "min_consecutive_samples": 2,
               "severity": "high",
-              "eligible_actions": ["point_nadir"]
-            },
-            {
-              "id": "battery_voltage_out_of_nominal",
-              "path": "telemetry.batt_v",
-              "kind": "number_range",
-              "min": 7.5,
-              "max": 8.6,
-              "min_consecutive_samples": 10,
-              "severity": "high",
-              "eligible_actions": ["point_sun_yaw"]
+              "eligible_actions": [
+                  "shutdown"
+              ]
             }
           ]
         }
-      ]
+      ],
+
+      "simulation": {
+        "eds_path": "/path/to/eds/workspace",
+        "max_runs": 2,
+        "run_timeout_ms": 10000,
+        "initialization": {
+          "source": "example",
+          "epoch_path": "telemetry.time_mjd_utc",
+          "patches": [
+            {"agent_id": "spacecraft", "engine": "power", "field": "battery.soc", "type": "f64", "telemetry_path": "telemetry.state_of_charge"}
+          ],
+          "requirements": [
+            {"path": "telemetry.state_of_charge", "min": 0.0, "max": 1.0}
+          ],
+          "compute_power_bindings": [
+            {
+              "id": "example_compute_load",
+              "agent_id": "spacecraft",
+              "engine": "power",
+              "field": "compute.power",
+              "operating_power_w": 12.0,
+              "shutdown_power_w": 0.5
+            }
+          ]
+        },
+        "scenarios": [
+          {
+            "id": "thermal_baseline",
+            "description": "Synthetic example: evaluate the frozen state with compute operating.",
+            "applicable_rule_ids": ["temperature_high"],
+            "allowed_actions": ["shutdown"],
+            "role": "baseline",
+            "duration_days": 0.05,
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
+            ],
+            "metrics": [
+              {
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
+                "aggregation": "last"
+              },
+              {
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
+                "aggregation": "min"
+              }
+            ]
+          },
+          {
+            "id": "compute_shutdown_recovery",
+            "description": "Synthetic example: evaluate compute's residual shutdown power draw.",
+            "applicable_rule_ids": ["temperature_high"],
+            "allowed_actions": ["shutdown"],
+            "baseline_scenario_id": "thermal_baseline",
+            "modeled_action": "shutdown",
+            "role": "recovery",
+            "compute_power_binding": "example_compute_load",
+            "state_bindings": [
+              {"id": "temperature", "source": "example", "path": "telemetry.temperature_c"},
+              {"id": "state_of_charge", "source": "example", "path": "telemetry.state_of_charge"}
+            ],
+            "constraints": [
+              {"metric_id": "final_state_of_charge", "kind": "minimum", "value": 0.3, "units": "fraction"},
+              {"metric_id": "minimum_state_of_charge", "kind": "minimum", "value": 0.2, "units": "fraction"},
+              {"metric_id": "maximum_state_of_charge_degradation", "kind": "maximum", "value": 0.1, "units": "fraction"}
+            ],
+            "thermal": false,
+            "duration_days": 0.05,
+            "metrics": [
+              {
+                "id": "final_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
+                "aggregation": "last"
+              },
+              {
+                "id": "minimum_state_of_charge",
+                "quantity": "state_of_charge",
+                "units": "fraction",
+                "target_file": "spacecraft.power.jsonl",
+                "field": "battery.soc",
+                "aggregation": "min"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "MissionPlanning",
+    "priority": 1,
+    "enabled": false,
+    "bin_path": "target/debug/mode_mission_planning",
+    "args": [],
+    "sandbox_resources": {
+      "cpu": 250.0,
+      "memory": 1000000000,
+      "disk": 1000000000
+    },
+    "persist_work_dir": false,
+    "mode_config": {
+      "eds_path": "/path/to/eds/workspace",
+      "input_adapter_command": ["/path/to/input-adapter", "mission-planning-input"],
+      "input_adapter_config": {},
+      "planning_horizon_secs": 21600.0,
+      "min_replan_interval_secs": 300,
+      "telemetry_gps_time_pointer": "/telemetry/gps_time",
+      "telemetry_state_of_charge_pointer": "/telemetry/state_of_charge",
+      "result_file": "result.jsonl",
+      "state_of_charge_field": "state_of_charge",
+      "low_power_state_of_charge": 0.3,
+      "recovered_state_of_charge": 0.6,
+      "minimum_elevation_deg": 10.0,
+      "default_pointing": { "kind": "nadir" },
+      "targets": [
+        { "name": "example-target", "in_fov_field": "target.in_fov" }
+      ],
+      "ground_stations": [
+        {
+          "name": "example-station",
+          "latitude_deg": 0.0,
+          "longitude_deg": 0.0,
+          "altitude_m": 0.0,
+          "elevation_field": "station.elevation_deg"
+        }
+      ],
+      "validation_checks": [
+        {
+          "target_file": "result.jsonl",
+          "field": "constraint_margin",
+          "aggregation": "min",
+          "op": "gte",
+          "threshold": 0.0
+        }
+      ],
+      "monte_carlo": {
+        "samples": 20,
+        "seed": 42,
+        "minimum_pass_fraction": 0.95,
+        "parameters": [
+          {
+            "name": "capture_power_draw_w",
+            "target": {
+              "agent_id": "spacecraft",
+              "engine": "power",
+              "field": "payload.capture_power_draw_w",
+              "type_": "f64"
+            },
+            "distribution": { "Normal": { "mean": 20.0, "std_dev": 3.0 } }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "CoorbitalEvasion",
+    "priority": 1,
+    "enabled": false,
+    "bin_path": "target/debug/mode_coorbital_evasion",
+    "args": [],
+    "sandbox_resources": {
+      "cpu": 250.0,
+      "memory": 1000000000,
+      "disk": 1000000000
+    },
+    "persist_work_dir": false,
+    "mode_config": {
+      "eds_path": "/path/to/coorbital-evasion-eds/workspace",
+      "gnc_time_step_limits": [0.01, 3.0],
+      "cdh_time_step_limits": [0.1, 60.0],
+      "power_time_step_limits": [0.1, 60.0],
+      "sim_duration_days": 0.05,
+      "simulation_timeout_secs": 60,
+      "min_replan_interval_secs": 60,
+      "command_lead_secs": 5.0,
+      "agent_id": "example-spacecraft",
+      "field_of_view_id": "example-field-of-view",
+      "threat_ids": ["example-ground-threat"],
+      "threat_max_range_km": 1000.0,
+      "ground_threat_locations": {
+        "example-ground-threat": [0.0, 0.0, 0.0]
+      },
+      "space_threat_epoch_states": {},
+      "fov_half_angle_deg": 30.0,
+      "fov_guard_angle_deg": 1.0,
+      "max_slew_rate_rad_s": 0.010472,
+      "command_dedup_angle_rad": 1.0e-6,
+      "command_dedup_time_secs": 1.0,
+      "result_engine": "gnc",
+      "time_field": "time",
+      "position_field": "root.position",
+      "velocity_field": "root.velocity",
+      "attitude_field": "root.attitude",
+      "boresight_field": "boresight_eci",
+      "relative_position_field": "relative_position_eci",
+      "line_of_sight_field": "line_of_sight",
+      "in_field_of_view_field": "in_field_of_view",
+      "schedule_patch_engine": "cdh",
+      "pointing_mode_schedule_field": "example-pointing-controller.mode_schedule",
+      "pointing_quaternion_schedule_field": "example-pointing-controller.quaternion_schedule",
+      "nadir_mode_id": "example-nadir-mode",
+      "sun_yaw_mode_id": "example-sun-yaw-mode"
     }
   }
 ]

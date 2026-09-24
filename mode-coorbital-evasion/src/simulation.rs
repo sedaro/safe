@@ -1,22 +1,95 @@
+use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 use safe::protocol::{Command, TimedCommand};
+use safe::telemetry_frame::TelemetryFrame;
 use safe::utils::{SECONDS_PER_DAY, gps_to_utc_mjd};
 use safe_sim::{EdsFrame, EdsPatch, SimulationResult};
-use safe_telemetry::augmented::AugmentedTelemetry;
-use safe_telemetry::model::Telemetry;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as ProcessCommand;
 
+use crate::planning::threat_is_within_range;
 use crate::types::{
-    EdsPointingSchedule, CoorbitalEvasionMode, GeometrySample, ModeScheduleEntry, PointingTarget,
-    QuaternionScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport,
+    CoorbitalEvasionMode, EdsPointingSchedule, GeometrySample, ModeScheduleEntry, PointingTarget,
+    RpyScheduleEntry, ScheduledPointing, ThreatGeometry, ValidationReport, quaternion_to_ypr,
 };
 
 const POINTING_MODE_SCHEDULE_TYPE: &str = "[(f64, str)]";
-const POINTING_QUATERNION_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64, f64))]";
+const POINTING_RPY_SCHEDULE_TYPE: &str = "[(f64, (f64, f64, f64))]";
+
+fn telemetry_vec3(value: &Value) -> anyhow::Result<[f64; 3]> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 3)
+        .context("must be a three-element numeric array")?;
+    let values = values
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .context("contains a non-finite value")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok([values[0], values[1], values[2]])
+}
+
+/// Wire-compatible with the gatekeeper input adapter contract without making
+/// this autonomy mode depend on an adapter implementation.
+#[derive(Debug, Clone, Serialize)]
+struct SimulationInputRequest {
+    telemetry: TelemetryFrame,
+    commands: Vec<TimedCommand>,
+    config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SimulationInput {
+    pub(crate) start_time_mjd: f64,
+    pub(crate) patches: Vec<EdsPatch>,
+}
 
 impl CoorbitalEvasionMode {
+    pub(crate) fn active_threat_ids(
+        &self,
+        telemetry: &TelemetryFrame,
+    ) -> anyhow::Result<Vec<String>> {
+        let augmented = telemetry
+            .payload
+            .get("augmented")
+            .and_then(Value::as_object)
+            .context("telemetry is missing object payload.augmented")?;
+        let mut ids = augmented
+            .get("ground_threat_locations")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|threats| threats.keys())
+            .chain(
+                augmented
+                    .get("space_threat_epoch_states")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|threats| threats.keys()),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        if !self.config.threat_ids.is_empty() {
+            ids.retain(|id| {
+                self.config
+                    .threat_ids
+                    .iter()
+                    .any(|configured| configured == id)
+            });
+        }
+        Ok(ids)
+    }
+
     fn add_command_to_schedule(
         &self,
         schedule: &mut EdsPointingSchedule,
@@ -30,9 +103,19 @@ impl CoorbitalEvasionMode {
             Command::PointSunYaw => schedule
                 .mode_schedule
                 .push((time_mjd, self.config.sun_yaw_mode_id.clone())),
-            Command::PointQuaternion { x, y, z, w } => schedule
-                .quaternion_schedule
-                .push((time_mjd, (*x, *y, *z, *w))),
+            Command::PointQuaternion { x, y, z, w } => {
+                let quaternion = UnitQuaternion::new_normalize(Quaternion::new(*w, *x, *y, *z));
+                schedule
+                    .rpy_schedule
+                    .push((time_mjd, quaternion_to_ypr(&quaternion)));
+            }
+            Command::PointYpr {
+                roll_deg,
+                pitch_deg,
+                yaw_deg,
+            } => schedule
+                .rpy_schedule
+                .push((time_mjd, (*roll_deg, *pitch_deg, *yaw_deg))),
             _ => {}
         }
     }
@@ -42,7 +125,7 @@ impl CoorbitalEvasionMode {
             .mode_schedule
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
         schedule
-            .quaternion_schedule
+            .rpy_schedule
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
         schedule.mode_schedule.dedup_by(|left, right| {
             if left.0 == right.0 {
@@ -52,7 +135,7 @@ impl CoorbitalEvasionMode {
                 false
             }
         });
-        schedule.quaternion_schedule.dedup_by(|left, right| {
+        schedule.rpy_schedule.dedup_by(|left, right| {
             if left.0 == right.0 {
                 *left = right.clone();
                 true
@@ -76,11 +159,11 @@ impl CoorbitalEvasionMode {
         format!("[{entries}]")
     }
 
-    fn serialize_quaternion_schedule(schedule: &[QuaternionScheduleEntry]) -> String {
+    fn serialize_rpy_schedule(schedule: &[RpyScheduleEntry]) -> String {
         let entries = schedule
             .iter()
-            .map(|(time_mjd, (x, y, z, w))| {
-                format!("({time_mjd:.15}, ({x:.15}, {y:.15}, {z:.15}, {w:.15}))")
+            .map(|(time_mjd, (roll, pitch, yaw))| {
+                format!("({time_mjd:.15}, ({roll:.15}, {pitch:.15}, {yaw:.15}))")
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -116,7 +199,10 @@ impl CoorbitalEvasionMode {
             }
             if !matches!(
                 command,
-                Command::PointNadir | Command::PointSunYaw | Command::PointQuaternion { .. }
+                Command::PointNadir
+                    | Command::PointSunYaw
+                    | Command::PointQuaternion { .. }
+                    | Command::PointYpr { .. }
             ) {
                 continue;
             }
@@ -138,11 +224,11 @@ impl CoorbitalEvasionMode {
             .mode_schedule
             .iter()
             .any(|(time_mjd, _)| *time_mjd <= sim_start_mjd);
-        let has_active_quaternion = schedule
-            .quaternion_schedule
+        let has_active_rpy = schedule
+            .rpy_schedule
             .iter()
             .any(|(time_mjd, _)| *time_mjd <= sim_start_mjd);
-        if !has_active_mode && !has_active_quaternion {
+        if !has_active_mode && !has_active_rpy {
             schedule
                 .mode_schedule
                 .push((sim_start_mjd, self.config.nadir_mode_id.clone()));
@@ -164,8 +250,8 @@ impl CoorbitalEvasionMode {
                 .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
                 .cloned()
                 .collect(),
-            quaternion_schedule: accepted
-                .quaternion_schedule
+            rpy_schedule: accepted
+                .rpy_schedule
                 .iter()
                 .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
                 .cloned()
@@ -177,10 +263,9 @@ impl CoorbitalEvasionMode {
                     .mode_schedule
                     .push((command.time_mjd, self.config.nadir_mode_id.clone())),
                 PointingTarget::Quaternion(quaternion) => {
-                    let q = quaternion.quaternion();
                     schedule
-                        .quaternion_schedule
-                        .push((command.time_mjd, (q.i, q.j, q.k, q.w)));
+                        .rpy_schedule
+                        .push((command.time_mjd, quaternion_to_ypr(quaternion)));
                 }
             }
         }
@@ -188,8 +273,11 @@ impl CoorbitalEvasionMode {
         schedule
     }
 
-    fn base_patches(&self, telemetry: &Telemetry) -> Vec<EdsPatch> {
-        let augmented = AugmentedTelemetry::from(telemetry);
+    fn mode_patches(
+        &self,
+        telemetry: &TelemetryFrame,
+        threat_ids: &[String],
+    ) -> anyhow::Result<Vec<EdsPatch>> {
         let mut patches = vec![
             EdsPatch::new(
                 &self.config.agent_id,
@@ -221,104 +309,170 @@ impl CoorbitalEvasionMode {
                     self.config.power_time_step_limits.0, self.config.power_time_step_limits.1
                 ),
             ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.position",
-                "eci",
-                &format!(
-                    "[{:.3}, {:.3}, {:.3}]",
-                    augmented.telemetry.adcs_tlm.fulldata.position_x_km,
-                    augmented.telemetry.adcs_tlm.fulldata.position_y_km,
-                    augmented.telemetry.adcs_tlm.fulldata.position_z_km
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.velocity",
-                "eci",
-                &format!(
-                    "[{:.6}, {:.6}, {:.6}]",
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_x_m_s / 1000.0,
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_y_m_s / 1000.0,
-                    augmented.telemetry.adcs_tlm.fulldata.velocity_z_m_s / 1000.0
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.attitude",
-                "body_eci",
-                &format!(
-                    "[{:.9}, {:.9}, {:.9}, {:.9}]",
-                    augmented.attitude_x,
-                    augmented.attitude_y,
-                    augmented.attitude_z,
-                    augmented.attitude_w
-                ),
-            ),
-            EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                "root!.idealized_pointing",
-                "bool",
-                "false",
-            ),
         ];
 
-        for (id, [latitude_deg, longitude_deg, altitude_km]) in &self.config.ground_threat_locations
-        {
+        let augmented = telemetry
+            .payload
+            .get("augmented")
+            .and_then(Value::as_object)
+            .context("telemetry is missing object payload.augmented")?;
+        let ground = augmented
+            .get("ground_threat_locations")
+            .and_then(Value::as_object);
+        let space = augmented
+            .get("space_threat_epoch_states")
+            .and_then(Value::as_object);
+
+        for id in threat_ids {
             patches.push(EdsPatch::new(
                 &self.config.agent_id,
                 "gnc",
-                &format!("{id}.latitude_deg"),
-                "deg",
-                &latitude_deg.to_string(),
+                &format!("{id}.active"),
+                "bool",
+                "true",
             ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.longitude_deg"),
-                "deg",
-                &longitude_deg.to_string(),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.altitude_km"),
-                "f64",
-                &altitude_km.to_string(),
-            ));
+            match (
+                ground.and_then(|locations| locations.get(id)),
+                space.and_then(|states| states.get(id)),
+            ) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "telemetry provides both ground and space state for threat '{id}'"
+                ),
+                (Some(location), None) => {
+                    let [latitude_deg, longitude_deg, altitude_km] = telemetry_vec3(location)
+                        .with_context(|| format!("ground threat '{id}'"))?;
+                    if !(-90.0..=90.0).contains(&latitude_deg)
+                        || !(-180.0..=180.0).contains(&longitude_deg)
+                    {
+                        anyhow::bail!("ground threat '{id}' has an invalid latitude or longitude");
+                    }
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.latitude_deg"),
+                        "deg",
+                        &format!("{latitude_deg:.15}"),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.longitude_deg"),
+                        "deg",
+                        &format!("{longitude_deg:.15}"),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.altitude_km"),
+                        "f64",
+                        &format!("{altitude_km:.15}"),
+                    ));
+                }
+                (None, Some(state)) => {
+                    let state = state
+                        .as_array()
+                        .filter(|state| state.len() == 3)
+                        .with_context(|| {
+                            format!("space threat '{id}' must be [epoch_mjd, position, velocity]")
+                        })?;
+                    let epoch_mjd = state[0]
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .with_context(|| format!("space threat '{id}' has an invalid epoch"))?;
+                    let position = telemetry_vec3(&state[1])
+                        .with_context(|| format!("space threat '{id}' position"))?;
+                    let velocity = telemetry_vec3(&state[2])
+                        .with_context(|| format!("space threat '{id}' velocity"))?;
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_mjd"),
+                        "f64",
+                        &epoch_mjd.to_string(),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_position"),
+                        "eci",
+                        &format!("[{}, {}, {}]", position[0], position[1], position[2]),
+                    ));
+                    patches.push(EdsPatch::new(
+                        &self.config.agent_id,
+                        "gnc",
+                        &format!("{id}.epoch_velocity"),
+                        "#[f64; 3]",
+                        &format!("[{}, {}, {}]", velocity[0], velocity[1], velocity[2]),
+                    ));
+                }
+                (None, None) => {
+                    anyhow::bail!("telemetry is missing state for configured threat '{id}'")
+                }
+            }
         }
-        // Space-threat altitude is derived by the EDS coordinate state manager, not an init field.
-        for (id, (epoch_mjd, position, velocity)) in &self.config.space_threat_epoch_states {
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_mjd"),
-                "f64",
-                &epoch_mjd.to_string(),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_position"),
-                "eci",
-                &format!("[{}, {}, {}]", position[0], position[1], position[2]),
-            ));
-            patches.push(EdsPatch::new(
-                &self.config.agent_id,
-                "gnc",
-                &format!("{id}.epoch_velocity"),
-                "#[f64; 3]",
-                &format!("[{}, {}, {}]", velocity[0], velocity[1], velocity[2]),
-            ));
-        }
-        patches
+        Ok(patches)
     }
 
-    fn frames_for_result<'a>(&self, result: &'a SimulationResult) -> anyhow::Result<&'a [EdsFrame]> {
+    pub(crate) async fn simulation_input(
+        &self,
+        telemetry: &TelemetryFrame,
+    ) -> anyhow::Result<SimulationInput> {
+        let (executable, args) = self
+            .config
+            .input_adapter_command
+            .split_first()
+            .context("input_adapter_command is empty")?;
+        let mut child = ProcessCommand::new(executable)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start simulation input adapter '{executable}'"))?;
+        let request = SimulationInputRequest {
+            telemetry: telemetry.clone(),
+            commands: Vec::new(),
+            config: self.config.input_adapter_config.clone(),
+        };
+        let mut stdin = child.stdin.take().context("input adapter has no stdin")?;
+        stdin.write_all(&serde_json::to_vec(&request)?).await?;
+        stdin.write_all(b"\n").await?;
+        drop(stdin);
+        let output = tokio::time::timeout(
+            Duration::from_secs(self.config.input_adapter_timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "simulation input adapter timed out after {} seconds",
+                self.config.input_adapter_timeout_secs
+            )
+        })??;
+        if !output.status.success() {
+            bail!(
+                "simulation input adapter failed (code={:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let input: SimulationInput = serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "simulation input adapter returned invalid JSON: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )
+        })?;
+        if !input.start_time_mjd.is_finite() {
+            bail!("simulation input adapter returned a non-finite start_time_mjd");
+        }
+        Ok(input)
+    }
+
+    fn frames_for_result<'a>(
+        &self,
+        result: &'a SimulationResult,
+    ) -> anyhow::Result<&'a [EdsFrame]> {
         if !result.success {
             anyhow::bail!(
                 "simulation failed (code={:?}): {}",
@@ -391,6 +545,7 @@ impl CoorbitalEvasionMode {
     pub(crate) fn decode_geometry(
         &self,
         result: &SimulationResult,
+        threat_ids: &[String],
     ) -> anyhow::Result<Vec<GeometrySample>> {
         self.frames_for_result(result)?
             .iter()
@@ -412,9 +567,7 @@ impl CoorbitalEvasionMode {
                             self.config.time_field
                         )
                     })?;
-                let threats = self
-                    .config
-                    .threat_ids
+                let threats = threat_ids
                     .iter()
                     .map(|id| {
                         Ok(ThreatGeometry {
@@ -459,26 +612,53 @@ impl CoorbitalEvasionMode {
 
     pub(crate) async fn run_geometry_simulation(
         &self,
-        telemetry: &Telemetry,
+        input: &SimulationInput,
         schedule: &EdsPointingSchedule,
+        telemetry: &TelemetryFrame,
+        threat_ids: &[String],
     ) -> anyhow::Result<Vec<GeometrySample>> {
-        let sim_start_mjd = gps_to_utc_mjd(telemetry.onboard_time_ms as f64 / 1_000.0)
-            .context("could not convert telemetry onboard time to simulation epoch")?;
-        let mut patches = self.base_patches(telemetry);
-        patches.push(EdsPatch::new(
-            &self.config.agent_id,
-            &self.config.schedule_patch_engine,
-            &self.config.pointing_mode_schedule_field,
-            POINTING_MODE_SCHEDULE_TYPE,
-            &Self::serialize_mode_schedule(&schedule.mode_schedule),
-        ));
-        patches.push(EdsPatch::new(
-            &self.config.agent_id,
-            &self.config.schedule_patch_engine,
-            &self.config.pointing_quaternion_schedule_field,
-            POINTING_QUATERNION_SCHEDULE_TYPE,
-            &Self::serialize_quaternion_schedule(&schedule.quaternion_schedule),
-        ));
+        let sim_start_mjd = input.start_time_mjd;
+        // Replace the adapter's pointing schedules for every engine it targets.
+        // The simulator uses the first duplicate patch, so leave one complete schedule
+        // per engine while preserving all unrelated adapter patches.
+        let mut schedule_engines = vec![self.config.schedule_patch_engine.clone()];
+        for patch in &input.patches {
+            if patch.agent_id == self.config.agent_id
+                && (patch.field == self.config.pointing_mode_schedule_field
+                    || patch.field == self.config.pointing_rpy_schedule_field)
+                && !schedule_engines.contains(&patch.engine)
+            {
+                schedule_engines.push(patch.engine.clone());
+            }
+        }
+        let mut patches = input
+            .patches
+            .iter()
+            .filter(|patch| {
+                patch.agent_id != self.config.agent_id
+                    || !schedule_engines.contains(&patch.engine)
+                    || (patch.field != self.config.pointing_mode_schedule_field
+                        && patch.field != self.config.pointing_rpy_schedule_field)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        patches.extend(self.mode_patches(telemetry, threat_ids)?);
+        for engine in schedule_engines {
+            patches.push(EdsPatch::new(
+                &self.config.agent_id,
+                &engine,
+                &self.config.pointing_mode_schedule_field,
+                POINTING_MODE_SCHEDULE_TYPE,
+                &Self::serialize_mode_schedule(&schedule.mode_schedule),
+            ));
+            patches.push(EdsPatch::new(
+                &self.config.agent_id,
+                &engine,
+                &self.config.pointing_rpy_schedule_field,
+                POINTING_RPY_SCHEDULE_TYPE,
+                &Self::serialize_rpy_schedule(&schedule.rpy_schedule),
+            ));
+        }
         let simulator = safe_sim::SedaroSimulator::new(&self.config.eds_path)
             .at_epoch(sim_start_mjd)
             .timeout(Duration::from_secs(self.config.simulation_timeout_secs))
@@ -489,6 +669,12 @@ impl CoorbitalEvasionMode {
                 self.config.eds_path.display()
             )
         })?;
+        tracing::info!(
+            simulation_count = 1,
+            threat_count = threat_ids.len(),
+            sim_duration_days = self.config.sim_duration_days,
+            "coorbital-evasion running geometry simulation"
+        );
         let result = simulator
             .run_collect(self.config.sim_duration_days)
             .await
@@ -498,7 +684,7 @@ impl CoorbitalEvasionMode {
                     workspace.display()
                 )
             })?;
-        self.decode_geometry(&result)
+        self.decode_geometry(&result, threat_ids)
     }
 
     pub(crate) fn validation_report(
@@ -506,6 +692,7 @@ impl CoorbitalEvasionMode {
         samples: &[GeometrySample],
         earliest_command_mjd: f64,
         _fov_half_angle_rad: f64,
+        threat_ids: &[String],
     ) -> ValidationReport {
         let mut report = ValidationReport::default();
         let earliest = samples
@@ -516,9 +703,12 @@ impl CoorbitalEvasionMode {
             let sample = &samples[index];
             let mut exposed = false;
             for (threat_index, threat) in sample.threats.iter().enumerate() {
-                if threat.line_of_sight && threat.in_field_of_view {
+                if threat_is_within_range(threat, self.config.threat_max_range_km)
+                    && threat.line_of_sight
+                    && threat.in_field_of_view
+                {
                     exposed = true;
-                    let id = &self.config.threat_ids[threat_index];
+                    let id = &threat_ids[threat_index];
                     if !report.exposed_threat_ids.contains(id) {
                         report.exposed_threat_ids.push(id.clone());
                     }
@@ -546,10 +736,88 @@ impl CoorbitalEvasionMode {
 #[cfg(test)]
 mod tests {
     use safe::protocol::{AutonomyModeBoardState, AutonomyModeId, BoardCmdId};
+    use safe::telemetry_frame::TelemetryFrame;
     use safe::utils::utc_mjd_to_gps;
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn mode_patches_use_ground_threat_state_from_telemetry() {
+        let mode = CoorbitalEvasionMode::new();
+        let telemetry = TelemetryFrame::new(serde_json::json!({
+            "augmented": {
+                "ground_threat_locations": {
+                    "ground-threat": [-23.0, -67.0, 0.5]
+                }
+            }
+        }));
+
+        let patches = mode
+            .mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+            .unwrap();
+
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.latitude_deg" && patch.value == "-23.000000000000000"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.longitude_deg" && patch.value == "-67.000000000000000"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "ground-threat.altitude_km" && patch.value == "0.500000000000000"
+        }));
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.field == "ground-threat.active" && patch.value == "true")
+        );
+    }
+
+    #[test]
+    fn mode_patches_use_space_threat_state_from_telemetry() {
+        let mode = CoorbitalEvasionMode::new();
+        let telemetry = TelemetryFrame::new(serde_json::json!({
+            "augmented": {
+                "space_threat_epoch_states": {
+                    "space-threat": [60000.0, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+                }
+            }
+        }));
+
+        let patches = mode
+            .mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+            .unwrap();
+
+        assert!(
+            patches
+                .iter()
+                .any(|patch| { patch.field == "space-threat.epoch_mjd" && patch.value == "60000" })
+        );
+        assert!(patches.iter().any(|patch| {
+            patch.field == "space-threat.epoch_position" && patch.value == "[1, 2, 3]"
+        }));
+        assert!(patches.iter().any(|patch| {
+            patch.field == "space-threat.epoch_velocity" && patch.value == "[4, 5, 6]"
+        }));
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.field == "space-threat.active" && patch.value == "true")
+        );
+    }
+
+    #[test]
+    fn mode_patches_accepts_telemetry_without_threats() {
+        let mode = CoorbitalEvasionMode::new();
+        let telemetry = TelemetryFrame::new(serde_json::json!({"augmented": {}}));
+
+        assert!(
+            mode.mode_patches(&telemetry, &mode.active_threat_ids(&telemetry).unwrap())
+                .unwrap()
+                .iter()
+                .all(|patch| !patch.field.contains("threat"))
+        );
+    }
 
     #[test]
     fn accepted_mixed_schedule_preserves_latest_pre_epoch_target() {
@@ -597,8 +865,8 @@ mod tests {
                 (future_mode_time, mode.config.nadir_mode_id.clone()),
             ]
         );
-        assert_eq!(schedule.quaternion_schedule.len(), 1);
-        assert!((schedule.quaternion_schedule[0].0 - (start + 0.02)).abs() < 1.0e-9);
+        assert_eq!(schedule.rpy_schedule.len(), 1);
+        assert!((schedule.rpy_schedule[0].0 - (start + 0.02)).abs() < 1.0e-9);
     }
 
     #[test]
@@ -609,7 +877,7 @@ mod tests {
             schedule.mode_schedule,
             vec![(60_000.0, mode.config.nadir_mode_id.clone())]
         );
-        assert!(schedule.quaternion_schedule.is_empty());
+        assert!(schedule.rpy_schedule.is_empty());
     }
 
     #[test]
@@ -642,7 +910,7 @@ mod tests {
                 (future_mode_time, mode.config.sun_yaw_mode_id.clone()),
             ]
         );
-        assert!(schedule.quaternion_schedule.is_empty());
+        assert!(schedule.rpy_schedule.is_empty());
     }
 
     #[test]
@@ -650,7 +918,7 @@ mod tests {
         let mode = CoorbitalEvasionMode::new();
         let accepted = EdsPointingSchedule {
             mode_schedule: vec![(1.0, "sun".to_string()), (2.0, "thruster".to_string())],
-            quaternion_schedule: Vec::new(),
+            rpy_schedule: Vec::new(),
         };
         let selected = vec![ScheduledPointing {
             time_mjd: 1.5,
@@ -661,6 +929,35 @@ mod tests {
             result.mode_schedule,
             vec![(1.0, "sun".to_string()), (1.5, mode.config.nadir_mode_id)]
         );
-        assert!(result.quaternion_schedule.is_empty());
+        assert!(result.rpy_schedule.is_empty());
+    }
+
+    #[test]
+    fn validation_ignores_threats_beyond_max_range() {
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.threat_max_range_km = 9.0;
+        let samples = (0..=1)
+            .map(|index| GeometrySample {
+                time_mjd: 60_000.0 + index as f64 / SECONDS_PER_DAY,
+                position_eci: Vector3::z(),
+                velocity_eci: Vector3::y(),
+                attitude_body_to_eci: UnitQuaternion::identity(),
+                boresight_eci: Vector3::z(),
+                threats: vec![ThreatGeometry {
+                    relative_position_eci: -10.0 * Vector3::z(),
+                    line_of_sight: true,
+                    in_field_of_view: true,
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let report = mode.validation_report(
+            &samples,
+            60_000.0,
+            30_f64.to_radians(),
+            &["threat".to_string()],
+        );
+        assert_eq!(report.score.exposure_secs, 0.0);
+        assert!(report.exposed_threat_ids.is_empty());
     }
 }

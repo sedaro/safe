@@ -584,7 +584,9 @@ async fn run_mode_supervisor(
                                     )
                                     .await;
                                 }
-                                AutonomyModeOutput::Command(_) | AutonomyModeOutput::CancelBoard { .. } => {}
+                                AutonomyModeOutput::Command(_)
+                                | AutonomyModeOutput::CancelBoard { .. }
+                                | AutonomyModeOutput::SimulationCompleted { .. } => {}
                             }
                             if let Some(active_mode_id) = desired_active.read().await.as_ref() {
                                 // if *active_mode_id == mode_id {

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use nalgebra::{UnitQuaternion, Vector3};
 use safe::protocol::AutonomyModeBoardState;
-use safe_telemetry::model::Telemetry;
+use safe::telemetry_frame::TelemetryFrame;
 
 use crate::config::CoorbitalEvasionModeConfig;
 
@@ -53,6 +53,28 @@ pub(crate) enum PointingTarget {
     Quaternion(UnitQuaternion<f64>),
 }
 
+pub(crate) fn quaternion_to_ypr(quaternion: &UnitQuaternion<f64>) -> (f64, f64, f64) {
+    let (roll, pitch, yaw) = quaternion.euler_angles();
+    let radians_to_degrees = 180.0 / std::f64::consts::PI;
+    // The flight controller applies RPY as reference * yaw(-Z) * pitch(Y) * roll(X).
+    // Flight yaw therefore has the opposite sign to a right-hand Z rotation.
+    (
+        roll * radians_to_degrees,
+        pitch * radians_to_degrees,
+        -yaw * radians_to_degrees,
+    )
+}
+
+pub(crate) fn ypr_to_quaternion(
+    roll_deg: f64,
+    pitch_deg: f64,
+    yaw_deg: f64,
+) -> UnitQuaternion<f64> {
+    UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -yaw_deg.to_radians())
+        * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), pitch_deg.to_radians())
+        * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), roll_deg.to_radians())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScheduledPointing {
     pub(crate) time_mjd: f64,
@@ -60,12 +82,12 @@ pub(crate) struct ScheduledPointing {
 }
 
 pub(crate) type ModeScheduleEntry = (f64, String);
-pub(crate) type QuaternionScheduleEntry = (f64, (f64, f64, f64, f64));
+pub(crate) type RpyScheduleEntry = (f64, (f64, f64, f64));
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct EdsPointingSchedule {
     pub(crate) mode_schedule: Vec<ModeScheduleEntry>,
-    pub(crate) quaternion_schedule: Vec<QuaternionScheduleEntry>,
+    pub(crate) rpy_schedule: Vec<RpyScheduleEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,7 +115,7 @@ pub(crate) enum PlanningOutcome {
 
 pub(crate) struct CoorbitalEvasionMode {
     pub(crate) config: CoorbitalEvasionModeConfig,
-    pub(crate) latest_telemetry: Option<Telemetry>,
+    pub(crate) latest_telemetry: Option<TelemetryFrame>,
     pub(crate) latest_board_snapshot: AutonomyModeBoardState,
     pub(crate) has_board_snapshot: bool,
     pub(crate) last_replan_start: Option<Instant>,

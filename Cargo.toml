@@ -1,13 +1,13 @@
 [workspace]
 members = [
     "safe",
+    "safe-llm-adapter",
     "safe-time",
     "safe-sim",
     "safe-gatekeeper",
     "safectl",
     "mode-anomaly-recovery",
-]
-exclude = [
+    "mode-mission-planning",
     "mode-coorbital-evasion",
 ]
 resolver = "2"

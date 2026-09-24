@@ -1,0 +1,19 @@
+[package]
+name = "safe-llm-adapter"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+https = ["dep:rustls-native-certs", "dep:tokio-rustls"]
+
+[dependencies]
+async-trait = "0.1.89"
+rustls-native-certs = { version = "0.8.4", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["io-util", "net", "time"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["io-util", "macros", "net", "rt"] }

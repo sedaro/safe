@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use safe::protocol::{
-    AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, Command, ModeToSafe, SafeToMode,
-    TimedCommand,
+    AutonomyModeBoardState, AutonomyModeId, AutonomyModeInput, AutonomyModeOutput, ModeToSafe,
+    SafeToMode,
 };
 use safe::telemetry_frame::TelemetryFrame;
 use safe::transports::Transport;
@@ -29,12 +29,30 @@ fn high_temperature_frame(ts_mono: u64) -> TelemetryFrame {
 }
 
 #[tokio::test]
-async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
+async fn persisted_static_anomaly_does_not_auto_emit_a_single_configured_action() {
+    profile_without_provider_cannot_execute(PROFILE_FIXTURE).await;
+}
+
+#[tokio::test]
+async fn shutdown_profile_requires_assessment_and_simulation_over_mode_transport() {
+    profile_without_provider_cannot_execute(include_str!("../testdata/shutdown_profile.json"))
+        .await;
+}
+
+async fn profile_without_provider_cannot_execute(profile: &str) {
     let mode_id = AutonomyModeId(Uuid::from_u128(1));
     let temp_dir = tempdir().expect("temporary directory");
     let socket_path = temp_dir.path().join("mode_anomaly_recovery.sock");
     let config_path = temp_dir.path().join("mode_config.json");
-    tokio::fs::write(&config_path, PROFILE_FIXTURE)
+    let mut config: serde_json::Value = serde_json::from_str(profile).unwrap();
+    // Hold the port without serving requests: no real model endpoint is used.
+    let unavailable_provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config["llm"]["adapter"]["config"]["endpoint"] = serde_json::json!(format!(
+        "http://{}/api/generate",
+        unavailable_provider.local_addr().unwrap()
+    ));
+    config["llm"]["request_timeout_ms"] = serde_json::json!(20);
+    tokio::fs::write(&config_path, serde_json::to_vec(&config).unwrap())
         .await
         .expect("write mode config");
 
@@ -51,6 +69,9 @@ async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
         .arg(config_path.to_string_lossy().to_string())
         .arg("--mode-id")
         .arg(mode_id.to_string())
+        .arg("--working-directory")
+        .arg(temp_dir.path())
+        .kill_on_drop(true)
         .spawn()
         .expect("start advisor mode");
 
@@ -76,11 +97,17 @@ async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
         } if mode == mode_id
     ));
 
+    stream
+        .write(SafeToMode::Input(AutonomyModeInput::BoardSnapshot(
+            AutonomyModeBoardState::default(),
+        )))
+        .await
+        .expect("send board");
     for ts_mono in [1, 2] {
+        let mut frame = high_temperature_frame(ts_mono);
+        frame.payload["telemetry"]["temperature_c"] = serde_json::json!(70.0);
         stream
-            .write(SafeToMode::Input(AutonomyModeInput::Telemetry(
-                high_temperature_frame(ts_mono),
-            )))
+            .write(SafeToMode::Input(AutonomyModeInput::Telemetry(frame)))
             .await
             .expect("send telemetry");
     }
@@ -89,21 +116,19 @@ async fn persisted_static_anomaly_emits_configured_action_without_ollama() {
         .await
         .expect("activate advisor");
 
-    let mut emitted_command = None;
-    for _ in 0..6 {
-        let output = timeout(Duration::from_secs(5), stream.read())
-            .await
-            .expect("advisor output timeout")
-            .expect("advisor output failed");
-        if let ModeToSafe::Output(AutonomyModeOutput::Command(envelope)) = output {
-            emitted_command = Some(envelope.cmd);
-            break;
+    // The fixture points at no local model. Assessment-first behavior must not
+    // replace that unavailable evidence with the former single-action shortcut.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while let Ok(message) = tokio::time::timeout_at(deadline, stream.read()).await {
+        let message = message.expect("mode stays connected");
+        if let ModeToSafe::Output(output) = message {
+            assert!(!matches!(
+                output,
+                AutonomyModeOutput::Command(_) | AutonomyModeOutput::Fault(_)
+            ));
         }
     }
-    assert!(matches!(
-        emitted_command,
-        Some(TimedCommand::Now(Command::PointSunYaw))
-    ));
+    assert!(!temp_dir.path().join("shutdown-attempt.jsonl").exists());
 
     stream
         .write(SafeToMode::Input(AutonomyModeInput::Shutdown))
