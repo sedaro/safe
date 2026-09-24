@@ -101,10 +101,6 @@ impl SimulationInitialization {
             !self.patches.is_empty(),
             "initialization patches are required"
         );
-        ensure!(
-            !self.command_schedules.is_empty() || !self.compute_power_bindings.is_empty(),
-            "executable command or compute-power bindings are required"
-        );
         let mut targets = HashSet::new();
         for patch in &self.patches {
             ensure!(
@@ -411,6 +407,17 @@ pub(crate) fn prepare_inputs(
                 );
                 Some((id, mode))
             }
+        }
+        Some(SimulationScenarioRole::Observation) => {
+            ensure!(
+                scenario.modeled_action.is_none()
+                    && scenario.baseline_scenario_id.is_none()
+                    && scenario.command_schedule_binding.is_none()
+                    && scenario.compute_power_binding.is_none()
+                    && scenario.constraints.is_empty(),
+                "observation cannot contain an action-specific contract"
+            );
+            None
         }
         None => bail!("initialized simulation requires an explicit scenario role"),
     };
