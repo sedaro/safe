@@ -304,6 +304,9 @@ impl CoorbitalEvasionMode {
             Err(error) if telemetry_is_not_ready(&error) => {}
             Err(error) => {
                 warn!("coorbital-evasion planning failed: {error:#}");
+                // A deterministic simulation/configuration failure cannot be
+                // repaired by the next telemetry frame. Pace retries instead.
+                self.last_replan_start = Some(Instant::now());
             }
         }
     }

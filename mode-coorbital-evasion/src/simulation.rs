@@ -79,6 +79,14 @@ impl CoorbitalEvasionMode {
             .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
+        if !self.config.threat_ids.is_empty() {
+            ids.retain(|id| {
+                self.config
+                    .threat_ids
+                    .iter()
+                    .any(|configured| configured == id)
+            });
+        }
         Ok(ids)
     }
 
@@ -316,8 +324,6 @@ impl CoorbitalEvasionMode {
             .and_then(Value::as_object);
 
         for id in threat_ids {
-            // Rogue point threats are inactive by default, so state patches alone
-            // do not make them participate in FOV evaluation.
             patches.push(EdsPatch::new(
                 &self.config.agent_id,
                 "gnc",
@@ -760,6 +766,11 @@ mod tests {
         assert!(patches.iter().any(|patch| {
             patch.field == "ground-threat.altitude_km" && patch.value == "0.500000000000000"
         }));
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.field == "ground-threat.active" && patch.value == "true")
+        );
     }
 
     #[test]
@@ -788,6 +799,11 @@ mod tests {
         assert!(patches.iter().any(|patch| {
             patch.field == "space-threat.epoch_velocity" && patch.value == "[4, 5, 6]"
         }));
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.field == "space-threat.active" && patch.value == "true")
+        );
     }
 
     #[test]

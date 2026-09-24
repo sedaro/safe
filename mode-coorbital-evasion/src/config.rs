@@ -33,6 +33,9 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     /// Defer planning until proposals from this mode have reached a terminal board state.
     #[serde(default)]
     pub(crate) wait_for_proposals_from_mode_id: Option<AutonomyModeId>,
+    /// Fixed allowlist of EDS threat entities to plan against.
+    #[serde(default)]
+    pub(crate) threat_ids: Vec<String>,
     #[serde(default = "default_agent_id")]
     pub(crate) agent_id: String,
     #[serde(default = "default_field_of_view_id")]
@@ -97,6 +100,7 @@ impl Default for CoorbitalEvasionModeConfig {
             min_replan_interval_secs: default_min_replan_interval_secs(),
             command_lead_secs: default_command_lead_secs(),
             wait_for_proposals_from_mode_id: None,
+            threat_ids: Vec::new(),
             agent_id: default_agent_id(),
             field_of_view_id: default_field_of_view_id(),
             threat_max_range_km: default_threat_max_range_km(),
@@ -225,6 +229,7 @@ mod tests {
         assert!(config.threat_max_range_km.is_infinite());
         assert_eq!(config.max_slew_rate_rad_s, 0.010_472);
         assert!(config.wait_for_proposals_from_mode_id.is_none());
+        assert!(config.threat_ids.is_empty());
         assert!(config.agent_id.is_empty());
         assert!(config.field_of_view_id.is_empty());
         assert!(config.pointing_mode_schedule_field.is_empty());
