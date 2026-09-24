@@ -86,6 +86,7 @@ impl MissionPlanningMode {
         }
 
         let accepted_commands = accepted_commands(&self.latest_board, current_gps_time);
+        let active_commands = active_commands(&self.latest_board, current_gps_time);
         let (simulation_start_mjd, baseline_result) =
             run_schedule(&self.config, telemetry, accepted_commands.clone())
                 .await
@@ -114,7 +115,7 @@ impl MissionPlanningMode {
                 )
             })
             .collect::<Vec<_>>();
-        candidates = exclude_schedule_conflicts(candidates, &accepted_commands);
+        candidates = exclude_schedule_conflicts(candidates, &active_commands);
         if candidates.is_empty() {
             self.power_saving = plan.current_power_saving;
             self.emit(runtime, TimedCommand::NOOP).await?;
@@ -186,7 +187,7 @@ impl ModeHandler<MissionPlanningConfig> for MissionPlanningMode {
         telemetry: TelemetryFrame,
     ) -> Result<()> {
         self.latest_telemetry = Some(telemetry.clone());
-        if runtime.is_active() && self.plan_on_next_telemetry {
+        if runtime.is_active() && (self.plan_on_next_telemetry || !self.replan_interval_active()) {
             self.run_once(runtime, telemetry).await?;
         }
         Ok(())
@@ -225,15 +226,29 @@ fn telemetry_number(telemetry: &TelemetryFrame, pointer: &str, label: &str) -> R
 }
 
 fn accepted_commands(board: &AutonomyModeBoardState, current_gps_time: f64) -> Vec<TimedCommand> {
+    board_commands(board, current_gps_time, |id| {
+        board.source_of_truth.contains(id)
+    })
+}
+
+/// Pending commands are not safe simulation inputs, but they still reserve a
+/// schedule slot until the gatekeeper reaches a decision.
+fn active_commands(board: &AutonomyModeBoardState, current_gps_time: f64) -> Vec<TimedCommand> {
+    board_commands(board, current_gps_time, |id| {
+        board.rejected.get(id).is_none_or(Vec::is_empty)
+    })
+}
+
+fn board_commands(
+    board: &AutonomyModeBoardState,
+    current_gps_time: f64,
+    include: impl Fn(&safe::protocol::BoardCmdId) -> bool,
+) -> Vec<TimedCommand> {
     let mut commands = board
-        .source_of_truth
+        .proposals
         .iter()
-        .filter_map(|id| {
-            board
-                .proposals
-                .get(id)
-                .map(|(_, command, proposal_time)| (command.clone(), *proposal_time, id.0.clone()))
-        })
+        .filter(|(id, _)| include(id))
+        .map(|(id, (_, command, proposal_time))| (command.clone(), *proposal_time, id.0.clone()))
         .filter(|(command, _, _)| !matches!(command, TimedCommand::NOOP))
         .collect::<Vec<_>>();
     commands.sort_by(|left, right| {
@@ -253,11 +268,10 @@ fn board_contains_equivalent(
     candidate: &TimedCommand,
     tolerance_secs: f64,
 ) -> bool {
-    board
-        .source_of_truth
-        .iter()
-        .filter_map(|id| board.proposals.get(id))
-        .any(|(_, existing, _)| equivalent(existing, candidate, tolerance_secs))
+    board.proposals.iter().any(|(id, (_, existing, _))| {
+        board.rejected.get(id).is_none_or(Vec::is_empty)
+            && equivalent(existing, candidate, tolerance_secs)
+    })
 }
 
 fn equivalent(left: &TimedCommand, right: &TimedCommand, tolerance_secs: f64) -> bool {
@@ -333,7 +347,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duplicate_detection_uses_only_source_of_truth() {
+    fn duplicate_detection_includes_pending_proposals() {
         let id = BoardCmdId("one".into());
         let command = TimedCommand::Scheduled {
             cmd: Command::CaptureImage,
@@ -344,7 +358,7 @@ mod tests {
             id.clone(),
             (AutonomyModeId(Uuid::nil()), command.clone(), 1),
         );
-        assert!(!board_contains_equivalent(&board, &command, 1.0));
+        assert!(board_contains_equivalent(&board, &command, 1.0));
         board.source_of_truth.push(id.clone());
         assert!(board_contains_equivalent(&board, &command, 1.0));
     }

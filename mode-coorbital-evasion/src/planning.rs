@@ -662,6 +662,18 @@ impl CoorbitalEvasionMode {
         let fov_half_angle_rad = self.config.fov_half_angle_deg.to_radians();
         let guarded_half_angle_rad =
             (self.config.fov_half_angle_deg + self.config.fov_guard_angle_deg).to_radians();
+        let baseline_boresights = baseline
+            .iter()
+            .map(|sample| sample.boresight_eci.normalize())
+            .collect::<Vec<_>>();
+        let baseline_score = score_boresights(
+            &baseline,
+            &baseline_boresights,
+            earliest,
+            baseline.len() - 1,
+            fov_half_angle_rad,
+            self.config.threat_max_range_km,
+        );
         let periods = unsafe_periods(
             &baseline,
             guarded_half_angle_rad,
@@ -770,6 +782,15 @@ impl CoorbitalEvasionMode {
             baseline.len() - 1,
             fov_half_angle_rad,
             self.config.threat_max_range_km,
+        );
+        tracing::info!(
+            baseline_exposure_secs = baseline_score.exposure_secs,
+            modeled_exposure_secs = modeled_score.exposure_secs,
+            exposure_reduction_secs = baseline_score.exposure_secs - modeled_score.exposure_secs,
+            baseline_nadir_cost = baseline_score.nadir_cost,
+            modeled_nadir_cost = modeled_score.nadir_cost,
+            pointing_commands = commands.len(),
+            "coorbital-evasion selected the minimum-exposure modeled schedule"
         );
         let commands = lift_commands(&baseline, &commands);
         let selected_schedule = self.selected_pointing_schedule(
