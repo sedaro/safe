@@ -376,6 +376,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observation_projection_runs_once_without_an_action_comparison() {
+        let adapter = Arc::new(Adapter::default());
+        let runner = Arc::new(Runner::default());
+        let mut request = request();
+        let simulation = request.config.simulation.as_mut().unwrap();
+        simulation.max_runs = 1;
+        simulation
+            .initialization
+            .as_mut()
+            .unwrap()
+            .compute_power_bindings
+            .clear();
+        simulation.scenarios.truncate(1);
+        let observation = &mut simulation.scenarios[0];
+        observation.role = Some(crate::config::SimulationScenarioRole::Observation);
+        observation.allowed_actions.clear();
+        request.config.validate().unwrap();
+
+        let report = run_with_runner(adapter.clone(), request, Some(runner.clone()))
+            .await
+            .unwrap();
+        assert!(report.assessment.is_some(), "{:?}", report.assessment_error);
+        assert_eq!(report.simulation.status, "evaluated");
+        assert_eq!(report.simulation.attempted_runs, 1);
+        assert_eq!(report.simulation.runs[0].scenario_id, "compute_on");
+        assert!(report.simulation.comparisons.is_empty());
+        assert_eq!(runner.requests.lock().unwrap().len(), 1);
+        assert!(adapter.prompts.lock().unwrap()[0].contains("compute_on"));
+    }
+
+    #[tokio::test]
     async fn failed_simulation_and_failed_constraints_are_evidence_not_suppressed_assessments() {
         for runner in [
             Runner {

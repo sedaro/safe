@@ -1,4 +1,4 @@
-//! Paired, frozen-state simulations supplied as advisory evidence only.
+//! Frozen-state simulations supplied as advisory evidence only.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -111,56 +111,73 @@ pub(crate) async fn collect(
         runs: Mutex::new(vec![]),
     });
     let mut comparisons = Vec::new();
-    for recovery in &config.scenarios {
-        if recovery.role != Some(SimulationScenarioRole::Recovery)
-            || (!post_recovery
-                && !recovery
-                    .applicable_rule_ids
+    for scenario in &config.scenarios {
+        let applicable = post_recovery
+            || scenario
+                .applicable_rule_ids
+                .iter()
+                .any(|id| candidate_ids.contains(id));
+        if !applicable {
+            continue;
+        }
+        match scenario.role {
+            Some(SimulationScenarioRole::Observation) => {
+                if runner.runs.lock().unwrap().len() + 1 > config.max_runs as usize {
+                    break;
+                }
+                // Observations project the frozen current state; they do not model an action.
+                let _ = runner
+                    .run(ScenarioRunRequest {
+                        scenario_id: scenario.id.clone(),
+                        evidence_revision,
+                        horizon_days: scenario.duration_days,
+                    })
+                    .await;
+            }
+            Some(SimulationScenarioRole::Recovery) => {
+                if runner.runs.lock().unwrap().len() + 2 > config.max_runs as usize {
+                    break;
+                }
+                let Some(baseline) = config
+                    .scenarios
                     .iter()
-                    .any(|id| candidate_ids.contains(id)))
-        {
-            continue;
+                    .find(|s| Some(s.id.as_str()) == scenario.baseline_scenario_id.as_deref())
+                else {
+                    continue;
+                };
+                let Some(action) = scenario.modeled_action else {
+                    continue;
+                };
+                let result = run_and_validate(
+                    runner.clone(),
+                    baseline,
+                    scenario,
+                    &config.viability,
+                    action,
+                    evidence_revision,
+                    scenario.duration_days,
+                )
+                .await;
+                comparisons.push(Comparison {
+                    baseline_id: baseline.id.clone(),
+                    recovery_id: scenario.id.clone(),
+                    modeled_action: action.as_str().into(),
+                    constraints_passed: result.is_ok(),
+                    error: result
+                        .err()
+                        .map(|error| format!("{error:#}").chars().take(1000).collect()),
+                });
+            }
+            _ => {}
         }
-        if runner.runs.lock().unwrap().len() + 2 > config.max_runs as usize {
-            break;
-        }
-        let Some(baseline) = config
-            .scenarios
-            .iter()
-            .find(|s| Some(s.id.as_str()) == recovery.baseline_scenario_id.as_deref())
-        else {
-            continue;
-        };
-        let Some(action) = recovery.modeled_action else {
-            continue;
-        };
-        let result = run_and_validate(
-            runner.clone(),
-            baseline,
-            recovery,
-            &config.viability,
-            action,
-            evidence_revision,
-            recovery.duration_days,
-        )
-        .await;
-        comparisons.push(Comparison {
-            baseline_id: baseline.id.clone(),
-            recovery_id: recovery.id.clone(),
-            modeled_action: action.as_str().into(),
-            constraints_passed: result.is_ok(),
-            error: result
-                .err()
-                .map(|error| format!("{error:#}").chars().take(1000).collect()),
-        });
-    }
-    if comparisons.is_empty() {
-        return SimulationEvidence::skipped(
-            "no applicable scenario pair within the configured run budget",
-        );
     }
     let runs = std::mem::take(&mut *runner.runs.lock().unwrap());
+    if runs.is_empty() {
+        return SimulationEvidence::skipped(
+            "no applicable simulation scenario within the configured run budget",
+        );
+    }
     SimulationEvidence { status: "evaluated".into(),
-        detail: "Frozen current-state counterfactuals, not evidence that shutdown occurred or cooled hardware. Power-only results do not predict temperature; a thermal model flag alone does not prove benefit. Unconfigured loads and per-packet time alignment remain model assumptions.".into(),
+        detail: "Frozen current-state projections and action counterfactuals are advisory evidence only. Observation scenarios do not model a shutdown or any other action. Power-only results do not predict temperature; a thermal model flag alone does not prove benefit. Unconfigured loads and per-packet time alignment remain model assumptions.".into(),
         attempted_runs: runs.len(), runs, comparisons }
 }

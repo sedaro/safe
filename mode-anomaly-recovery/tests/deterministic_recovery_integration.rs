@@ -344,3 +344,89 @@ async fn advisor_is_quiet_during_cooldown_and_provider_failure_does_not_block_no
     assert!(record(directory.path()).await["completed_at"].is_number());
     mode.stop().await;
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn critical_recovery_cancels_an_in_flight_eds_process_without_waiting_for_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let eds = directory.path().join("eds");
+    let pid_file = directory.path().join("eds.pid");
+    tokio::fs::write(
+        &eds,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .await
+    .unwrap();
+    std::fs::set_permissions(&eds, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = profile();
+    config["advisory"] = json!({"enabled":true,"local_inference":true});
+    config["llm"] = json!({"adapter":{"kind":"ollama","config":{"endpoint":"http://127.0.0.1:1/api/generate"}},"model":"test"});
+    let legacy: Value =
+        serde_json::from_str(include_str!("../testdata/shutdown_profile.json")).unwrap();
+    config["simulation"] = legacy["simulation"].clone();
+    config["simulation"]["eds_path"] = json!(eds);
+    config["simulation"]["run_timeout_ms"] = json!(60000);
+    config["simulation"]["initialization"]["epoch_path"] = json!("epoch_mjd");
+    config["simulation"]["initialization"]["patches"][0]["telemetry_path"] = json!("battery.soc");
+    config["simulation"]["initialization"]["requirements"][0]["path"] = json!("battery.soc");
+    for scenario in config["simulation"]["scenarios"].as_array_mut().unwrap() {
+        scenario["state_bindings"][0]["path"] = json!("battery.soc");
+    }
+    config["nominal_profiles"] = json!([{"id":"warning","source":"example","rules":[
+        {"id":"hot","path":"thermal.temperature_c","kind":"number_range","max":60.0,"eligible_actions":[]}
+    ]}]);
+    let mut mode = Mode::start(directory.path(), &config).await;
+    mode.input(AutonomyModeInput::BoardSnapshot(Default::default()))
+        .await;
+    mode.input(AutonomyModeInput::Activate).await;
+    let at = now();
+    mode.input(AutonomyModeInput::Telemetry(telemetry_frame::TelemetryFrame {
+        source: Some("example".into()), ts_mono: (at * 1000.0) as u64,
+        payload: json!({"epoch_mjd":60000.0,"battery":{"soc":0.8,"measured_at_unix_secs":at,"valid":true},
+            "thermal":{"temperature_c":70.0,"measured_at_unix_secs":at,"valid":true}}),
+    })).await;
+    mode.noop().await;
+    let pid: u32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(&pid_file).await {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("EDS should start for noncritical advisory assessment");
+    struct EdsCleanup(u32);
+    impl Drop for EdsCleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &self.0.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    let mut cleanup = Some(EdsCleanup(pid));
+    mode.input(AutonomyModeInput::Deactivate).await;
+    mode.telemetry(0.1, 90.0).await;
+    mode.input(AutonomyModeInput::Activate).await;
+    timeout(Duration::from_secs(2), record(directory.path()))
+        .await
+        .expect("shutdown must not wait for EDS");
+    timeout(Duration::from_secs(2), async {
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled EDS process must exit");
+    std::mem::forget(cleanup.take().unwrap()); // PID is reaped; do not signal a potentially reused PID.
+    mode.silent_for(Duration::from_millis(100)).await;
+    mode.stop().await;
+}

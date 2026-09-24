@@ -256,6 +256,7 @@ pub(crate) struct SimulationMetric {
 pub(crate) enum SimulationScenarioRole {
     Baseline,
     Recovery,
+    Observation,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -288,6 +289,7 @@ pub(crate) struct SimulationScenario {
     pub(crate) id: String,
     pub(crate) description: String,
     pub(crate) applicable_rule_ids: Vec<String>,
+    #[serde(default)]
     pub(crate) allowed_actions: Vec<AllowedAction>,
     #[serde(default)]
     pub(crate) baseline_scenario_id: Option<String>,
@@ -776,11 +778,13 @@ impl AnomalyRecoveryModeConfig {
                     "advisory simulations require telemetry initialization"
                 );
                 ensure!(
-                    simulation
-                        .scenarios
-                        .iter()
-                        .any(|s| s.role == Some(SimulationScenarioRole::Recovery)),
-                    "advisory simulations require a paired recovery scenario"
+                    simulation.scenarios.iter().any(|s| matches!(
+                        s.role,
+                        Some(
+                            SimulationScenarioRole::Recovery | SimulationScenarioRole::Observation
+                        )
+                    )),
+                    "advisory simulations require a recovery pair or observation scenario"
                 );
             }
             if let Some(initialization) = &simulation.initialization {
@@ -790,11 +794,11 @@ impl AnomalyRecoveryModeConfig {
                 }
             }
             if simulation.eds_path.as_os_str().is_empty()
-                || simulation.max_runs < 2
+                || simulation.max_runs == 0
                 || simulation.run_timeout_ms == 0
                 || simulation.scenarios.is_empty()
             {
-                bail!("simulation requires eds_path, max_runs >= 2, and run_timeout_ms > 0");
+                bail!("simulation requires eds_path, max_runs > 0, and run_timeout_ms > 0");
             }
             if [
                 &simulation.viability.final_soc_metric,
@@ -859,6 +863,18 @@ impl AnomalyRecoveryModeConfig {
                                 }
                             }
                         }
+                        Some(SimulationScenarioRole::Observation) => {
+                            if scenario.modeled_action.is_some()
+                                || scenario.baseline_scenario_id.is_some()
+                                || scenario.command_schedule_binding.is_some()
+                                || scenario.compute_power_binding.is_some()
+                                || !scenario.constraints.is_empty()
+                            {
+                                bail!(
+                                    "observation cannot specify an action, baseline, binding, or constraints"
+                                );
+                            }
+                        }
                         None => bail!("initialized scenarios require an explicit role"),
                     }
                 }
@@ -871,7 +887,8 @@ impl AnomalyRecoveryModeConfig {
                 }
                 if !scenario_ids.insert(scenario.id.as_str())
                     || scenario.applicable_rule_ids.is_empty()
-                    || scenario.allowed_actions.is_empty()
+                    || (scenario.role != Some(SimulationScenarioRole::Observation)
+                        && scenario.allowed_actions.is_empty())
                     || scenario.metrics.is_empty()
                 {
                     bail!(
@@ -1461,6 +1478,32 @@ mod tests {
             entries[0]["activation"]["Hysteretic"]["exit"]["Equal"][1]["Term"]["String"]["Literal"],
             expected_id.to_string()
         );
+    }
+
+    #[test]
+    fn otp_observation_projection_needs_no_compute_power_binding() {
+        let entries: serde_json::Value =
+            serde_json::from_str(include_str!("../autonomy_mode_config.otp2-recovery.json"))
+                .unwrap();
+        let config: super::AnomalyRecoveryModeConfig =
+            serde_json::from_value(entries[0]["mode_config"].clone()).unwrap();
+        config.validate().unwrap();
+        let simulation = config.simulation.as_ref().unwrap();
+        assert_eq!(simulation.max_runs, 1);
+        assert!(
+            simulation
+                .initialization
+                .as_ref()
+                .unwrap()
+                .compute_power_bindings
+                .is_empty()
+        );
+        assert_eq!(simulation.scenarios.len(), 1);
+        assert_eq!(
+            simulation.scenarios[0].role,
+            Some(SimulationScenarioRole::Observation)
+        );
+        assert!(simulation.scenarios[0].allowed_actions.is_empty());
     }
 
     use super::*;

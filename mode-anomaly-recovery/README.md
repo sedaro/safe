@@ -12,6 +12,10 @@ mode-local state machine, routing example, optional LLM advisor, and FlatSat
 verification steps. The procedure runs without an LLM or EDS. The assessment
 workflow below remains available when `recovery` is omitted.
 
+The [synthetic recovery/advisory configuration](./testdata/recovery_advisory_profile.json)
+illustrates optional LLM analysis with paired power simulations. Supply deployment
+telemetry bindings, model settings, and thresholds in your local configuration.
+
 ## Thermal Assessment User Story
 
 The intended thermal-recovery workflow uses an LLM to assess telemetry,

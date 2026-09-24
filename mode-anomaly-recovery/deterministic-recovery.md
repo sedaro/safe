@@ -41,7 +41,12 @@ only for the real SCP restart test/deployment.
 Setting `mode_config.recovery` selects this procedure. Omitting it retains the
 existing LLM assessment/simulation workflow. The deterministic procedure requires
 neither an LLM configuration nor an EDS configuration. Its `action_catalog` is
-empty, and it does not accept simulation configuration.
+empty. Optional `simulation` configuration supplies counterfactual evidence to
+the LLM advisor when `advisory.enabled` is true; it never gates critical recovery.
+
+For a complete synthetic example with paired power simulations and LLM analysis,
+see [`testdata/recovery_advisory_profile.json`](testdata/recovery_advisory_profile.json).
+Replace its example telemetry bindings and model settings for your deployment.
 
 Each measurement declares:
 
@@ -114,7 +119,7 @@ The mode writes:
 | --- | --- |
 | `recovery-state.json` | Episode ID, trigger measurements/reasons, policy, attempt time, original deadline, invocation outcome, completion time. |
 | `recovery-status.json` | Active/waiting state, latest measurements, remaining time, reason for waiting, clock and advisor status, whether `NOOP` was sent. |
-| `advisory-assessment.json` | Latest optional assessment and associated episode ID. |
+| `advisory-assessment.json` | Latest optional report: assessment or provider error, simulation runs/comparisons, frozen telemetry revision, and associated episode ID. |
 
 State changes use atomic replacement, file synchronization, and directory
 synchronization. New episode IDs use the shutdown-attempt timestamp (for example,
@@ -138,20 +143,51 @@ assessment-only inference. The advisor has no command or recovery-control handle
   `eligible_actions` are empty in this configuration.
 - After recovery, an assessment can summarize trigger evidence, recent readings,
   board intent, likely contributors, evidence gaps, and operational recommendations.
+- If `simulation` is configured, applicable baseline/recovery pairs run first and
+  their metrics, constraint outcomes, and errors are provided to the LLM. Missing
+  simulation inputs or failed runs are evidence gaps; analysis can still proceed.
 - Inference runs asynchronously after the deterministic check/handoff. Provider
   failures never delay `NOOP` or decide shutdown/release.
-- While recovery is waiting, pending inference is cancelled and new requests are
-  suppressed, including after the minimum 100 minutes if recovery is incomplete.
+- While recovery is waiting, pending inference and EDS work are cancelled and new
+  requests are suppressed, including after the minimum 100 minutes if recovery is
+  incomplete. EDS runs use the existing subprocess timeout and kill-on-drop behavior.
 - `min_interval_secs` (default 300) and `history_samples` (default 64, max 256)
   bound assessment frequency and evidence history. Responses are validated and
   written as advisory records, not executed as commands.
+- `advisory.instructions` supplies mission-specific assessment context. Older
+  multi-turn planner prompts are not used by this assessment-only path. The prompt
+  builder removes oldest history with an omission count to fit its estimated
+  context budget, while retaining current measurements and simulation evidence.
 
-For a local model server, configure `pause_command` and `resume_command` to manage
-that service; merely cancelling the client request may leave server-side inference
-running. These are executable/argument arrays, not shell strings. Set
-`local_inference: false` for a remote provider. Local service failures are reported
-in the status file and retried at a bounded cadence. A critical shutdown is not
-delayed waiting for an advisory service command.
+Model service management is optional. Leave both `pause_command` and
+`resume_command` empty to keep the server running while cancelling/suppressing
+this mode's inference requests. Client cancellation may leave an already-submitted
+server-side inference running. To manage a local service as well, configure both
+commands as executable/argument arrays. `local_inference` identifies a local or
+remote provider. Service failures are reported in the status file and retried at
+a bounded cadence. A critical shutdown is not delayed by a service command.
+
+### Advisory simulation applicability
+
+Use the existing `simulation.initialization` and `simulation.scenarios` schema.
+Before a noncritical assessment, run pairs whose recovery scenario lists a current
+candidate in `applicable_rule_ids`. Post-recovery assessments may run configured
+pairs from the **current recovered snapshot**, rather than reconstructing the
+pre-shutdown orbit. Respect `max_runs` across the assessment and `run_timeout_ms`
+per scenario. Each pair shares the frozen snapshot, horizon, and evidence revision.
+
+The existing SOC/units/constraint checks evaluate each pair. Both successful and
+failed comparisons are recorded; failed constraints do not erase collected metrics.
+`allowed_actions` and `modeled_action` describe simulated counterfactuals in this
+path. They grant no execution authority; `action_catalog` and rule-level
+`eligible_actions` remain empty.
+
+The standalone scenarios currently omit existing board plans. They therefore run
+only with a known board containing no outstanding effectful commands. `NOOP` and
+rejected proposals do not block them. Missing/effectful board context produces an
+explicit skipped-simulation reason and allows LLM analysis to proceed. A relevant
+board change cancels in-flight advisory work. Simulation failure or LLM failure
+does not affect shutdown, the cooldown deadline, or release.
 
 ## Verification and FlatSat sequence
 
