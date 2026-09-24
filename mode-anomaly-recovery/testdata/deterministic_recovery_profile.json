@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "shutdown_command": ["/bin/true"],
+  "recovery": {
+    "trusted_system_utc": true,
+    "minimum_hold_secs": 6000,
+    "max_measurement_age_secs": 30,
+    "trigger_samples": 2,
+    "recovery_samples": 2,
+    "recovery_dwell_secs": 10,
+    "max_clock_step_secs": 5,
+    "power": {
+      "id": "battery_soc",
+      "source": "example",
+      "path": "battery.soc",
+      "timestamp_path": "battery.measured_at_unix_secs",
+      "validity_path": "battery.valid",
+      "valid_value": true,
+      "units": "fraction",
+      "trigger": 0.15,
+      "recover": 0.3
+    },
+    "thermals": [
+      {
+        "id": "compute_temperature",
+        "source": "example",
+        "path": "thermal.temperature_c",
+        "timestamp_path": "thermal.measured_at_unix_secs",
+        "validity_path": "thermal.valid",
+        "valid_value": true,
+        "units": "degC",
+        "trigger": 80.0,
+        "recover": 60.0
+      }
+    ]
+  }
+}
