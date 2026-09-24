@@ -695,8 +695,8 @@ impl AnomalyRecoveryModeConfig {
                 "deterministic recovery advisor is assessment-only; action_catalog must be empty"
             );
             ensure!(
-                self.simulation.is_none(),
-                "deterministic recovery does not run simulations"
+                self.simulation.is_none() || self.advisory.enabled,
+                "recovery-mode simulations require advisory.enabled"
             );
         }
         if self
@@ -770,6 +770,19 @@ impl AnomalyRecoveryModeConfig {
         }
 
         if let Some(simulation) = &self.simulation {
+            if self.recovery.is_some() {
+                ensure!(
+                    simulation.initialization.is_some(),
+                    "advisory simulations require telemetry initialization"
+                );
+                ensure!(
+                    simulation
+                        .scenarios
+                        .iter()
+                        .any(|s| s.role == Some(SimulationScenarioRole::Recovery)),
+                    "advisory simulations require a paired recovery scenario"
+                );
+            }
             if let Some(initialization) = &simulation.initialization {
                 initialization.validate()?;
                 if self.profile_for_source(&initialization.source).is_none() {
@@ -876,7 +889,11 @@ impl AnomalyRecoveryModeConfig {
                     }
                 }
                 for action in &scenario.allowed_actions {
-                    if !action_ids.contains(action) {
+                    // In deterministic recovery these are modeled counterfactuals,
+                    // never actions the advisor is authorized to execute.
+                    if !(action_ids.contains(action)
+                        || (self.recovery.is_some() && action.is_recommendable()))
+                    {
                         bail!(
                             "simulation scenario '{}': action '{}' is not configured",
                             scenario.id,
@@ -1415,6 +1432,37 @@ fn default_selection_tool_description() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deterministic_config_retains_simulations_and_analysis_without_action_authority() {
+        let entries: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/recovery_advisory_profile.json"))
+                .unwrap();
+        let config: super::AnomalyRecoveryModeConfig =
+            serde_json::from_value(entries[0]["mode_config"].clone()).unwrap();
+        config.validate().unwrap();
+        assert!(config.advisory.enabled && config.simulation.is_some());
+        assert!(
+            config.advisory.pause_command.is_empty() && config.advisory.resume_command.is_empty()
+        );
+        assert!(config.action_catalog.is_empty());
+        assert!(
+            config
+                .nominal_profiles
+                .iter()
+                .flat_map(|p| &p.rules)
+                .all(|rule| rule.eligible_actions.is_empty())
+        );
+        assert_eq!(config.recovery.as_ref().unwrap().minimum_hold_secs, 6000);
+        let expected_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            entries[0]["name"].as_str().unwrap().as_bytes(),
+        );
+        assert_eq!(
+            entries[0]["activation"]["Hysteretic"]["exit"]["Equal"][1]["Term"]["String"]["Literal"],
+            expected_id.to_string()
+        );
+    }
+
     use super::*;
 
     fn valid_config() -> AnomalyRecoveryModeConfig {
