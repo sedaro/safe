@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use safe_sim::MonteCarloParameter;
+use safe_sim::{EdsPatchTarget, MonteCarloParameter, ProbabilityDistribution};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -83,7 +83,37 @@ pub(crate) struct MonteCarloConfig {
     pub(crate) seed: u64,
     #[serde(default = "default_minimum_pass_fraction")]
     pub(crate) minimum_pass_fraction: f64,
+    #[serde(default)]
     pub(crate) parameters: Vec<MonteCarloParameter>,
+    #[serde(default)]
+    pub(crate) variations: Vec<MonteCarloVariation>,
+    #[serde(default = "default_max_resample_attempts")]
+    pub(crate) max_resample_attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MonteCarloOperation {
+    #[default]
+    Replace,
+    Add,
+    Multiply,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct MonteCarloBounds {
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MonteCarloVariation {
+    pub(crate) name: String,
+    pub(crate) target: EdsPatchTarget,
+    #[serde(default)]
+    pub(crate) operation: MonteCarloOperation,
+    pub(crate) distribution: ProbabilityDistribution,
+    pub(crate) bounds: Option<MonteCarloBounds>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,8 +275,8 @@ impl MissionPlanningConfig {
 }
 
 fn validate_monte_carlo(config: &MonteCarloConfig) -> Result<()> {
-    if config.samples == 0 || config.parameters.is_empty() {
-        bail!("monte_carlo requires samples and parameters");
+    if config.samples == 0 || (config.parameters.is_empty() && config.variations.is_empty()) {
+        bail!("monte_carlo requires parameters or variations");
     }
     if !config.minimum_pass_fraction.is_finite()
         || !(0.0..=1.0).contains(&config.minimum_pass_fraction)
@@ -254,7 +284,14 @@ fn validate_monte_carlo(config: &MonteCarloConfig) -> Result<()> {
     {
         bail!("monte_carlo minimum_pass_fraction must be in (0, 1]");
     }
+    if config.max_resample_attempts == 0 {
+        bail!("monte_carlo max_resample_attempts must be greater than zero");
+    }
     Ok(())
+}
+
+fn default_max_resample_attempts() -> usize {
+    1_000
 }
 
 fn validate_pointing(pointing: &PointingConfig) -> Result<()> {
