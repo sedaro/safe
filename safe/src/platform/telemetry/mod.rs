@@ -146,10 +146,37 @@ mod example {
 
         let mut counter: u32 = 0;
         loop {
+            let time_mjd_utc = 60_000.0 + f64::from(counter) / 86_400.0;
+            let gps_time = 1_000_000_u64 + u64::from(counter);
             let t = TelemetryFrame {
                 source: Some("example".to_string()),
                 ts_mono: counter as u64,
-                payload: serde_json::json!({"telemetry": {"batt_v": counter, "batt_c": counter, "temperature_c": counter}}),
+                payload: serde_json::json!({
+                    "telemetry": {
+                        "batt_v": counter,
+                        "batt_c": counter,
+                        "temperature_c": counter
+                    },
+                    "packets": {
+                        "power_system": {
+                            "fields": {
+                                "bus_voltage_mv": 4000.0
+                            }
+                        }
+                    },
+                    "augmented": {
+                        "time_mjd_utc": time_mjd_utc,
+                        "gps_time": gps_time,
+                        "state_of_charge": 0.84,
+                        "position_eci_km": [6878.0, 0.0, 0.0],
+                        "velocity_eci_km_s": [0.0, 7.6, 0.0],
+                        "body_to_eci_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        "sun_eci_km": [149_597_870.7, 0.0, 0.0],
+                        "in_shadow": false,
+                        "ground_threat_locations": {},
+                        "space_threat_epoch_states": {}
+                    }
+                }),
             };
 
             if tx.send(t).await.is_err() {
