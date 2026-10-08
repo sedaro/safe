@@ -315,8 +315,8 @@ impl CoorbitalEvasionMode {
 fn telemetry_is_not_ready(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     message.contains("telemetry is missing ")
-        || message.contains("external simulation input is missing derived ")
-        || message.contains("external simulation input is missing battery voltage")
+        || message.contains("simulation input is missing derived ")
+        || message.contains("simulation input is missing battery voltage")
 }
 
 #[async_trait]
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn missing_derived_telemetry_is_transient() {
         let error = anyhow!(
-            "simulation input adapter failed (code=Some(1)): Error: external simulation input is missing derived ECI position"
+            "simulation input adapter failed (code=Some(1)): Error: simulation input is missing derived ECI position"
         );
 
         assert!(telemetry_is_not_ready(&error));
