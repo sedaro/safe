@@ -1,10 +1,11 @@
-//! Deterministic recovery policy. Time and shutdown execution are supplied by the caller.
+//! Deterministic SOC/thermal recovery policy. Time and execution are supplied by the caller.
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
+use safe::protocol::BoardCmdId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,6 +41,9 @@ fn one() -> f64 {
 fn hold_default() -> u64 {
     6000
 }
+fn sun_point_delay_default() -> u64 {
+    600
+}
 fn sample_default() -> usize {
     1
 }
@@ -54,6 +58,8 @@ pub(crate) struct RecoveryConfig {
     pub thermals: Vec<MeasurementConfig>,
     #[serde(default = "hold_default")]
     pub minimum_hold_secs: u64,
+    #[serde(default = "sun_point_delay_default")]
+    pub sun_point_delay_secs: u64,
     pub max_measurement_age_secs: u64,
     #[serde(default = "sample_default")]
     pub trigger_samples: usize,
@@ -76,6 +82,10 @@ impl RecoveryConfig {
         ensure!(
             self.minimum_hold_secs > 0 && self.minimum_hold_secs <= 604800,
             "minimum_hold_secs must be in 1..=604800"
+        );
+        ensure!(
+            self.sun_point_delay_secs > 0 && self.sun_point_delay_secs <= 604800,
+            "sun_point_delay_secs must be in 1..=604800"
         );
         ensure!(
             self.max_measurement_age_secs > 0 && self.max_clock_step_secs > 0,
@@ -161,10 +171,34 @@ impl Measurement {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EpisodeKind {
+    SocSunPoint,
+    #[default]
+    ThermalShutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SocProgress {
+    pub sun_point_gps_time: f64,
+    /// Persist intent before sending: an uncertain submission must not be duplicated.
+    pub submission_reserved: bool,
+    pub command_id: Option<BoardCmdId>,
+    pub command_status: String,
+    pub cancellation_targets: Vec<BoardCmdId>,
+    pub cancelled_commands: Vec<BoardCmdId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Episode {
     pub schema_version: u32,
+    #[serde(default)]
+    pub kind: EpisodeKind,
+    #[serde(default)]
+    pub soc: Option<SocProgress>,
     pub id: String,
     pub policy: RecoveryConfig,
     pub reasons: Vec<String>,
@@ -178,6 +212,7 @@ pub(crate) struct Episode {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Decision {
     Hold(String),
+    StartSoc(Vec<String>),
     Shutdown(Vec<String>),
     Release,
 }
@@ -226,7 +261,7 @@ impl RecoveryController {
             );
             let episode: Episode = serde_json::from_reader(File::open(path)?)?;
             ensure!(
-                episode.schema_version == 1,
+                matches!(episode.schema_version, 1 | 2),
                 "unsupported recovery record version"
             );
             episode.policy.validate()?;
@@ -234,14 +269,49 @@ impl RecoveryController {
                 episode.attempted_at.is_finite()
                     && episode.attempted_at > 0.0
                     && episode.resume_after.is_finite()
-                    && episode.resume_after
-                        >= episode.attempted_at + episode.policy.minimum_hold_secs as f64,
+                    && episode.resume_after >= episode.attempted_at
+                    && episode.resume_after <= 253402300799.0,
+                "invalid recovery timestamps"
+            );
+            let delay = match episode.kind {
+                EpisodeKind::ThermalShutdown => {
+                    ensure!(
+                        episode.soc.is_none(),
+                        "shutdown record contains SOC progress"
+                    );
+                    episode.policy.minimum_hold_secs
+                }
+                EpisodeKind::SocSunPoint => {
+                    ensure!(
+                        episode.schema_version == 2,
+                        "SOC recovery requires record version 2"
+                    );
+                    let soc = episode.soc.as_ref().context("missing SOC progress")?;
+                    let expected =
+                        safe_time::utc_mjd_to_gps(40587.0 + episode.resume_after / 86400.0)
+                            .context("invalid sun-point time")?;
+                    ensure!(
+                        soc.sun_point_gps_time.is_finite()
+                            && (soc.sun_point_gps_time - expected).abs() < 0.001,
+                        "invalid sun-point GPS deadline"
+                    );
+                    episode.policy.sun_point_delay_secs
+                }
+            };
+            ensure!(
+                episode.attempted_at.is_finite()
+                    && episode.attempted_at > 0.0
+                    && episode.resume_after.is_finite()
+                    && episode.resume_after >= episode.attempted_at + delay as f64,
                 "invalid recovery deadline"
             );
             ensure!(
-                episode
-                    .completed_at
-                    .is_none_or(|at| at.is_finite() && at >= episode.resume_after),
+                episode.completed_at.is_none_or(|at| at.is_finite()
+                    && at
+                        >= match episode.kind {
+                            EpisodeKind::ThermalShutdown => episode.resume_after,
+                            EpisodeKind::SocSunPoint => episode.attempted_at,
+                        }),
                 "invalid completion time"
             );
             if episode.completed_at.is_none() {
@@ -340,9 +410,32 @@ impl RecoveryController {
         }
         if let Some(episode) = &self.episode {
             if now < episode.attempted_at {
-                return Decision::Hold("clock precedes shutdown attempt".into());
+                return Decision::Hold("clock precedes recovery trigger".into());
             }
             if episode.completed_at.is_none() {
+                if episode.kind == EpisodeKind::SocSunPoint {
+                    let soc = episode.soc.as_ref().expect("validated SOC episode");
+                    if !soc.submission_reserved {
+                        return Decision::Hold(format!(
+                            "sun-point command: {}",
+                            soc.command_status
+                        ));
+                    }
+                    let power = &self.measurements[0];
+                    // Match the activation rule's strict > comparison. SOC handoff has
+                    // no cooldown, thermal recovery gate, sample count, or dwell gate.
+                    if power.fresh(now, &self.config)
+                        && power
+                            .value
+                            .is_some_and(|value| value > self.config.power.recover)
+                    {
+                        return Decision::Release;
+                    }
+                    return Decision::Hold(
+                        "SOC recovery threshold not satisfied; activation config controls handoff"
+                            .into(),
+                    );
+                }
                 if now < episode.resume_after {
                     return Decision::Hold("minimum cooldown active".into());
                 }
@@ -379,6 +472,9 @@ impl RecoveryController {
             .map(|(config, _)| config.id.clone())
             .collect();
         if !reasons.is_empty() {
+            if reasons.contains(&self.config.power.id) {
+                return Decision::StartSoc(reasons);
+            }
             return Decision::Shutdown(reasons);
         }
         for (config, state) in self.config.measurements().zip(&self.measurements) {
@@ -404,7 +500,9 @@ impl RecoveryController {
             "shutdown is not eligible"
         );
         let episode = Episode {
-            schema_version: 1,
+            schema_version: 2,
+            kind: EpisodeKind::ThermalShutdown,
+            soc: None,
             id: format!("shutdown-{now}"),
             policy: self.config.clone(),
             reasons,
@@ -420,6 +518,41 @@ impl RecoveryController {
             measurement.recovered_samples = 0;
             measurement.recovered_since = None;
         }
+        self.persist(directory)
+    }
+
+    pub fn reserve_soc(&mut self, directory: &Path, now: f64, reasons: Vec<String>) -> Result<()> {
+        ensure!(
+            matches!(self.decision(now), Decision::StartSoc(_)),
+            "SOC recovery is not eligible"
+        );
+        let scheduled_at = now + self.config.sun_point_delay_secs as f64;
+        ensure!(
+            scheduled_at <= 253402300799.0,
+            "sun-point deadline is out of range"
+        );
+        let gps_time = safe_time::utc_mjd_to_gps(40587.0 + scheduled_at / 86400.0)
+            .context("cannot convert sun-point deadline to GPS")?;
+        self.episode = Some(Episode {
+            schema_version: 2,
+            kind: EpisodeKind::SocSunPoint,
+            soc: Some(SocProgress {
+                sun_point_gps_time: gps_time,
+                submission_reserved: false,
+                command_id: None,
+                command_status: "awaiting board snapshot".into(),
+                cancellation_targets: vec![],
+                cancelled_commands: vec![],
+            }),
+            id: format!("soc-{now}"),
+            policy: self.config.clone(),
+            reasons,
+            trigger_measurements: self.measurements.clone(),
+            attempted_at: now,
+            resume_after: scheduled_at,
+            shutdown_outcome: "not applicable: SOC recovery does not shut down the host".into(),
+            completed_at: None,
+        });
         self.persist(directory)
     }
 
@@ -496,12 +629,12 @@ mod tests {
     }
 
     fn start_episode(controller: &mut RecoveryController, directory: &Path) {
-        controller.observe(&sample(START, 0.1, 90.0), START);
-        controller.observe(&sample(START + 1.0, 0.1, 90.0), START + 1.0);
+        controller.observe(&sample(START, 0.8, 90.0), START);
+        controller.observe(&sample(START + 1.0, 0.8, 90.0), START + 1.0);
         let Decision::Shutdown(reasons) = controller.decision(START + 1.0) else {
             panic!("expected shutdown")
         };
-        assert_eq!(reasons, vec!["battery_soc", "compute_temperature"]);
+        assert_eq!(reasons, vec!["compute_temperature"]);
         controller
             .reserve_shutdown(directory, START + 1.0, reasons)
             .unwrap();
@@ -523,7 +656,11 @@ mod tests {
             c.observe(&sample(START + 2.0, soc, temperature), START + 2.0);
             assert_eq!(
                 c.decision(START + 2.0),
-                Decision::Shutdown(vec![reason.into()])
+                if reason == "battery_soc" {
+                    Decision::StartSoc(vec![reason.into()])
+                } else {
+                    Decision::Shutdown(vec![reason.into()])
+                }
             );
         }
     }
@@ -601,7 +738,7 @@ mod tests {
         restarted.observe(&sample(START + 6014.0, 0.1, 50.0), START + 6014.0);
         restarted.observe(&sample(START + 6015.0, 0.1, 50.0), START + 6015.0);
         assert!(
-            matches!(restarted.decision(START + 6015.0), Decision::Shutdown(_)),
+            matches!(restarted.decision(START + 6015.0), Decision::StartSoc(_)),
             "later independent episode must be possible"
         );
     }
@@ -674,8 +811,8 @@ mod tests {
     fn persistence_failure_never_allows_a_shutdown_retry() {
         let directory = tempfile::tempdir().unwrap();
         let mut c = controller(directory.path());
-        c.observe(&sample(START, 0.1, 95.0), START);
-        c.observe(&sample(START + 1.0, 0.1, 95.0), START + 1.0);
+        c.observe(&sample(START, 0.8, 95.0), START);
+        c.observe(&sample(START + 1.0, 0.8, 95.0), START + 1.0);
         assert!(
             c.reserve_shutdown(
                 &directory.path().join("missing"),
@@ -686,5 +823,140 @@ mod tests {
         );
         assert!(c.blocked.is_some());
         assert!(matches!(c.decision(START + 1.0), Decision::Hold(_)));
+    }
+
+    #[test]
+    fn soc_precedes_thermal_and_releases_before_sun_point_without_thermal_dwell_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut c = controller(directory.path());
+        for at in [START, START + 1.0] {
+            c.observe(&sample(at, 0.1, 90.0), at);
+        }
+        let Decision::StartSoc(reasons) = c.decision(START + 1.0) else {
+            panic!("expected SOC recovery");
+        };
+        c.reserve_soc(directory.path(), START + 1.0, reasons)
+            .unwrap();
+        let deadline = c.episode.as_ref().unwrap().resume_after;
+        assert_eq!(deadline, START + 601.0);
+        let gps = c
+            .episode
+            .as_ref()
+            .unwrap()
+            .soc
+            .as_ref()
+            .unwrap()
+            .sun_point_gps_time;
+        let utc = safe_time::gps_to_utc(gps).unwrap();
+        assert!((utc.timestamp() as f64 - deadline).abs() < 0.001);
+        // The procedure must reserve its command before it can finish.
+        c.observe(&sample(START + 2.0, 0.8, 95.0), START + 2.0);
+        assert!(matches!(c.decision(START + 2.0), Decision::Hold(_)));
+        let progress = c.episode.as_mut().unwrap().soc.as_mut().unwrap();
+        progress.command_id = Some(BoardCmdId("sun".into()));
+        progress.command_status = "proposed".into();
+        progress.submission_reserved = true;
+        // A single recovered SOC sample suffices; thermal is still critical.
+        assert_eq!(c.decision(START + 2.0), Decision::Release);
+        c.complete(directory.path(), START + 2.0).unwrap();
+        let restarted = controller(directory.path());
+        assert!(restarted.blocked.is_none());
+        assert_eq!(restarted.episode.as_ref().unwrap().resume_after, deadline);
+        assert_eq!(
+            restarted.episode.as_ref().unwrap().completed_at,
+            Some(START + 2.0)
+        );
+    }
+
+    #[test]
+    fn soc_restart_does_not_reset_deadline_or_escalate_thermal_and_requires_strict_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut c = controller(directory.path());
+        for at in [START, START + 1.0] {
+            c.observe(&sample(at, 0.1, 50.0), at);
+        }
+        c.reserve_soc(directory.path(), START + 1.0, vec!["battery_soc".into()])
+            .unwrap();
+        let progress = c.episode.as_mut().unwrap().soc.as_mut().unwrap();
+        progress.submission_reserved = true;
+        progress.command_id = Some(BoardCmdId("sun".into()));
+        progress.command_status = "approved".into();
+        c.persist(directory.path()).unwrap();
+        let mut restarted = controller(directory.path());
+        assert!(restarted.blocked.is_none());
+        for (elapsed, soc) in [(2.0, 0.1), (3.0, 0.3), (6100.0, 0.1)] {
+            restarted.observe(&sample(START + elapsed, soc, 95.0), START + elapsed);
+            assert!(matches!(
+                restarted.decision(START + elapsed),
+                Decision::Hold(_)
+            ));
+            assert_eq!(
+                restarted.episode.as_ref().unwrap().resume_after,
+                START + 601.0
+            );
+        }
+        restarted.observe(&sample(START + 6101.0, 0.8, 95.0), START + 6101.0);
+        assert_eq!(restarted.decision(START + 6101.0), Decision::Release);
+        restarted
+            .episode
+            .as_mut()
+            .unwrap()
+            .soc
+            .as_mut()
+            .unwrap()
+            .command_status = "rejected".into();
+        assert_eq!(
+            restarted.decision(START + 6101.0),
+            Decision::Release,
+            "command rejection is diagnostic; SOC activation config owns handoff"
+        );
+    }
+
+    #[test]
+    fn legacy_shutdown_records_keep_original_procedure_even_when_triggered_by_soc() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut c = controller(directory.path());
+        start_episode(&mut c, directory.path());
+        let mut legacy = serde_json::to_value(c.episode.as_ref().unwrap()).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy["reasons"] = serde_json::json!(["battery_soc"]);
+        legacy.as_object_mut().unwrap().remove("kind");
+        legacy.as_object_mut().unwrap().remove("soc");
+        legacy["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sun_point_delay_secs");
+        durable_write(directory.path(), STATE_FILE, &legacy).unwrap();
+        let mut restarted = controller(directory.path());
+        assert!(restarted.blocked.is_none());
+        assert_eq!(
+            restarted.episode.as_ref().unwrap().kind,
+            EpisodeKind::ThermalShutdown
+        );
+        restarted.observe(&sample(START + 2.0, 0.8, 50.0), START + 2.0);
+        assert!(matches!(restarted.decision(START + 2.0), Decision::Hold(_)));
+        assert_eq!(
+            restarted.episode.as_ref().unwrap().resume_after,
+            START + 6001.0
+        );
+    }
+
+    #[test]
+    fn soc_persistence_failure_prevents_actions_and_invalid_delay_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut c = controller(directory.path());
+        for at in [START, START + 1.0] {
+            c.observe(&sample(at, 0.1, 95.0), at);
+        }
+        assert!(
+            c.reserve_soc(&directory.path().join("missing"), START + 1.0, vec![])
+                .is_err()
+        );
+        assert!(matches!(c.decision(START + 1.0), Decision::Hold(_)));
+        for delay in [0, 604801] {
+            let mut config = config();
+            config.sun_point_delay_secs = delay;
+            assert!(config.validate().is_err());
+        }
     }
 }

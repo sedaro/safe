@@ -24,6 +24,7 @@
       "recovery": {
         "trusted_system_utc": true,
         "minimum_hold_secs": 6000,
+        "sun_point_delay_secs": 600,
         "max_measurement_age_secs": 30,
         "trigger_samples": 1,
         "recovery_samples": 2,

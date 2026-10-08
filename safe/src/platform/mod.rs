@@ -989,4 +989,82 @@ done"#,
         assert!(header.contains("gps_time"));
         assert!(data.starts_with("PointNadir,70"));
     }
+
+    #[tokio::test]
+    async fn board_cancellation_replaces_published_schedule_with_timed_sun_point() {
+        use crate::protocol::{AutonomyModeId, BoardCmdId, BoardEvent};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("commands.csv");
+        let recovery = AutonomyModeId(uuid::Uuid::from_u128(1));
+        let planning = AutonomyModeId(uuid::Uuid::from_u128(2));
+        let old = BoardCmdId::from_event(1, planning, 0);
+        let sun = BoardCmdId::from_event(2, recovery, 0);
+        let mut board = BoardState::default();
+        board.apply(&BoardEvent::Proposed {
+            id: old.clone(),
+            from: planning,
+            cmd: TimedCommand::Scheduled {
+                cmd: Command::CaptureImage,
+                gps_time: 1000.0,
+            },
+            ts_mono: 1,
+        });
+        board.apply(&BoardEvent::Approved {
+            id: old.clone(),
+            by: recovery,
+            reason: "approved".into(),
+            ts_mono: 2,
+        });
+        write_host_command_dispatch_csv(&path, &board)
+            .await
+            .unwrap();
+        assert!(
+            tokio::fs::read_to_string(&path)
+                .await
+                .unwrap()
+                .contains("CaptureImage,1000")
+        );
+        board.apply(&BoardEvent::Canceled {
+            id: old.clone(),
+            by: recovery,
+            reason: "SOC recovery".into(),
+            ts_mono: 3,
+        });
+        board.apply(&BoardEvent::Proposed {
+            id: sun.clone(),
+            from: recovery,
+            cmd: TimedCommand::Scheduled {
+                cmd: Command::PointSunYaw,
+                gps_time: 1600.0,
+            },
+            ts_mono: 4,
+        });
+        // Unapproved recovery proposals are not published.
+        write_host_command_dispatch_csv(&path, &board)
+            .await
+            .unwrap();
+        assert!(tokio::fs::read_to_string(&path).await.unwrap().is_empty());
+        board.apply(&BoardEvent::Approved {
+            id: sun.clone(),
+            by: recovery,
+            reason: "approved".into(),
+            ts_mono: 5,
+        });
+        write_host_command_dispatch_csv(&path, &board)
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let rows: Vec<HostCommandDispatchCsvRecord> = csv::Reader::from_reader(content.as_bytes())
+            .deserialize()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cmd, "PointSunYaw");
+        assert_eq!(rows[0].gps_time, 1600.0);
+        assert_eq!(board.source_of_truth, vec![sun]);
+        assert!(
+            board.proposals.contains_key(&old),
+            "cancelled command retains audit history"
+        );
+    }
 }

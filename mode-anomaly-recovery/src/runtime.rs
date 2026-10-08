@@ -580,7 +580,9 @@ impl ModeHandler<AnomalyRecoveryModeConfig> for AnomalyRecoveryMode {
     ) -> Result<()> {
         if let Some(recovery) = &mut self.recovery_runtime {
             recovery.note_board(&board);
-            return Ok(());
+            return recovery
+                .process(runtime, &self.config, &self.adapter_registry, None)
+                .await;
         }
         self.has_board_snapshot = true;
         self.live_context.update_board(board.clone());

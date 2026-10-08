@@ -12,6 +12,7 @@ anyhow = "1.0.102"
 async-trait = "0.1.89"
 safe = { path = "../safe" }
 safe-sim = { path = "../safe-sim" }
+safe-time = { path = "../safe-time" }
 safe-llm-adapter = { path = "../safe-llm-adapter", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

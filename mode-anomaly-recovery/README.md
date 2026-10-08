@@ -1,11 +1,19 @@
 # Anomaly Recovery
 
-## Deterministic reboot and cooldown
+## Deterministic SOC and thermal recovery
 
 The mode supports a deterministic recovery procedure selected by
-`mode_config.recovery`: critical low power or high temperature → one durable
-shutdown attempt → reboot-persistent 100-minute minimum wait → fresh recovery
-threshold checks → `NOOP` handoff using existing SAFE activation rules.
+`mode_config.recovery`:
+
+- **Low SOC:** cancel active board commands → schedule `PointSunYaw` for 10 minutes
+  after confirmation → let the next mode's activation condition gate handoff on
+  recovered SOC. The schedule survives an early handoff; there is no host shutdown
+  or 100-minute SOC cooldown.
+- **Thermal-only:** one durable shutdown attempt → reboot-persistent 100-minute
+  minimum wait → fresh recovery threshold checks → `NOOP` handoff.
+
+An active SOC episode takes precedence over thermal triggers. The existing LLM
+workflow below is separate and is selected when `recovery` is omitted.
 
 See [deterministic recovery](./deterministic-recovery.md) for the configuration,
 mode-local state machine, routing example, optional LLM advisor, and FlatSat

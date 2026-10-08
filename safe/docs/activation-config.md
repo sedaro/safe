@@ -146,6 +146,25 @@ segments index JSON arrays. The frame `source` and `ts_mono` fields are not part
 of a telemetry path. Numeric and boolean average lookups use at most the latest
 256 telemetry frames.
 
+### SOC-gated recovery handoff
+
+The [anomaly recovery routing example](../../mode-anomaly-recovery/recovery-routing.example.json)
+keeps AnomalyRecovery as the priority-0, always-eligible fallback. MissionPlanning
+has a higher priority and an `Immediate` expression combining:
+
+```text
+LastPlannedAutonomyModeRef == AnomalyRecovery UUID
+AND augmented.state_of_charge > recovery threshold
+```
+
+A recovery-mode command, including a scheduled sun-point command, satisfies the
+last-planned part immediately. Low SOC keeps MissionPlanning ineligible, so the
+fallback remains selected. Recovered SOC permits handoff even before the scheduled
+command time. Set the gate's threshold to the same scaled value as the mode's
+`recovery.power.recover` and supply the configured SOC path in the latest telemetry
+payload. Activation expressions do not apply the mode's sensor-validity, freshness,
+sample-count, or dwell checks. This pattern uses the existing selector and protocol.
+
 ## Reload Behavior
 
 SAFE polls the mode configuration approximately once per second and reloads it

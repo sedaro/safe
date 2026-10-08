@@ -1077,6 +1077,7 @@ dependencies = [
  "safe",
  "safe-llm-adapter",
  "safe-sim",
+ "safe-time",
  "serde",
  "serde_json",
  "tempfile",
