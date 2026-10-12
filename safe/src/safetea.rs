@@ -1394,6 +1394,13 @@ impl SafeTEA {
                         .gatekeeper_input_tx
                         .send(GatekeeperAdapterInput::Telemetry(t.clone()))
                         .await;
+                    // Pending proposals survive a SAFE restart, but their in-flight
+                    // gatekeeper request does not; retry with fresh telemetry.
+                    if self.latest_gatekeeper_request_id.is_none()
+                        && !self.has_pending_autonomy_mode_command_events()
+                    {
+                        self.request_gatekeeper_for_pending_batch().await;
+                    }
                 }
 
                 if let Msg::ExternalCommandReceived {
