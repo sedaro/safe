@@ -131,6 +131,8 @@ pub(crate) struct MissionPlanningConfig {
     pub(crate) planning_horizon_secs: f64,
     #[serde(default = "default_min_replan_interval_secs")]
     pub(crate) min_replan_interval_secs: u64,
+    #[serde(default = "default_min_pointing_interval_secs")]
+    pub(crate) min_pointing_interval_secs: f64,
     #[serde(default = "default_command_lead_secs")]
     pub(crate) command_lead_secs: f64,
     #[serde(default = "default_command_dedup_tolerance_secs")]
@@ -166,6 +168,7 @@ impl Default for MissionPlanningConfig {
             simulation_timeout_secs: default_simulation_timeout_secs(),
             planning_horizon_secs: default_planning_horizon_secs(),
             min_replan_interval_secs: default_min_replan_interval_secs(),
+            min_pointing_interval_secs: default_min_pointing_interval_secs(),
             command_lead_secs: default_command_lead_secs(),
             command_dedup_tolerance_secs: default_command_dedup_tolerance_secs(),
             telemetry_gps_time_pointer: String::new(),
@@ -198,6 +201,10 @@ impl MissionPlanningConfig {
             bail!("adapter and simulation timeouts must be greater than zero");
         }
         finite_positive("planning_horizon_secs", self.planning_horizon_secs)?;
+        finite_nonnegative(
+            "min_pointing_interval_secs",
+            self.min_pointing_interval_secs,
+        )?;
         finite_nonnegative("command_lead_secs", self.command_lead_secs)?;
         finite_nonnegative(
             "command_dedup_tolerance_secs",
@@ -374,6 +381,9 @@ fn default_planning_horizon_secs() -> f64 {
 }
 fn default_min_replan_interval_secs() -> u64 {
     300
+}
+fn default_min_pointing_interval_secs() -> f64 {
+    600.0
 }
 fn default_command_lead_secs() -> f64 {
     60.0

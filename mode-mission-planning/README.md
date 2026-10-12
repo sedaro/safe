@@ -8,6 +8,30 @@ by `safe-gatekeeper`.
 
 ## Behavior
 
+### Pointing interval
+
+`min_pointing_interval_secs` sets the minimum separation between pointing
+commands. It defaults to 600 seconds and applies to active board commands and
+commands generated in the current plan.
+
+When candidate commands conflict, priority is Sun pointing, ground contact, then
+default pointing. Earlier commands take precedence at equal priority. A
+conflicting transition is moved to the first available time only when it remains
+before the next planned or board pointing transition; otherwise it is omitted.
+SOC hysteresis continues to select Sun pointing until the recovered-SOC
+threshold is reached. Captures are evaluated against the resulting pointing
+schedule. Active board commands are retained as reservations; canceled commands
+are ignored.
+
+Configure the interval in `mode_config`:
+
+```json
+"min_pointing_interval_secs": 600.0
+```
+
+Mission Planning and Coorbital Evasion use separate settings. Set both to the
+same value when uniform spacing across the modes is desired.
+
 The mode plans once per activation. It uses the latest telemetry received while
 inactive, or waits for the first telemetry frame after activation. A second
 activation within `min_replan_interval_secs` emits one explicit `NOOP` instead

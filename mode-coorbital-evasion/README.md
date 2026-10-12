@@ -33,6 +33,11 @@ The adapter returns the simulation epoch and EDS initialization patches:
 }
 ```
 
+The request's `commands` field contains accepted board `Track` commands. The
+configured input adapter converts them to EDS `track_schedule` patches for both the
+baseline and selected-schedule runs. Accepted Nadir, Sun, quaternion, and YPR
+commands continue to be projected by the mode's pointing-schedule builder.
+
 The adapter owns telemetry decoding, epoch derivation, units, and spacecraft
 state projection. The mode reads its configured threats from
 `payload.augmented.ground_threat_locations` and
@@ -51,7 +56,31 @@ EDS identifiers, including `agent_id`, `field_of_view_id`, pointing schedule
 fields, and pointing-mode IDs, per deployment. The defaults intentionally
 contain no deployment identifiers.
 
-## Current Implementation
+## Pointing interval and command priority
+
+`min_pointing_interval_secs` sets the minimum separation between planned
+pointing commands. It defaults to 600 seconds and applies to active, non-canceled
+board proposals and commands selected by the current plan.
+
+Fixed evasion maneuvers that conflict with a reserved time or a protected
+pointing interval are omitted. A Nadir return is moved to the first available
+sample when it can occur before another planned maneuver or accepted board
+transition takes over; otherwise the return is omitted. Accepted board commands
+are retained and modeled during validation.
+
+Accepted or pending Sun-pointing and ground `Track` commands protect pointing
+until another accepted pointing transition takes over. Coorbital Evasion's own
+proposals do not end that protection. Outside those intervals, the planner
+continues its Nadir-based threat analysis.
+
+Configure the interval in `mode_config`:
+
+```json
+"min_pointing_interval_secs": 600.0
+```
+
+Mission Planning and Coorbital Evasion use separate settings. Set both to the
+same value when uniform spacing across the modes is desired.
 
 The implementation identifies sampled periods where Nadir would expose configured threats. For each period it solves for one fixed body-to-ECI boresight that satisfies every visible threat/sample constraint, schedules the latest reachable slew, and compares direct transitions with transitions through Nadir.
 

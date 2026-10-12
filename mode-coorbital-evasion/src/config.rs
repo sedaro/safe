@@ -28,6 +28,8 @@ pub(crate) struct CoorbitalEvasionModeConfig {
     pub(crate) simulation_timeout_secs: u64,
     #[serde(default = "default_min_replan_interval_secs")]
     pub(crate) min_replan_interval_secs: u64,
+    #[serde(default = "default_min_pointing_interval_secs")]
+    pub(crate) min_pointing_interval_secs: f64,
     #[serde(default = "default_command_lead_secs")]
     pub(crate) command_lead_secs: f64,
     /// Defer planning until proposals from this mode have reached a terminal board state.
@@ -98,6 +100,7 @@ impl Default for CoorbitalEvasionModeConfig {
             sim_duration_days: default_sim_duration_days(),
             simulation_timeout_secs: default_simulation_timeout_secs(),
             min_replan_interval_secs: default_min_replan_interval_secs(),
+            min_pointing_interval_secs: default_min_pointing_interval_secs(),
             command_lead_secs: default_command_lead_secs(),
             wait_for_proposals_from_mode_id: None,
             threat_ids: Vec::new(),
@@ -147,6 +150,9 @@ fn default_adapter_timeout_secs() -> u64 {
 }
 fn default_min_replan_interval_secs() -> u64 {
     60
+}
+fn default_min_pointing_interval_secs() -> f64 {
+    600.0
 }
 fn default_command_lead_secs() -> f64 {
     5.0

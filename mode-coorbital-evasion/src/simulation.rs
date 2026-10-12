@@ -54,6 +54,25 @@ pub(crate) struct SimulationInput {
 }
 
 impl CoorbitalEvasionMode {
+    pub(crate) fn accepted_track_commands(&self) -> Vec<TimedCommand> {
+        self.latest_board_snapshot
+            .source_of_truth
+            .iter()
+            .filter_map(|id| self.latest_board_snapshot.proposals.get(id))
+            .filter_map(|(_, command, _)| {
+                matches!(
+                    command,
+                    TimedCommand::Now(Command::Track { .. })
+                        | TimedCommand::Scheduled {
+                            cmd: Command::Track { .. },
+                            ..
+                        }
+                )
+                .then(|| command.clone())
+            })
+            .collect()
+    }
+
     pub(crate) fn active_threat_ids(
         &self,
         telemetry: &TelemetryFrame,
@@ -240,23 +259,12 @@ impl CoorbitalEvasionMode {
     pub(crate) fn selected_pointing_schedule(
         &self,
         accepted: &EdsPointingSchedule,
-        earliest_command_mjd: f64,
         selected: &[ScheduledPointing],
     ) -> EdsPointingSchedule {
-        let mut schedule = EdsPointingSchedule {
-            mode_schedule: accepted
-                .mode_schedule
-                .iter()
-                .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
-                .cloned()
-                .collect(),
-            rpy_schedule: accepted
-                .rpy_schedule
-                .iter()
-                .filter(|(time_mjd, _)| *time_mjd < earliest_command_mjd)
-                .cloned()
-                .collect(),
-        };
+        // Evasion only adds commands around the accepted schedule. Its filter
+        // never displaces accepted board reservations, so validation must keep
+        // those future commands as well as the pre-command history.
+        let mut schedule = accepted.clone();
         for command in selected {
             match &command.target {
                 PointingTarget::Nadir => schedule
@@ -432,7 +440,7 @@ impl CoorbitalEvasionMode {
             .with_context(|| format!("failed to start simulation input adapter '{executable}'"))?;
         let request = SimulationInputRequest {
             telemetry: telemetry.clone(),
-            commands: Vec::new(),
+            commands: self.accepted_track_commands(),
             config: self.config.input_adapter_config.clone(),
         };
         let mut stdin = child.stdin.take().context("input adapter has no stdin")?;
@@ -870,6 +878,57 @@ mod tests {
     }
 
     #[test]
+    fn input_adapter_receives_only_accepted_ground_track_commands() {
+        let mut mode = CoorbitalEvasionMode::new();
+        let mut board = AutonomyModeBoardState::default();
+        let mode_id = AutonomyModeId(Uuid::nil());
+        let accepted = BoardCmdId("accepted-track".into());
+        board.proposals.insert(
+            accepted.clone(),
+            (
+                mode_id,
+                TimedCommand::Scheduled {
+                    cmd: Command::Track {
+                        latitude_deg: 10.0,
+                        longitude_deg: 20.0,
+                        altitude_m: 100.0,
+                    },
+                    gps_time: utc_mjd_to_gps(60_000.25).unwrap(),
+                },
+                0,
+            ),
+        );
+        board.source_of_truth.push(accepted);
+        board.proposals.insert(
+            BoardCmdId("pending-track".into()),
+            (
+                mode_id,
+                TimedCommand::Now(Command::Track {
+                    latitude_deg: 30.0,
+                    longitude_deg: 40.0,
+                    altitude_m: 200.0,
+                }),
+                1,
+            ),
+        );
+        mode.latest_board_snapshot = board;
+
+        let commands = mode.accepted_track_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            TimedCommand::Scheduled {
+                cmd: Command::Track {
+                    latitude_deg: 10.0,
+                    longitude_deg: 20.0,
+                    altitude_m: 100.0,
+                },
+                gps_time,
+            } if (*gps_time - utc_mjd_to_gps(60_000.25).unwrap()).abs() < 1.0e-6
+        ));
+    }
+
+    #[test]
     fn empty_accepted_schedule_starts_nadir() {
         let mode = CoorbitalEvasionMode::new();
         let schedule = mode.accepted_pointing_schedule(60_000.0, 60_001.0);
@@ -914,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_schedule_keeps_only_pre_command_accepted_entries() {
+    fn selected_schedule_keeps_future_accepted_entries() {
         let mode = CoorbitalEvasionMode::new();
         let accepted = EdsPointingSchedule {
             mode_schedule: vec![(1.0, "sun".to_string()), (2.0, "thruster".to_string())],
@@ -924,10 +983,14 @@ mod tests {
             time_mjd: 1.5,
             target: PointingTarget::Nadir,
         }];
-        let result = mode.selected_pointing_schedule(&accepted, 1.5, &selected);
+        let result = mode.selected_pointing_schedule(&accepted, &selected);
         assert_eq!(
             result.mode_schedule,
-            vec![(1.0, "sun".to_string()), (1.5, mode.config.nadir_mode_id)]
+            vec![
+                (1.0, "sun".to_string()),
+                (1.5, mode.config.nadir_mode_id),
+                (2.0, "thruster".to_string()),
+            ]
         );
         assert!(result.rpy_schedule.is_empty());
     }

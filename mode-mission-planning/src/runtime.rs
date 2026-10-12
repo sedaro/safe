@@ -8,7 +8,7 @@ use safe::telemetry_frame::TelemetryFrame;
 use tracing::{info, warn};
 
 use crate::config::MissionPlanningConfig;
-use crate::planning::build_plan;
+use crate::planning::{build_plan, default_pointing_command};
 use crate::simulation::{extract_planning_samples, run_schedule, validate_candidate_schedule};
 
 #[derive(Default)]
@@ -86,7 +86,6 @@ impl MissionPlanningMode {
         }
 
         let accepted_commands = accepted_commands(&self.latest_board, current_gps_time);
-        let active_commands = active_commands(&self.latest_board, current_gps_time);
         let (simulation_start_mjd, baseline_result) =
             run_schedule(&self.config, telemetry, accepted_commands.clone())
                 .await
@@ -106,7 +105,8 @@ impl MissionPlanningMode {
 
         let mut candidates = plan
             .commands
-            .into_iter()
+            .iter()
+            .cloned()
             .filter(|candidate| {
                 !board_contains_equivalent(
                     &self.latest_board,
@@ -115,7 +115,33 @@ impl MissionPlanningMode {
                 )
             })
             .collect::<Vec<_>>();
-        candidates = exclude_schedule_conflicts(candidates, &active_commands);
+        let spaced = enforce_pointing_interval(
+            candidates,
+            &plan.commands,
+            &self.latest_board,
+            current_gps_time,
+            self.config.min_pointing_interval_secs,
+            safe::utils::utc_mjd_to_gps(
+                simulation_start_mjd
+                    + self.config.planning_horizon_secs / safe::utils::SECONDS_PER_DAY,
+            )
+            .unwrap_or(current_gps_time),
+        );
+        let retained_active = board_commands(&self.latest_board, current_gps_time, |id| {
+            self.latest_board.rejected.get(id).is_none_or(Vec::is_empty)
+        });
+        candidates = exclude_schedule_conflicts(spaced, &retained_active);
+        let effective_pointing = candidates.clone();
+        let default_pointing = default_pointing_command(&self.config.default_pointing);
+        candidates.retain(|candidate| {
+            !capture_conflicts_with_effective_pointing(
+                candidate,
+                &effective_pointing,
+                &self.latest_board,
+                current_gps_time,
+                &default_pointing,
+            )
+        });
         if candidates.is_empty() {
             self.power_saving = plan.current_power_saving;
             self.emit(runtime, TimedCommand::NOOP).await?;
@@ -162,6 +188,180 @@ impl MissionPlanningMode {
             })
             .await
     }
+}
+
+fn is_pointing(command: &safe::protocol::Command) -> bool {
+    matches!(
+        command,
+        safe::protocol::Command::PointSunYaw
+            | safe::protocol::Command::PointNadir
+            | safe::protocol::Command::PointQuaternion { .. }
+            | safe::protocol::Command::PointYpr { .. }
+            | safe::protocol::Command::PointThruster
+            | safe::protocol::Command::PointNadirWithSensor { .. }
+            | safe::protocol::Command::Track { .. }
+    )
+}
+
+fn pointing_priority(command: &safe::protocol::Command) -> u8 {
+    match command {
+        safe::protocol::Command::PointSunYaw => 3,
+        safe::protocol::Command::Track { .. } => 2,
+        _ => 0,
+    }
+}
+
+fn capture_conflicts_with_effective_pointing(
+    candidate: &TimedCommand,
+    candidates: &[TimedCommand],
+    board: &AutonomyModeBoardState,
+    now: f64,
+    default_pointing: &safe::protocol::Command,
+) -> bool {
+    let TimedCommand::Scheduled {
+        cmd:
+            safe::protocol::Command::CaptureImage
+            | safe::protocol::Command::CaptureImageWithCamera { .. },
+        gps_time,
+    } = candidate
+    else {
+        return false;
+    };
+    let board_pointing = board
+        .proposals
+        .iter()
+        .filter_map(|(id, (_, command, _))| {
+            let active = board.rejected.get(id).is_none_or(Vec::is_empty);
+            active.then_some(command)
+        })
+        .filter_map(|command| match command {
+            TimedCommand::Now(command) if is_pointing(command) => Some((now, command)),
+            TimedCommand::Scheduled { cmd, gps_time: at } if is_pointing(cmd) => {
+                (*at <= *gps_time).then_some((*at, cmd))
+            }
+            _ => None,
+        });
+    let planned_pointing = candidates.iter().filter_map(|command| match command {
+        TimedCommand::Now(command) if is_pointing(command) => Some((now, command)),
+        TimedCommand::Scheduled { cmd, gps_time: at } if is_pointing(cmd) && *at <= *gps_time => {
+            Some((*at, cmd))
+        }
+        _ => None,
+    });
+    board_pointing
+        .chain(planned_pointing)
+        .filter(|(at, _)| *at <= *gps_time)
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .is_some_and(|(_, command)| command_value(command) != command_value(default_pointing))
+}
+
+fn enforce_pointing_interval(
+    commands: Vec<TimedCommand>,
+    intentions: &[TimedCommand],
+    board: &AutonomyModeBoardState,
+    now: f64,
+    interval: f64,
+    horizon_end: f64,
+) -> Vec<TimedCommand> {
+    if interval == 0.0 {
+        return commands;
+    }
+    let mut reservations = board
+        .proposals
+        .iter()
+        .filter_map(|(id, (_, command, _))| {
+            let (pointing, time) = match command {
+                TimedCommand::Scheduled { cmd, gps_time } if is_pointing(cmd) => (true, *gps_time),
+                TimedCommand::Now(cmd) if is_pointing(cmd) => (true, now),
+                _ => (false, 0.0),
+            };
+            let active = board.rejected.get(id).is_none_or(Vec::is_empty);
+            (pointing && active).then_some(time)
+        })
+        .collect::<Vec<_>>();
+    let mut indexed = commands.into_iter().enumerate().collect::<Vec<_>>();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        let left_point = match left {
+            TimedCommand::Scheduled { cmd, .. } => Some(cmd),
+            _ => None,
+        };
+        let right_point = match right {
+            TimedCommand::Scheduled { cmd, .. } => Some(cmd),
+            _ => None,
+        };
+        let left_priority = left_point
+            .filter(|cmd| is_pointing(cmd))
+            .map_or(0, |cmd| pointing_priority(cmd));
+        let right_priority = right_point
+            .filter(|cmd| is_pointing(cmd))
+            .map_or(0, |cmd| pointing_priority(cmd));
+        right_priority
+            .cmp(&left_priority)
+            .then_with(|| execution_time(left, now).total_cmp(&execution_time(right, now)))
+            .then(left_index.cmp(right_index))
+    });
+    let mut kept = Vec::new();
+    for (_, mut command) in indexed {
+        let TimedCommand::Scheduled { cmd, gps_time } = &mut command else {
+            kept.push(command);
+            continue;
+        };
+        if !is_pointing(cmd) {
+            kept.push(command);
+            continue;
+        }
+        let requested_time = *gps_time;
+        let next_intention = intentions
+            .iter()
+            .filter_map(|intent| match intent {
+                TimedCommand::Scheduled { cmd, gps_time }
+                    if is_pointing(cmd) && *gps_time > requested_time =>
+                {
+                    Some(*gps_time)
+                }
+                _ => None,
+            })
+            .min_by(f64::total_cmp)
+            .unwrap_or(horizon_end);
+        if reservations
+            .iter()
+            .any(|time| (*gps_time - time).abs() < interval)
+        {
+            let next_reservation = reservations
+                .iter()
+                .copied()
+                .filter(|time| *time > requested_time)
+                .min_by(f64::total_cmp)
+                .unwrap_or(horizon_end);
+            loop {
+                let before = *gps_time;
+                for reserved in &reservations {
+                    if (*gps_time - reserved).abs() < interval {
+                        *gps_time = reserved + interval;
+                    }
+                }
+                if *gps_time == before
+                    || !reservations
+                        .iter()
+                        .any(|reserved| (*gps_time - reserved).abs() < interval)
+                {
+                    break;
+                }
+            }
+            if *gps_time <= horizon_end
+                && *gps_time < next_intention
+                && *gps_time < next_reservation
+            {
+                reservations.push(*gps_time);
+                kept.push(command);
+            }
+        } else {
+            reservations.push(*gps_time);
+            kept.push(command);
+        }
+    }
+    kept.sort_by(|left, right| execution_time(left, now).total_cmp(&execution_time(right, now)));
+    kept
 }
 
 #[async_trait]
@@ -228,14 +428,6 @@ fn telemetry_number(telemetry: &TelemetryFrame, pointer: &str, label: &str) -> R
 fn accepted_commands(board: &AutonomyModeBoardState, current_gps_time: f64) -> Vec<TimedCommand> {
     board_commands(board, current_gps_time, |id| {
         board.source_of_truth.contains(id)
-    })
-}
-
-/// Pending commands are not safe simulation inputs, but they still reserve a
-/// schedule slot until the gatekeeper reaches a decision.
-fn active_commands(board: &AutonomyModeBoardState, current_gps_time: f64) -> Vec<TimedCommand> {
-    board_commands(board, current_gps_time, |id| {
-        board.rejected.get(id).is_none_or(Vec::is_empty)
     })
 }
 
@@ -312,10 +504,15 @@ fn execution_time(command: &TimedCommand, current_gps_time: f64) -> f64 {
 /// The flight scheduler rejects imaging-program schedule transitions less than 20 seconds apart.
 /// Keep existing approved commands authoritative when composing a new plan.
 fn exclude_schedule_conflicts(
-    candidates: Vec<TimedCommand>,
+    mut candidates: Vec<TimedCommand>,
     accepted_commands: &[TimedCommand],
 ) -> Vec<TimedCommand> {
     const MIN_SCHEDULE_SEPARATION_SECS: f64 = 20.0;
+    // A capture must not consume the scheduler slot needed by pointing.
+    candidates.sort_by_key(|command| {
+        !matches!(command,
+        TimedCommand::Scheduled { cmd, .. } if is_pointing(cmd))
+    });
     let mut kept = accepted_commands.to_vec();
     let mut filtered = Vec::new();
     for candidate in candidates {
@@ -336,6 +533,8 @@ fn exclude_schedule_conflicts(
         }
     }
     filtered
+        .sort_by(|left, right| execution_time(left, 0.0).total_cmp(&execution_time(right, 0.0)));
+    filtered
 }
 
 #[cfg(test)]
@@ -345,6 +544,270 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn pointing_filter_delays_valid_contact_and_drops_superseded_default() {
+        let mode = AutonomyModeId(Uuid::nil());
+        let mut board = AutonomyModeBoardState::default();
+        let commands = vec![
+            TimedCommand::Scheduled {
+                cmd: Command::PointNadir,
+                gps_time: 1_000.0,
+            },
+            TimedCommand::Scheduled {
+                cmd: Command::Track {
+                    latitude_deg: 1.0,
+                    longitude_deg: 2.0,
+                    altitude_m: 3.0,
+                },
+                gps_time: 1_100.0,
+            },
+            TimedCommand::Scheduled {
+                cmd: Command::Track {
+                    latitude_deg: 4.0,
+                    longitude_deg: 5.0,
+                    altitude_m: 6.0,
+                },
+                gps_time: 1_300.0,
+            },
+        ];
+        let kept =
+            enforce_pointing_interval(commands.clone(), &commands, &board, 0.0, 600.0, 2_000.0);
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(
+            kept[1],
+            TimedCommand::Scheduled {
+                cmd: Command::Track {
+                    latitude_deg: 4.0,
+                    ..
+                },
+                gps_time: 1_700.0,
+            }
+        ));
+
+        board.proposals.insert(
+            BoardCmdId("reservation".into()),
+            (
+                mode,
+                TimedCommand::Scheduled {
+                    cmd: Command::PointNadir,
+                    gps_time: 1_000.0,
+                },
+                0,
+            ),
+        );
+        let reservation_id = BoardCmdId("reservation".into());
+        board
+            .approved
+            .insert(reservation_id.clone(), vec![(mode, "approved".into(), 0)]);
+        board
+            .rejected
+            .insert(reservation_id, vec![(mode, "command canceled".into(), 1)]);
+        let contact = TimedCommand::Scheduled {
+            cmd: Command::Track {
+                latitude_deg: 1.0,
+                longitude_deg: 2.0,
+                altitude_m: 3.0,
+            },
+            gps_time: 1_100.0,
+        };
+        let kept = enforce_pointing_interval(
+            vec![contact.clone()],
+            &[contact],
+            &board,
+            0.0,
+            600.0,
+            2_000.0,
+        );
+        assert!(matches!(
+            kept.as_slice(),
+            [TimedCommand::Scheduled {
+                cmd: Command::Track { .. },
+                gps_time: 1_100.0,
+            }]
+        ));
+        board.proposals.insert(
+            BoardCmdId("sun".into()),
+            (
+                mode,
+                TimedCommand::Scheduled {
+                    cmd: Command::PointSunYaw,
+                    gps_time: 1_000.0,
+                },
+                0,
+            ),
+        );
+        let contact = TimedCommand::Scheduled {
+            cmd: Command::Track {
+                latitude_deg: 1.0,
+                longitude_deg: 2.0,
+                altitude_m: 3.0,
+            },
+            gps_time: 1_100.0,
+        };
+        let kept = enforce_pointing_interval(
+            vec![contact.clone()],
+            &[contact],
+            &board,
+            0.0,
+            600.0,
+            2_000.0,
+        );
+        assert!(matches!(
+            kept.as_slice(),
+            [TimedCommand::Scheduled {
+                cmd: Command::Track { .. },
+                gps_time: 1_600.0,
+            }]
+        ));
+    }
+
+    #[test]
+    fn delayed_default_is_dropped_before_future_sun_transition() {
+        let board = AutonomyModeBoardState::default();
+        let commands = vec![
+            TimedCommand::Scheduled {
+                cmd: Command::PointNadir,
+                gps_time: 100.0,
+            },
+            TimedCommand::Scheduled {
+                cmd: Command::Track {
+                    latitude_deg: 1.0,
+                    longitude_deg: 2.0,
+                    altitude_m: 3.0,
+                },
+                gps_time: 200.0,
+            },
+            TimedCommand::Scheduled {
+                cmd: Command::PointSunYaw,
+                gps_time: 900.0,
+            },
+        ];
+
+        let kept =
+            enforce_pointing_interval(commands.clone(), &commands, &board, 0.0, 600.0, 2_000.0);
+
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(
+            kept[0],
+            TimedCommand::Scheduled {
+                cmd: Command::Track { .. },
+                gps_time: 200.0
+            }
+        ));
+        assert!(matches!(
+            kept[1],
+            TimedCommand::Scheduled {
+                cmd: Command::PointSunYaw,
+                gps_time: 900.0
+            }
+        ));
+        let image_before_contact = TimedCommand::Scheduled {
+            cmd: Command::CaptureImage,
+            gps_time: 150.0,
+        };
+        let image_during_contact = TimedCommand::Scheduled {
+            cmd: Command::CaptureImage,
+            gps_time: 250.0,
+        };
+        assert!(!capture_conflicts_with_effective_pointing(
+            &image_before_contact,
+            &kept,
+            &board,
+            0.0,
+            &Command::PointNadir,
+        ));
+        assert!(capture_conflicts_with_effective_pointing(
+            &image_during_contact,
+            &kept,
+            &board,
+            0.0,
+            &Command::PointNadir,
+        ));
+        let image_after_sun = TimedCommand::Scheduled {
+            cmd: Command::CaptureImage,
+            gps_time: 950.0,
+        };
+        assert!(capture_conflicts_with_effective_pointing(
+            &image_after_sun,
+            &kept,
+            &board,
+            0.0,
+            &Command::PointNadir,
+        ));
+        assert!(!capture_conflicts_with_effective_pointing(
+            &TimedCommand::Scheduled {
+                cmd: Command::CaptureImage,
+                gps_time: 1_500.0,
+            },
+            &[],
+            &AutonomyModeBoardState::default(),
+            0.0,
+            &Command::PointNadir,
+        ));
+    }
+
+    #[test]
+    fn delayed_default_is_not_moved_past_a_board_transition() {
+        let mut board = AutonomyModeBoardState::default();
+        let id = BoardCmdId("contact".into());
+        board.proposals.insert(
+            id.clone(),
+            (
+                AutonomyModeId(Uuid::nil()),
+                TimedCommand::Scheduled {
+                    cmd: Command::Track {
+                        latitude_deg: 1.0,
+                        longitude_deg: 2.0,
+                        altitude_m: 3.0,
+                    },
+                    gps_time: 200.0,
+                },
+                0,
+            ),
+        );
+        board.source_of_truth.push(id);
+        let nadir = TimedCommand::Scheduled {
+            cmd: Command::PointNadir,
+            gps_time: 100.0,
+        };
+
+        let kept =
+            enforce_pointing_interval(vec![nadir.clone()], &[nadir], &board, 0.0, 600.0, 2_000.0);
+
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn delayed_recovery_default_is_kept_when_it_precedes_next_state_change() {
+        let mut board = AutonomyModeBoardState::default();
+        board.proposals.insert(
+            BoardCmdId("sun".into()),
+            (
+                AutonomyModeId(Uuid::nil()),
+                TimedCommand::Scheduled {
+                    cmd: Command::PointSunYaw,
+                    gps_time: 1_000.0,
+                },
+                0,
+            ),
+        );
+        let commands = vec![TimedCommand::Scheduled {
+            cmd: Command::PointNadir,
+            gps_time: 1_100.0,
+        }];
+
+        let kept =
+            enforce_pointing_interval(commands.clone(), &commands, &board, 0.0, 600.0, 2_000.0);
+
+        assert!(matches!(
+            kept.as_slice(),
+            [TimedCommand::Scheduled {
+                cmd: Command::PointNadir,
+                gps_time: 1_600.0,
+            }]
+        ));
+    }
 
     #[test]
     fn duplicate_detection_includes_pending_proposals() {

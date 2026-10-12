@@ -194,7 +194,7 @@ fn command_for_state(config: &MissionPlanningConfig, state: PointingState) -> Co
     }
 }
 
-fn default_pointing_command(pointing: &PointingConfig) -> Command {
+pub(crate) fn default_pointing_command(pointing: &PointingConfig) -> Command {
     match pointing {
         PointingConfig::Nadir => Command::PointNadir,
         PointingConfig::SunYaw => Command::PointSunYaw,

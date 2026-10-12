@@ -113,14 +113,6 @@ impl CoorbitalEvasionMode {
         )
     }
 
-    fn selected_target_at(plan: &CoorbitalEvasionPlan, time_mjd: f64) -> Option<&PointingTarget> {
-        plan.commands
-            .iter()
-            .take_while(|command| command.time_mjd <= time_mjd)
-            .last()
-            .map(|command| &command.target)
-    }
-
     fn reconciliation_actions(
         &self,
         mode_id: AutonomyModeId,
@@ -142,21 +134,21 @@ impl CoorbitalEvasionMode {
             }
             let is_accepted = self.latest_board_snapshot.source_of_truth.contains(id);
             let is_own = *from == mode_id;
-            if !Self::is_pointing_command(cmd) || (!is_accepted && !is_own) {
+            // Accepted commands may already own an external schedule reservation.
+            // A board cancellation alone cannot release that slot, so leave them
+            // intact and plan around them.
+            if is_accepted || !is_own || !Self::is_pointing_command(cmd) {
                 continue;
             }
-            let keep = if is_accepted {
-                Self::selected_target_at(plan, time_mjd)
-                    .is_some_and(|target| self.command_matches_target(cmd, target))
-                    || plan
-                        .commands
-                        .iter()
-                        .any(|planned| self.scheduled_command_matches(timed_command, planned))
-            } else {
-                plan.commands
-                    .iter()
-                    .any(|planned| self.scheduled_command_matches(timed_command, planned))
-            };
+            // Coorbital avoidance yields to recovery and ground-contact pointing;
+            // do not remove their accepted future board commands while reconciling.
+            if matches!(cmd, Command::PointSunYaw | Command::Track { .. }) {
+                continue;
+            }
+            let keep = plan
+                .commands
+                .iter()
+                .any(|planned| self.scheduled_command_matches(timed_command, planned));
             if !keep {
                 cancel.push(id.clone());
             }
@@ -197,6 +189,14 @@ impl CoorbitalEvasionMode {
                 )
                 .await?;
         }
+        if propose.is_empty() {
+            self.emit_handoff_noop(runtime).await?;
+            debug!(
+                canceled = cancel.len(),
+                "coorbital-evasion handed off without a pointing proposal"
+            );
+            return Ok(());
+        }
         for planned in &propose {
             let Some(gps_time) = utc_mjd_to_gps(planned.time_mjd) else {
                 anyhow::bail!(
@@ -233,12 +233,21 @@ impl CoorbitalEvasionMode {
         Ok(())
     }
 
+    async fn emit_handoff_noop(&self, runtime: &mut ModeRuntime) -> anyhow::Result<()> {
+        runtime
+            .command(CommandEnvelope {
+                from: runtime.mode_id(),
+                cmd: TimedCommand::NOOP,
+            })
+            .await
+    }
+
     async fn maybe_plan(
         &mut self,
         runtime: &mut ModeRuntime,
         telemetry: &TelemetryFrame,
     ) -> anyhow::Result<()> {
-        let outcome = self.build_plan(telemetry).await?;
+        let outcome = self.build_plan(telemetry, runtime.mode_id()).await?;
         let simulation_count = match &outcome {
             PlanningOutcome::NoBoardChange => 1,
             PlanningOutcome::Schedule(_) => 2,
@@ -246,6 +255,7 @@ impl CoorbitalEvasionMode {
         runtime.simulation_completed(simulation_count).await?;
         let PlanningOutcome::Schedule(plan) = outcome else {
             info!("coorbital-evasion baseline is clear; no pointing change required");
+            self.emit_handoff_noop(runtime).await?;
             return Ok(());
         };
         if plan.validation.score.exposure_secs > 0.0 {
@@ -445,6 +455,44 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_never_cancels_accepted_recovery_or_contact_pointing() {
+        let own = AutonomyModeId(Uuid::nil());
+        let other = AutonomyModeId(Uuid::new_v4());
+        let mut mode = CoorbitalEvasionMode::new();
+        let mut board = AutonomyModeBoardState::default();
+        add_board_command(
+            &mut board,
+            "sun",
+            other,
+            Command::PointSunYaw,
+            60_000.1,
+            true,
+        );
+        add_board_command(
+            &mut board,
+            "contact",
+            other,
+            Command::Track {
+                latitude_deg: 1.0,
+                longitude_deg: 2.0,
+                altitude_m: 3.0,
+            },
+            60_000.2,
+            true,
+        );
+        mode.latest_board_snapshot = board;
+        let (cancel, propose) = mode.reconciliation_actions(
+            own,
+            &plan(vec![ScheduledPointing {
+                time_mjd: 60_000.5,
+                target: PointingTarget::Nadir,
+            }]),
+        );
+        assert!(cancel.is_empty());
+        assert_eq!(propose.len(), 1);
+    }
+
+    #[test]
     fn reconciliation_cancels_conflicts_and_obsolete_own_proposals_only() {
         let own = AutonomyModeId(Uuid::nil());
         let other = AutonomyModeId(Uuid::new_v4());
@@ -488,13 +536,7 @@ mod tests {
             target: PointingTarget::Nadir,
         };
         let (cancel, propose) = mode.reconciliation_actions(own, &plan(vec![selected.clone()]));
-        assert_eq!(
-            cancel,
-            vec![
-                BoardCmdId("conflict".to_string()),
-                BoardCmdId("obsolete".to_string())
-            ]
-        );
+        assert_eq!(cancel, vec![BoardCmdId("obsolete".to_string())]);
         assert_eq!(propose, vec![selected]);
     }
 

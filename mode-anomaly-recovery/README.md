@@ -2,6 +2,9 @@
 
 ## Deterministic SOC and thermal recovery
 
+SOC recovery clears active board commands and schedules Sun pointing after the
+configured `sun_point_delay_secs` (600 seconds by default).
+
 The mode supports a deterministic recovery procedure selected by
 `mode_config.recovery`:
 

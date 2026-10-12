@@ -589,6 +589,11 @@ fn lift_commands(samples: &[GeometrySample], commands: &[ModelCommand]) -> Vec<S
 
 impl CoorbitalEvasionMode {
     fn validate_config(&self) -> anyhow::Result<()> {
+        if !self.config.min_pointing_interval_secs.is_finite()
+            || self.config.min_pointing_interval_secs < 0.0
+        {
+            anyhow::bail!("mode_config.min_pointing_interval_secs must be finite and non-negative");
+        }
         if self.config.eds_path.as_os_str().is_empty() {
             anyhow::bail!("mode_config.eds_path must be configured");
         }
@@ -633,6 +638,7 @@ impl CoorbitalEvasionMode {
     pub(crate) async fn build_plan(
         &self,
         telemetry: &TelemetryFrame,
+        mode_id: safe::protocol::AutonomyModeId,
     ) -> anyhow::Result<PlanningOutcome> {
         self.validate_config()?;
         let threat_ids = self.active_threat_ids(telemetry)?;
@@ -769,6 +775,17 @@ impl CoorbitalEvasionMode {
             }
         }
 
+        // Coorbital avoidance yields to recovery/contact pointing. Fixed
+        // maneuvers that conflict are omitted; Nadir returns wait for a safe slot.
+        commands = respect_pointing_interval(
+            commands,
+            &self.latest_board_snapshot,
+            mode_id,
+            safe::utils::utc_mjd_to_gps(sim_start_mjd).context("invalid simulation epoch")?,
+            self.config.min_pointing_interval_secs,
+            &baseline,
+        );
+
         let modeled_path = modeled_boresights(
             &baseline,
             earliest,
@@ -793,11 +810,7 @@ impl CoorbitalEvasionMode {
             "coorbital-evasion selected the minimum-exposure modeled schedule"
         );
         let commands = lift_commands(&baseline, &commands);
-        let selected_schedule = self.selected_pointing_schedule(
-            &accepted_schedule,
-            baseline[earliest].time_mjd,
-            &commands,
-        );
+        let selected_schedule = self.selected_pointing_schedule(&accepted_schedule, &commands);
         let validated_samples = self
             .run_geometry_simulation(&input, &selected_schedule, telemetry, &threat_ids)
             .await
@@ -841,6 +854,214 @@ impl CoorbitalEvasionMode {
     }
 }
 
+fn respect_pointing_interval(
+    commands: Vec<ModelCommand>,
+    board: &safe::protocol::AutonomyModeBoardState,
+    mode_id: safe::protocol::AutonomyModeId,
+    now: f64,
+    interval: f64,
+    samples: &[GeometrySample],
+) -> Vec<ModelCommand> {
+    let is_pointing = |command: &safe::protocol::Command| {
+        matches!(
+            command,
+            safe::protocol::Command::PointSunYaw
+                | safe::protocol::Command::PointNadir
+                | safe::protocol::Command::PointQuaternion { .. }
+                | safe::protocol::Command::PointYpr { .. }
+                | safe::protocol::Command::PointThruster
+                | safe::protocol::Command::PointNadirWithSensor { .. }
+                | safe::protocol::Command::Track { .. }
+        )
+    };
+    let mut reserved = board
+        .proposals
+        .iter()
+        .filter_map(|(id, (from, command, _))| {
+            // Unapproved proposals from this mode can be canceled during
+            // reconciliation before the replacement is emitted.
+            if *from == mode_id && !board.source_of_truth.contains(id) {
+                return None;
+            }
+            let time = match command {
+                safe::protocol::TimedCommand::Scheduled { cmd, gps_time } if is_pointing(cmd) => {
+                    *gps_time
+                }
+                safe::protocol::TimedCommand::Now(cmd) if is_pointing(cmd) => now,
+                _ => return None,
+            };
+            let active = board.rejected.get(id).is_none_or(Vec::is_empty);
+            active.then_some(time)
+        })
+        .collect::<Vec<_>>();
+    reserved.sort_by(f64::total_cmp);
+    let mut commands = commands;
+    commands.sort_by_key(|command| command.sample_index);
+    let mut kept = Vec::new();
+    let mut evasion_active = false;
+    for (position, command) in commands.iter().copied().enumerate() {
+        let time =
+            safe::utils::utc_mjd_to_gps(samples[command.sample_index].time_mjd).unwrap_or(f64::NAN);
+        if !time.is_finite() {
+            continue;
+        }
+
+        match command.target {
+            ModeledTarget::Fixed(_) => {
+                if higher_priority_pointing_active(board, mode_id, now, time)
+                    || conflicts_with_pointing_reservation(time, &reserved, interval)
+                {
+                    continue;
+                }
+                reserved.push(time);
+                kept.push(command);
+                evasion_active = true;
+            }
+            ModeledTarget::Nadir if evasion_active => {
+                let last_fixed_time = kept
+                    .iter()
+                    .rev()
+                    .find(|previous| matches!(previous.target, ModeledTarget::Fixed(_)))
+                    .and_then(|previous| {
+                        safe::utils::utc_mjd_to_gps(samples[previous.sample_index].time_mjd)
+                    })
+                    .unwrap_or(time);
+                let next_fixed = commands[position + 1..]
+                    .iter()
+                    .find(|next| matches!(next.target, ModeledTarget::Fixed(_)))
+                    .map(|next| next.sample_index);
+                let last_index = next_fixed
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or(samples.len().saturating_sub(1));
+                let earliest_index = (command.sample_index..=last_index).find(|index| {
+                    let candidate_time =
+                        safe::utils::utc_mjd_to_gps(samples[*index].time_mjd).unwrap_or(f64::NAN);
+                    candidate_time.is_finite()
+                        && !higher_priority_pointing_active(board, mode_id, now, candidate_time)
+                        && !other_pointing_takes_over(
+                            board,
+                            mode_id,
+                            last_fixed_time,
+                            candidate_time,
+                        )
+                        && !conflicts_with_pointing_reservation(candidate_time, &reserved, interval)
+                });
+                if let Some(sample_index) = earliest_index {
+                    let return_command = ModelCommand {
+                        sample_index,
+                        target: ModeledTarget::Nadir,
+                    };
+                    let return_time =
+                        safe::utils::utc_mjd_to_gps(samples[sample_index].time_mjd).unwrap();
+                    reserved.push(return_time);
+                    kept.push(return_command);
+                    evasion_active = false;
+                }
+            }
+            ModeledTarget::Nadir => {
+                // Avoid emitting a redundant Nadir immediately before an evasion
+                // command; keep the slot for the maneuver that actually matters.
+                let next_fixed = commands[position + 1..]
+                    .iter()
+                    .find(|next| matches!(next.target, ModeledTarget::Fixed(_)));
+                if next_fixed.is_some_and(|next| {
+                    let next_time =
+                        safe::utils::utc_mjd_to_gps(samples[next.sample_index].time_mjd)
+                            .unwrap_or(f64::NAN);
+                    next_time.is_finite() && interval > 0.0 && (next_time - time).abs() < interval
+                }) || higher_priority_pointing_active(board, mode_id, now, time)
+                    || conflicts_with_pointing_reservation(time, &reserved, interval)
+                {
+                    continue;
+                }
+                reserved.push(time);
+                kept.push(command);
+            }
+        }
+    }
+    kept.sort_by_key(|command| command.sample_index);
+    kept
+}
+
+fn conflicts_with_pointing_reservation(time: f64, reservations: &[f64], interval: f64) -> bool {
+    interval > 0.0
+        && reservations
+            .iter()
+            .any(|other| (time - other).abs() < interval)
+}
+
+fn other_pointing_takes_over(
+    board: &safe::protocol::AutonomyModeBoardState,
+    mode_id: safe::protocol::AutonomyModeId,
+    after: f64,
+    through: f64,
+) -> bool {
+    board.proposals.iter().any(|(id, (from, command, _))| {
+        if *from == mode_id {
+            return false;
+        }
+        let accepted = board.source_of_truth.contains(id);
+        let (command, time) = match command {
+            safe::protocol::TimedCommand::Scheduled { cmd, gps_time } => (cmd, *gps_time),
+            safe::protocol::TimedCommand::Now(cmd) => (cmd, after),
+            safe::protocol::TimedCommand::NOOP => return false,
+        };
+        let protects = matches!(
+            command,
+            safe::protocol::Command::PointSunYaw | safe::protocol::Command::Track { .. }
+        );
+        let active = board.rejected.get(id).is_none_or(Vec::is_empty);
+        (accepted || (active && protects)) && time > after && time <= through
+    })
+}
+
+/// A Sun or Track command owns pointing until another pointing command from a
+/// different mode takes over. Pending Sun/Track proposals are protective starts,
+/// but pending lower-priority proposals cannot release that protection.
+fn higher_priority_pointing_active(
+    board: &safe::protocol::AutonomyModeBoardState,
+    mode_id: safe::protocol::AutonomyModeId,
+    now: f64,
+    time: f64,
+) -> bool {
+    let mut events = board
+        .proposals
+        .iter()
+        .filter_map(|(id, (from, command, _))| {
+            if *from == mode_id {
+                return None;
+            }
+            let (cmd, at) = match command {
+                safe::protocol::TimedCommand::Scheduled { cmd, gps_time } => (cmd, *gps_time),
+                safe::protocol::TimedCommand::Now(cmd) => (cmd, now),
+                safe::protocol::TimedCommand::NOOP => return None,
+            };
+            let pointing = matches!(
+                cmd,
+                safe::protocol::Command::PointSunYaw
+                    | safe::protocol::Command::PointNadir
+                    | safe::protocol::Command::PointQuaternion { .. }
+                    | safe::protocol::Command::PointYpr { .. }
+                    | safe::protocol::Command::PointThruster
+                    | safe::protocol::Command::PointNadirWithSensor { .. }
+                    | safe::protocol::Command::Track { .. }
+            );
+            if !pointing || at > time {
+                return None;
+            }
+            let accepted = board.source_of_truth.contains(id);
+            let active = board.rejected.get(id).is_none_or(Vec::is_empty);
+            let protects = matches!(
+                cmd,
+                safe::protocol::Command::PointSunYaw | safe::protocol::Command::Track { .. }
+            );
+            (accepted || (active && protects)).then_some((at, protects))
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+    events.into_iter().fold(false, |_, protected| protected.1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +1084,289 @@ mod tests {
             line_of_sight: visible,
             in_field_of_view: false,
         }
+    }
+
+    #[test]
+    fn evasion_filter_skips_conflicts_with_board_and_its_own_schedule() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(300.0, Vector3::z(), vec![]),
+            sample(1_300.0, Vector3::z(), vec![]),
+        ];
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        let id = safe::protocol::BoardCmdId("contact".into());
+        board.proposals.insert(
+            id.clone(),
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                safe::protocol::TimedCommand::Scheduled {
+                    cmd: safe::protocol::Command::Track {
+                        latitude_deg: 0.0,
+                        longitude_deg: 0.0,
+                        altitude_m: 0.0,
+                    },
+                    gps_time: safe::utils::utc_mjd_to_gps(samples[0].time_mjd).unwrap(),
+                },
+                0,
+            ),
+        );
+        board.source_of_truth.push(id);
+        board.proposals.insert(
+            safe::protocol::BoardCmdId("restore".into()),
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+                safe::protocol::TimedCommand::Scheduled {
+                    cmd: safe::protocol::Command::PointNadir,
+                    gps_time: safe::utils::utc_mjd_to_gps(samples[1].time_mjd).unwrap(),
+                },
+                0,
+            ),
+        );
+        board
+            .source_of_truth
+            .push(safe::protocol::BoardCmdId("restore".into()));
+        let candidates = vec![
+            ModelCommand {
+                sample_index: 0,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            },
+            ModelCommand {
+                sample_index: 1,
+                target: ModeledTarget::Fixed(Vector3::y()),
+            },
+            ModelCommand {
+                sample_index: 2,
+                target: ModeledTarget::Nadir,
+            },
+        ];
+        let result = respect_pointing_interval(
+            candidates,
+            &board,
+            safe::protocol::AutonomyModeId(uuid::Uuid::new_v4()),
+            0.0,
+            600.0,
+            &samples,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].sample_index, 2);
+    }
+
+    #[test]
+    fn evasion_yields_for_the_full_track_interval_until_nadir_is_scheduled() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(700.0, Vector3::z(), vec![]),
+            sample(1_300.0, Vector3::z(), vec![]),
+        ];
+        let mode_id = safe::protocol::AutonomyModeId(uuid::Uuid::nil());
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        for (id, cmd, seconds) in [
+            (
+                "contact",
+                safe::protocol::Command::Track {
+                    latitude_deg: 0.0,
+                    longitude_deg: 0.0,
+                    altitude_m: 0.0,
+                },
+                0.0,
+            ),
+            ("restore", safe::protocol::Command::PointNadir, 700.0),
+        ] {
+            board.proposals.insert(
+                safe::protocol::BoardCmdId(id.into()),
+                (
+                    mode_id,
+                    safe::protocol::TimedCommand::Scheduled {
+                        cmd,
+                        gps_time: safe::utils::utc_mjd_to_gps(60_000.0 + seconds / SECONDS_PER_DAY)
+                            .unwrap(),
+                    },
+                    0,
+                ),
+            );
+            board
+                .source_of_truth
+                .push(safe::protocol::BoardCmdId(id.into()));
+        }
+        let commands = vec![
+            ModelCommand {
+                sample_index: 0,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            },
+            ModelCommand {
+                sample_index: 2,
+                target: ModeledTarget::Fixed(Vector3::y()),
+            },
+        ];
+        let kept = respect_pointing_interval(
+            commands,
+            &board,
+            safe::protocol::AutonomyModeId(uuid::Uuid::new_v4()),
+            0.0,
+            0.0,
+            &samples,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].sample_index, 2);
+    }
+
+    #[test]
+    fn evasion_delays_nadir_return_until_minimum_interval_is_met() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(300.0, Vector3::z(), vec![]),
+            sample(700.0, Vector3::z(), vec![]),
+            sample(1_300.0, Vector3::z(), vec![]),
+        ];
+        let commands = vec![
+            ModelCommand {
+                sample_index: 0,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            },
+            ModelCommand {
+                sample_index: 1,
+                target: ModeledTarget::Nadir,
+            },
+        ];
+
+        let kept = respect_pointing_interval(
+            commands,
+            &safe::protocol::AutonomyModeBoardState::default(),
+            safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+            0.0,
+            600.0,
+            &samples,
+        );
+
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].sample_index, 0);
+        assert_eq!(kept[1].sample_index, 2);
+        assert!(matches!(kept[1].target, ModeledTarget::Nadir));
+    }
+
+    #[test]
+    fn evasion_omits_delayed_nadir_when_sun_pointing_takes_over() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(300.0, Vector3::z(), vec![]),
+            sample(700.0, Vector3::z(), vec![]),
+            sample(1_300.0, Vector3::z(), vec![]),
+        ];
+        let mode_id = safe::protocol::AutonomyModeId(uuid::Uuid::nil());
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        let sun_id = safe::protocol::BoardCmdId("sun".into());
+        board.proposals.insert(
+            sun_id.clone(),
+            (
+                safe::protocol::AutonomyModeId(uuid::Uuid::new_v4()),
+                safe::protocol::TimedCommand::Scheduled {
+                    cmd: safe::protocol::Command::PointSunYaw,
+                    gps_time: safe::utils::utc_mjd_to_gps(samples[2].time_mjd).unwrap(),
+                },
+                0,
+            ),
+        );
+        board.source_of_truth.push(sun_id);
+        let commands = vec![
+            ModelCommand {
+                sample_index: 0,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            },
+            ModelCommand {
+                sample_index: 1,
+                target: ModeledTarget::Nadir,
+            },
+        ];
+
+        let kept = respect_pointing_interval(commands, &board, mode_id, 0.0, 600.0, &samples);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].sample_index, 0);
+        assert!(matches!(kept[0].target, ModeledTarget::Fixed(_)));
+    }
+
+    #[test]
+    fn evasion_does_not_return_after_another_modes_pointing_transition() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(300.0, Vector3::z(), vec![]),
+            sample(700.0, Vector3::z(), vec![]),
+            sample(1_300.0, Vector3::z(), vec![]),
+        ];
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        let mode_id = safe::protocol::AutonomyModeId(uuid::Uuid::nil());
+        let other_mode = safe::protocol::AutonomyModeId(uuid::Uuid::new_v4());
+        let id = safe::protocol::BoardCmdId("mission-nadir".into());
+        board.proposals.insert(
+            id.clone(),
+            (
+                other_mode,
+                safe::protocol::TimedCommand::Scheduled {
+                    cmd: safe::protocol::Command::PointNadir,
+                    gps_time: safe::utils::utc_mjd_to_gps(samples[2].time_mjd).unwrap(),
+                },
+                0,
+            ),
+        );
+        board.source_of_truth.push(id);
+        let commands = vec![
+            ModelCommand {
+                sample_index: 0,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            },
+            ModelCommand {
+                sample_index: 1,
+                target: ModeledTarget::Nadir,
+            },
+        ];
+
+        let kept = respect_pointing_interval(commands, &board, mode_id, 0.0, 600.0, &samples);
+
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(kept[0].target, ModeledTarget::Fixed(_)));
+    }
+
+    #[test]
+    fn canceled_board_pointing_is_not_a_spacing_reservation() {
+        let samples = vec![
+            sample(100.0, Vector3::z(), vec![]),
+            sample(300.0, Vector3::z(), vec![]),
+        ];
+        let mut board = safe::protocol::AutonomyModeBoardState::default();
+        let id = safe::protocol::BoardCmdId("approved-then-canceled".into());
+        let other_mode = safe::protocol::AutonomyModeId(uuid::Uuid::new_v4());
+        board.proposals.insert(
+            id.clone(),
+            (
+                other_mode,
+                safe::protocol::TimedCommand::Scheduled {
+                    cmd: safe::protocol::Command::PointNadir,
+                    gps_time: safe::utils::utc_mjd_to_gps(samples[0].time_mjd).unwrap(),
+                },
+                0,
+            ),
+        );
+        board
+            .approved
+            .insert(id.clone(), vec![(other_mode, "approved".into(), 1)]);
+        board
+            .rejected
+            .insert(id, vec![(other_mode, "board-canceled".into(), 2)]);
+
+        let kept = respect_pointing_interval(
+            vec![ModelCommand {
+                sample_index: 1,
+                target: ModeledTarget::Fixed(Vector3::x()),
+            }],
+            &board,
+            safe::protocol::AutonomyModeId(uuid::Uuid::nil()),
+            0.0,
+            600.0,
+            &samples,
+        );
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].sample_index, 1);
     }
 
     #[test]
