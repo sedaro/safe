@@ -71,7 +71,7 @@ where
     async fn write(&mut self, msg: T) -> Result<(), std::io::Error> {
         let bytes = bincode::serialize(&msg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.framed_stream.send(bytes.into()).await
+        self.framed_stream.send(bytes::Bytes::from(bytes)).await
     }
     fn split(self: Box<Self>) -> (Box<dyn ReadHalf<R>>, Box<dyn WriteHalf<T>>) {
         let (write, read) = self.framed_stream.split();
