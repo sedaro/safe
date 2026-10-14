@@ -7,7 +7,7 @@ use crate::telemetry_frame::TelemetryFrame;
 
 pub const AUTONOMY_MODE_PROTOCOL_VERSION: u16 = 2;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     SetPidControllerGains(f64, f64, f64, f64),
     IridiumPowerOn,
@@ -128,11 +128,15 @@ impl Into<String> for Command {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub enum TimedCommand {
     Now(Command),
+    /// Internal turn-completion signal; never a host command or simulator input.
     NOOP,
-    Scheduled { cmd: Command, gps_time: f64 },
+    Scheduled {
+        cmd: Command,
+        gps_time: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -228,7 +232,7 @@ pub enum BoardEvent {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoardState {
     pub proposals: HashMap<BoardCmdId, (AutonomyModeId, TimedCommand, u64)>,
     pub rejected: HashMap<BoardCmdId, Vec<(AutonomyModeId, String, u64)>>,
@@ -263,10 +267,14 @@ impl BoardState {
                 reason,
                 ts_mono,
             } => {
-                self.rejected
-                    .entry(id.clone())
-                    .or_default()
-                    .push((*by, reason.clone(), *ts_mono));
+                // Recovery can replay a durable effect after its projection was
+                // already written; exact decision deduplication keeps that replay
+                // idempotent instead of growing duplicate approvals/rejections.
+                let decisions = self.rejected.entry(id.clone()).or_default();
+                let decision = (*by, reason.clone(), *ts_mono);
+                if !decisions.contains(&decision) {
+                    decisions.push(decision);
+                }
                 self.recompute();
             }
             BoardEvent::Approved {
@@ -275,10 +283,11 @@ impl BoardState {
                 reason,
                 ts_mono,
             } => {
-                self.approved
-                    .entry(id.clone())
-                    .or_default()
-                    .push((*by, reason.clone(), *ts_mono));
+                let decisions = self.approved.entry(id.clone()).or_default();
+                let decision = (*by, reason.clone(), *ts_mono);
+                if !decisions.contains(&decision) {
+                    decisions.push(decision);
+                }
                 self.recompute();
             }
         }

@@ -118,6 +118,20 @@ pub struct Event {
 #[derive(Debug, Clone)]
 struct PendingGatekeeperBatch {
     command_ids: Vec<BoardCmdId>,
+    board: BoardState,
+}
+
+impl PendingGatekeeperBatch {
+    fn matches_board(&self, board: &BoardState) -> bool {
+        // A decision applies only to the candidate set and accepted schedule
+        // the child simulated. Cancellation or replacement invalidates it.
+        self.board.source_of_truth == board.source_of_truth
+            && self.command_ids.iter().all(|id| {
+                self.board.proposals.get(id) == board.proposals.get(id)
+                    && board.rejected.get(id).is_none_or(Vec::is_empty)
+                    && board.approved.get(id).is_none_or(Vec::is_empty)
+            })
+    }
 }
 
 pub(crate) fn update(flight: &mut Flight, ev: &Event) -> Vec<Effect> {
@@ -141,7 +155,6 @@ pub(crate) fn update(flight: &mut Flight, ev: &Event) -> Vec<Effect> {
                 ts_mono: ev.ts_mono,
             }));
         }
-
         Msg::GatekeeperApproved { id } => {
             fx.push(Effect::Board(BoardEvent::Approved {
                 id: id.clone(),
@@ -251,6 +264,10 @@ pub async fn rebuild_board_from_outputs(
             Err(_) => continue,
         }
     }
+    // source_of_truth is a cache over proposals/decisions, not authority.
+    // Recompute it before seeding retry bookkeeping so a stale snapshot cannot
+    // hide an unresolved command after restart.
+    board.recompute();
     Ok(board)
 }
 
@@ -318,6 +335,7 @@ pub struct SafeTEA {
     output_records: usize,
     host_status_tx: mpsc::Sender<HostCommandStatus>,
     sent_board_command_ids: HashSet<BoardCmdId>,
+    gatekeeper_connected: bool,
     flight: Flight,
     host_command_dispatch_tx: watch::Sender<BoardState>,
     logical_ts: u64,
@@ -510,31 +528,49 @@ impl SafeTEA {
 
             match serde_json::from_str::<Event>(&line) {
                 Ok(ev) => {
-                    if ev.seq <= self.flight.get_seq() {
-                        continue;
+                    // The event is durable before its board effects and flight
+                    // checkpoint. A crash can leave the checkpoint ahead of a
+                    // missing effect. Rebuild the board projection idempotently
+                    // from retained events; replay never executes host commands.
+                    let already_checkpointed = ev.seq <= self.flight.get_seq();
+                    let effects = if already_checkpointed {
+                        // Repair retained events from older runtimes that advanced
+                        // the checkpoint while discarding their board effects.
+                        // Do not roll the current selector state back in time.
+                        let mut effects = update(&mut self.flight.clone(), &ev);
+                        effects
+                    } else {
+                        self.apply_event(&ev, false).await?
+                    };
+                    for effect in &effects {
+                        if let Effect::Board(board_event) = effect {
+                            let mut repaired = self.board.clone();
+                            repaired.apply(board_event);
+                            if repaired != self.board {
+                                append_jsonl(
+                                    &self.runtime_paths.outputs,
+                                    &OutputJournalRecord::Effect {
+                                        effect: effect.clone(),
+                                    },
+                                )
+                                .await?;
+                                self.output_records += 1;
+                                self.board = repaired;
+                            }
+                        }
                     }
 
-                    self.apply_event(&ev, false).await?;
-
+                    if already_checkpointed {
+                        continue;
+                    }
                     match &ev.msg {
                         Msg::TelemetryReceived(t) => {
                             self.flight.note_telemetry(t);
-                            self.latest_telemetry = Some(t.clone());
-                            let previous_active = self.flight.get_active_autonomy_mode();
                             self.flight
                                 .recalculate_active_autonomy_mode_at(self.activation_now_ms());
-                            if let Some(router) = self.router.as_mut() {
-                                router
-                                    .set_active(
-                                        previous_active,
-                                        self.flight.get_active_autonomy_mode(),
-                                    )
-                                    .await;
-                            }
-
-                            if let Some(router) = self.router.as_mut() {
-                                router.send_telemetry_to_all(t.clone()).await;
-                            }
+                            // Rebuild selector context, but do not activate modes
+                            // against a partially repaired board or treat replayed
+                            // telemetry as a fresh gatekeeper input.
                         }
                         _ => {}
                     }
@@ -591,7 +627,6 @@ impl SafeTEA {
 
         flight.set_autonomy_modes(mode_meta);
         flight.set_autonomy_mode_activations(mode_activations);
-        flight.recalculate_active_autonomy_mode();
 
         // Bootstrap router from mode configs at runtime
         let router = if mode_configs.is_empty() {
@@ -607,6 +642,21 @@ impl SafeTEA {
         let board = rebuild_board_from_outputs(&runtime_paths)
             .await
             .expect("rebuild board");
+        let pending_handoffs = board
+            .proposals
+            .iter()
+            .filter(|(id, (_, command, _))| {
+                matches!(command, TimedCommand::NOOP)
+                    && board.approved.get(*id).is_none_or(Vec::is_empty)
+                    && board.rejected.get(*id).is_none_or(Vec::is_empty)
+            })
+            .count();
+        info!(
+            proposals = board.proposals.len(),
+            accepted = board.source_of_truth.len(),
+            pending_handoffs,
+            "restored command board"
+        );
         let event_records = journal_record_count(&runtime_paths.events)
             .await
             .expect("count event records");
@@ -660,6 +710,7 @@ impl SafeTEA {
             pending_gatekeeper_batches: HashMap::new(),
             output_records,
             sent_board_command_ids,
+            gatekeeper_connected: false,
             flight,
             host_command_dispatch_tx,
             host_status_tx,
@@ -679,11 +730,6 @@ impl SafeTEA {
         };
 
         safetea
-            .rehydrate_autonomy_mode_runtime()
-            .await
-            .expect("rehydrate");
-
-        safetea
             .recover_from_log_with_autonomy_mode_delivery()
             .await
             .expect("recover");
@@ -700,6 +746,8 @@ impl SafeTEA {
             safetea.logical_ts = recovered_next_seq;
         }
 
+        safetea.flight.recalculate_active_autonomy_mode();
+
         save_json_atomic(&safetea.runtime_paths.flight, &safetea.flight)
             .await
             .expect("atomic save");
@@ -708,6 +756,10 @@ impl SafeTEA {
             .host_command_dispatch_tx
             .send_replace(safetea.board.clone());
         safetea.send_board_snapshot_to_all().await;
+        safetea
+            .rehydrate_autonomy_mode_runtime()
+            .await
+            .expect("rehydrate");
         safetea
             .write_operational_status()
             .await
@@ -855,7 +907,6 @@ impl SafeTEA {
                 if self.sent_board_command_ids.contains(id) {
                     return None;
                 }
-
                 let is_approved = self
                     .board
                     .approved
@@ -891,13 +942,30 @@ impl SafeTEA {
         Some((command_ids, commands))
     }
 
-    fn has_pending_autonomy_mode_command_events(&self) -> bool {
-        self.q
-            .iter()
-            .any(|event| matches!(event.msg, Msg::AutonomyModeCommandReceived(_)))
+    fn has_pending_board_command_events(&self) -> bool {
+        self.q.iter().any(|event| {
+            matches!(
+                event.msg,
+                Msg::AutonomyModeCommandReceived(_)
+                    | Msg::GatekeeperApproved { .. }
+                    | Msg::GatekeeperRejected { .. }
+                    | Msg::BoardCommandApproved { .. }
+                    | Msg::BoardCommandCanceled { .. }
+            )
+        })
     }
 
     async fn request_gatekeeper_for_pending_batch(&mut self) {
+        // A previous decision may be queued but not applied to the board yet.
+        // Evaluating another batch now would omit those newly accepted commands.
+        if self.has_pending_board_command_events() {
+            return;
+        }
+        // A process restart loses the child session and its telemetry. Wait for
+        // the replacement to be ready and for SAFE to receive a fresh frame.
+        if !self.gatekeeper_connected || self.latest_telemetry.is_none() {
+            return;
+        }
         let Some((command_ids, _commands)) = self.collect_unapproved_board_batch() else {
             self.latest_gatekeeper_request_id = None;
             self.pending_gatekeeper_batches.clear();
@@ -917,10 +985,13 @@ impl SafeTEA {
         self.gatekeeper_next_request_id += 1;
 
         self.pending_gatekeeper_batches.clear();
+        // Retain the evaluated board with the candidate IDs so late decisions
+        // cannot approve a schedule that changed while simulation was running.
         self.pending_gatekeeper_batches.insert(
             request_id,
             PendingGatekeeperBatch {
                 command_ids: command_ids.clone(),
+                board: self.board.clone(),
             },
         );
         self.latest_gatekeeper_request_id = Some(request_id);
@@ -928,14 +999,20 @@ impl SafeTEA {
         let batch_size = command_ids.len();
         info!(request_id, batch_size, "requesting gatekeeper evaluation");
 
-        self.gatekeeper_input_tx
+        if let Err(error) = self
+            .gatekeeper_input_tx
             .send(GatekeeperAdapterInput::EvaluateBatch {
                 request_id,
                 board: self.board.clone(),
                 candidate_command_ids: command_ids,
             })
             .await
-            .expect("gatekeeper input");
+        {
+            self.latest_gatekeeper_request_id = None;
+            self.pending_gatekeeper_batches.clear();
+            self.gatekeeper_connected = false;
+            error!(%error, "gatekeeper request channel unavailable; retaining pending commands");
+        }
     }
 
     pub async fn run(&mut self) {
@@ -1015,14 +1092,28 @@ impl SafeTEA {
                     }
                 }
 
-                maybe_gk = self.gatekeeper_output_rx.recv() => {
+                maybe_gk = self.gatekeeper_output_rx.recv(), if !self.gatekeeper_output_rx.is_closed() || !self.gatekeeper_output_rx.is_empty() => {
                     if let Some(gk_out) = maybe_gk {
                         match gk_out {
+                            GatekeeperAdapterOutput::Ready => {
+                                self.gatekeeper_connected = true;
+                                if let Some(telemetry) = self.latest_telemetry.clone() {
+                                    let _ = self.gatekeeper_input_tx.send(GatekeeperAdapterInput::Telemetry(telemetry)).await;
+                                    self.request_gatekeeper_for_pending_batch().await;
+                                }
+                            }
+                            GatekeeperAdapterOutput::Unavailable { reason } => {
+                                self.gatekeeper_connected = false;
+                                self.latest_gatekeeper_request_id = None;
+                                self.pending_gatekeeper_batches.clear();
+                                error!(%reason, "gatekeeper unavailable; retaining unapproved commands for retry");
+                            }
                             GatekeeperAdapterOutput::Approve {
                                 request_id,
                                 details,
                                 simulation_count,
                             } => {
+                                self.gatekeeper_connected = true;
                                 self.summary.num_gatekeeper_simulations_completed = self
                                     .summary
                                     .num_gatekeeper_simulations_completed
@@ -1039,9 +1130,14 @@ impl SafeTEA {
 
                                 self.pending_gatekeeper_batches.clear();
                                 self.latest_gatekeeper_request_id = None;
-                                self.next_seq += 1;
-                                self.logical_ts += 1;
-
+                                if !batch.matches_board(&self.board) || self.has_pending_board_command_events() {
+                                    // The simulator validated a frozen complete
+                                    // schedule. Do not apply its result after any
+                                    // candidate or accepted-schedule change.
+                                    info!(request_id, "discarding gatekeeper approval for changed board; re-evaluation required");
+                                    self.request_gatekeeper_for_pending_batch().await;
+                                    continue;
+                                }
                                 for id in batch.command_ids {
                                     self.sent_board_command_ids.insert(id.clone());
                                     self.q.push_back(Event {
@@ -1050,7 +1146,6 @@ impl SafeTEA {
                                         source: Source::Gatekeeper,
                                         msg: Msg::GatekeeperApproved { id: id.clone() },
                                     });
-
                                     match id.parse() {
                                         Some((_seq, autonomy_mode_id, _local_idx)) => {
                                             let summary = self
@@ -1074,7 +1169,6 @@ impl SafeTEA {
                                             );
                                         }
                                     }
-
                                     self.next_seq += 1;
                                     self.logical_ts += 1;
                                 }
@@ -1086,6 +1180,7 @@ impl SafeTEA {
                                 reason,
                                 simulation_count,
                             } => {
+                                self.gatekeeper_connected = true;
                                 self.summary.num_gatekeeper_simulations_completed = self
                                     .summary
                                     .num_gatekeeper_simulations_completed
@@ -1102,6 +1197,11 @@ impl SafeTEA {
 
                                 self.pending_gatekeeper_batches.clear();
                                 self.latest_gatekeeper_request_id = None;
+                                if !batch.matches_board(&self.board) || self.has_pending_board_command_events() {
+                                    info!(request_id, "discarding gatekeeper rejection for changed board; re-evaluation required");
+                                    self.request_gatekeeper_for_pending_batch().await;
+                                    continue;
+                                }
                                 self.next_seq += 1;
                                 self.logical_ts += 1;
 
@@ -1162,6 +1262,19 @@ impl SafeTEA {
                 }
 
                 _ = self.status_tick.tick() => {
+                    if self.gatekeeper_output_rx.is_closed() && self.gatekeeper_output_rx.is_empty() {
+                        self.gatekeeper_connected = false;
+                        self.latest_gatekeeper_request_id = None;
+                        self.pending_gatekeeper_batches.clear();
+                        match spawn_gatekeeper_adapter(&self.cfg) {
+                            Ok((input, output)) => {
+                                self.gatekeeper_input_tx = input;
+                                self.gatekeeper_output_rx = output;
+                                error!("gatekeeper supervisor stopped; restarting without discarding board state");
+                            }
+                            Err(error) => error!(%error, "failed to restart gatekeeper supervisor"),
+                        }
+                    }
                     if let Err(e) = self.write_operational_status().await {
                         error!("failed writing operational status: {e}");
                     }
@@ -1277,7 +1390,6 @@ impl SafeTEA {
                         }
                         AutonomyModeOutput::Command(env) => {
                             self.flight.set_last_planned_autonomy_mode(env.from);
-
                             self.q.push_back(Event {
                                 seq: self.next_seq,
                                 ts_mono: self.logical_ts,
@@ -1370,7 +1482,7 @@ impl SafeTEA {
                         router.send_board_snapshot_to_all(self.board.clone()).await;
                     }
 
-                    if !self.has_pending_autonomy_mode_command_events() {
+                    if !self.has_pending_board_command_events() {
                         self.request_gatekeeper_for_pending_batch().await;
                     }
                 }
@@ -1397,7 +1509,7 @@ impl SafeTEA {
                     // Pending proposals survive a SAFE restart, but their in-flight
                     // gatekeeper request does not; retry with fresh telemetry.
                     if self.latest_gatekeeper_request_id.is_none()
-                        && !self.has_pending_autonomy_mode_command_events()
+                        && !self.has_pending_board_command_events()
                     {
                         self.request_gatekeeper_for_pending_batch().await;
                     }

@@ -96,6 +96,11 @@ impl Config {
         if self.platform.shell_executable.trim().is_empty() {
             return Err("platform.shell_executable must not be empty".into());
         }
+        if self.platform.external_gatekeeper_request_timeout_ms == Some(0) {
+            return Err(
+                "platform.external_gatekeeper_request_timeout_ms must be greater than zero".into(),
+            );
+        }
         Ok(())
     }
 }
@@ -166,6 +171,9 @@ pub struct PlatformConfig {
     pub external_egress_retry: ExternalEgressRetryConfig,
     #[serde(default)]
     pub external_gatekeeper_command: Option<String>,
+    /// Overall adapter response deadline, including the nominal and Monte Carlo runs.
+    #[serde(default)]
+    pub external_gatekeeper_request_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

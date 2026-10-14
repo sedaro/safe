@@ -30,8 +30,12 @@ impl CoorbitalEvasionMode {
         self.latest_board_snapshot
             .proposals
             .iter()
-            .filter(|(id, (from, _, _))| {
+            .filter(|(id, (from, command, _))| {
                 *from == upstream_mode_id
+                    // A NOOP has no host effect. It is still evaluated by SAFE's
+                    // gatekeeper path; it must not hold the mode scheduler while
+                    // that independent validation is running or recovering.
+                    && !matches!(command, TimedCommand::NOOP)
                     && self
                         .latest_board_snapshot
                         .approved
@@ -641,6 +645,19 @@ mod tests {
         mode.latest_board_snapshot = board;
 
         assert_eq!(mode.pending_upstream_proposal_count(), 1);
+    }
+
+    #[test]
+    fn pending_noop_handoff_does_not_block_evasion_planning() {
+        let upstream = AutonomyModeId(Uuid::from_u128(1));
+        let mut mode = CoorbitalEvasionMode::new();
+        mode.config.wait_for_proposals_from_mode_id = Some(upstream);
+        mode.latest_board_snapshot.proposals.insert(
+            BoardCmdId("10:00000000-0000-0000-0000-000000000001:0".into()),
+            (upstream, TimedCommand::NOOP, 1),
+        );
+
+        assert_eq!(mode.pending_upstream_proposal_count(), 0);
     }
 
     #[test]
